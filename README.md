@@ -1,4 +1,4 @@
-# LNPP 组件管理器
+# LNPP 组件管理器 v1.1
 
 Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis 的启动、停止、版本切换、配置。
 
