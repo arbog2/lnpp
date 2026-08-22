@@ -1,0 +1,1492 @@
+#include "common.h"
+#include "process.h"
+#include "manager.h"
+#include <commdlg.h>
+#include <shlobj.h>
+
+// App icon resource (see app.rc)
+#define IDI_APP 101
+
+// ============================ Control IDs ============================
+enum {
+    IDC_TAB = 100,
+    // common per-page controls
+    IDC_DOT = 200, IDC_STATUS_TXT = 201, IDC_VER_COMBO = 202,
+    IDC_BTN_SWITCH = 203, IDC_BTN_START = 204, IDC_BTN_STOP = 205,
+    IDC_BTN_CFG = 206, IDC_BTN_DATA = 207, IDC_LOG = 208,
+    // nginx page
+    IDC_NG_VHOST_LIST = 300, IDC_NG_ADD_NAME = 301, IDC_NG_ADD_DOMAIN = 302,
+    IDC_NG_ADD_PORT = 303, IDC_NG_BTN_ADD = 304, IDC_NG_BTN_DEL = 305, IDC_NG_BTN_RELOAD = 306,
+    IDC_NG_LABEL_NAME = 307, IDC_NG_LABEL_DOMAIN = 308, IDC_NG_LABEL_PORT = 309,
+    IDC_NG_SSL = 310, IDC_NG_CERT = 311, IDC_NG_KEY = 312,
+    IDC_NG_BTN_CERT = 313, IDC_NG_BTN_KEY = 314,
+    IDC_NG_LABEL_CERT = 315, IDC_NG_LABEL_KEY = 316,
+    IDC_NG_ROOT = 317, IDC_NG_BTN_ROOT = 318, IDC_NG_LABEL_ROOT = 319,
+    // postgresql page
+    IDC_PG_BTN_INIT = 400, IDC_PG_BTN_PWD = 401, IDC_PG_BTN_ADDUSER = 402,
+    IDC_PG_BTN_DELUSER = 403, IDC_PG_BTN_BACKUP = 404, IDC_PG_INFO = 405,
+    IDC_PG_USER = 406, IDC_PG_PWD = 407, IDC_PG_PORT = 408,
+    IDC_PG_LABEL_USER = 409, IDC_PG_LABEL_PWD = 410, IDC_PG_LABEL_PORT = 411,
+    // redis page
+    IDC_REDIS_INFO = 500,
+    // nodejs page
+    IDC_NODE_PM2_LIST = 600, IDC_NODE_BTN_RESTART = 601, IDC_NODE_BTN_STOP = 602, IDC_NODE_BTN_REFRESH = 603,
+    IDC_NODE_BTN_RESTART_ALL = 604, IDC_NODE_BTN_DELETE = 605,
+    // overview page (first tab)
+    IDC_OV_AUTOSTART_ALL = 700, IDC_OV_BTN_ALL_START = 701, IDC_OV_BTN_ALL_RESTART = 702,
+    IDC_OV_BTN_ALL_STOP = 703, IDC_OV_RESULT = 704, IDC_OV_BOOT_START = 705,
+    IDC_OV_BTN_PATH_ADD = 706, IDC_OV_BTN_PATH_DEL = 707,
+    IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
+    IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
+    IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
+};
+
+// tray menu item ids
+enum {
+    IDM_TRAY_SHOW = 2000,
+    IDM_TRAY_COMP_BASE = 2100,   // + comp index: start/stop
+    IDM_TRAY_ALL_START = 2200,
+    IDM_TRAY_ALL_STOP = 2201,
+    IDM_TRAY_EXIT = 2300,
+};
+
+// ============================ Message IDs ============================
+enum {
+    WM_OP_DONE = WM_APP + 1,      // wParam = comp index, lParam = 0 success / 1 fail
+    WM_UI_STATUS = WM_APP + 2,    // background status poll finished -> refresh dots/info
+    WM_UI_PM2 = WM_APP + 3,       // background pm2 poll finished -> refresh node page
+    WM_ALL_DONE = WM_APP + 4,     // overview all-start/restart/stop finished (wParam=AllOp, lParam=fail count)
+    WM_TRAYICON = WM_APP + 5,     // tray icon callback
+    WM_REAL_EXIT = WM_APP + 6,    // all components stopped -> destroy window / quit
+    WM_PG_USERS = WM_APP + 7,     // pg user list loaded -> fill the user combo
+};
+
+// ============================ Globals ============================
+static HWND g_main = nullptr;
+static HWND g_tab = nullptr;
+static HFONT g_font = nullptr;
+static HFONT g_monoFont = nullptr;
+
+// Background status / pm2 polling snapshot (see statusWorker / pm2Worker).
+static std::mutex g_snapMtx;
+static bool g_snapRunning[(int)Comp::Count] = {};
+static bool g_snapInstalled[(int)Comp::Count] = {};
+static std::wstring g_snapCurrent[(int)Comp::Count];
+static std::vector<std::wstring> g_snapVersions[(int)Comp::Count];
+static std::vector<PM2App> g_snapPm2;
+static std::atomic<bool> g_statusWorkerBusy{false};
+static std::atomic<bool> g_pm2WorkerBusy{false};
+static std::atomic<bool> g_appClosing{false};
+static std::atomic<int> g_curTab{0};
+static bool g_pendingVhostClear = false;   // clear nginx add form after a successful add
+static std::vector<std::wstring> g_pgUsers;   // pg user list for the user combo
+static std::atomic<bool> g_pgUsersBusy{false};
+
+// ---- system tray / boot start ----
+static bool g_trayAdded = false;
+static bool g_realExit = false;
+static bool g_startHidden = false;
+static NOTIFYICONDATAW g_nid = {};
+
+struct CompUI {
+    HWND dot = nullptr, statusTxt = nullptr, verCombo = nullptr;
+    HWND btnSwitch = nullptr, btnStart = nullptr, btnStop = nullptr, btnCfg = nullptr, btnData = nullptr;
+    HWND logEdit = nullptr;
+    std::vector<HWND> pageControls;   // controls belonging to this tab page
+    std::atomic<bool> busy{false};
+    std::wstring opName;
+};
+static CompUI g_ui[(int)Comp::Count];
+
+// ---- Overview (first tab) ----
+// Tab layout: [0] 总览, [1..] nginx / PostgreSQL / Redis / Node.js
+static const int TAB_OVERVIEW = 0;
+static const int TAB_COMP_BASE = 1;
+static Comp tabToComp(int idx) { return (Comp)(idx - TAB_COMP_BASE); }
+static int compToTab(Comp c) { return (int)c + TAB_COMP_BASE; }
+
+struct OverviewUI {
+    HWND chkAutoAll = nullptr;
+    HWND btnAllStart = nullptr, btnAllRestart = nullptr, btnAllStop = nullptr;
+    HWND btnPathAdd = nullptr, btnPathDel = nullptr;
+    HWND dot[(int)Comp::Count];
+    HWND status[(int)Comp::Count];
+    HWND btnToggle[(int)Comp::Count];
+    HWND chkAuto[(int)Comp::Count];
+    HWND result = nullptr;
+    std::vector<HWND> controls;
+    std::atomic<bool> busy{false};
+};
+static OverviewUI g_ov;
+
+// ============================ Utilities ============================
+
+static void logAppend(Comp c, const std::wstring& line) {
+    HWND edit = g_ui[(int)c].logEdit;
+    if (!edit) return;
+    std::wstring text = nowText() + L"  " + line + L"\r\n";
+    int len = GetWindowTextLengthW(edit);
+    SendMessageW(edit, EM_SETSEL, len, len);
+    SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
+    // auto scroll
+    SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+}
+
+static void logMsgUi(Comp c, const std::wstring& msg) {
+    logAppend(c, msg);
+}
+
+static HWND makeCtl(int id, const wchar_t* cls, const wchar_t* text, DWORD style,
+                    int x, int y, int w, int cth, HWND parent) {
+    // every control built here is a child of `parent`; without WS_CHILD the
+    // system would create a draggable top-level popup instead
+    style |= WS_CHILD | WS_VISIBLE;
+    HWND ctl = CreateWindowW(cls, text, style, x, y, w, cth, parent,
+                             (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    if (ctl) SendMessageW(ctl, WM_SETFONT, (WPARAM)g_font, TRUE);
+    return ctl;
+}
+
+static void setStatus(Comp c, bool running, bool installed) {
+    CompUI& ui = g_ui[(int)c];
+    if (!ui.statusTxt) return;
+    if (!installed) {
+        SetWindowTextW(ui.statusTxt, L"未安装");
+        SetWindowLongPtrW(ui.dot, GWLP_USERDATA, 0);
+        InvalidateRect(ui.dot, nullptr, TRUE);
+    } else if (running) {
+        SetWindowTextW(ui.statusTxt, L"运行中");
+        SetWindowLongPtrW(ui.dot, GWLP_USERDATA, 2);
+        InvalidateRect(ui.dot, nullptr, TRUE);
+    } else {
+        SetWindowTextW(ui.statusTxt, L"已停止");
+        SetWindowLongPtrW(ui.dot, GWLP_USERDATA, 1);
+        InvalidateRect(ui.dot, nullptr, TRUE);
+    }
+}
+
+static void setCombo(HWND combo, const std::vector<std::wstring>& items, const std::wstring& sel) {
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    int selIdx = -1;
+    for (size_t i = 0; i < items.size(); ++i) {
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)items[i].c_str());
+        if (items[i] == sel) selIdx = (int)i;
+    }
+    SendMessageW(combo, CB_SETCURSEL, selIdx < 0 ? 0 : selIdx, 0);
+}
+
+static void refreshVersions(Comp c) {
+    CompUI& ui = g_ui[(int)c];
+    if (!ui.verCombo) return;
+    std::vector<std::wstring> versions;
+    std::wstring current;
+    bool running = false, installed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        versions = g_snapVersions[(int)c];
+        current = g_snapCurrent[(int)c];
+        running = g_snapRunning[(int)c];
+        installed = g_snapInstalled[(int)c];
+    }
+    setCombo(ui.verCombo, versions, current);
+    setStatus(c, running, installed);
+    EnableWindow(ui.verCombo, installed);
+    EnableWindow(ui.btnSwitch, installed);
+    EnableWindow(ui.btnStart, installed);
+    EnableWindow(ui.btnStop, installed);
+}
+
+// ============================ Worker helpers ============================
+
+static void beginOp(Comp c, const std::wstring& name) {
+    CompUI& ui = g_ui[(int)c];
+    ui.busy = true;
+    ui.opName = name;
+    logMsgUi(c, L"==> " + name + L" ...");
+    EnableWindow(ui.btnStart, FALSE);
+    EnableWindow(ui.btnStop, FALSE);
+    EnableWindow(ui.btnSwitch, FALSE);
+    EnableWindow(ui.verCombo, FALSE);
+}
+
+static void endOp(Comp c, bool ok, const std::wstring& msg) {
+    CompUI& ui = g_ui[(int)c];
+    ui.busy = false;
+    logMsgUi(c, ok ? (L"==> " + ui.opName + L" 完成") : (L"==> " + ui.opName + L" 失败: " + msg));
+    // refresh UI on UI thread
+    PostMessageW(g_main, WM_OP_DONE, (WPARAM)c, ok ? 0 : 1);
+}
+
+static void runAsync(Comp c, const std::wstring& name,
+                     std::function<bool(std::wstring&)> fn) {
+    CompUI& ui = g_ui[(int)c];
+    if (ui.busy) return;
+    beginOp(c, name);
+    std::thread([c, fn]() {
+        std::wstring err;
+        bool ok = fn(err);
+        endOp(c, ok, err);
+    }).detach();
+}
+
+// ============================ Background polling ============================
+// Component status and the pm2 list are computed on worker threads so the UI
+// thread never blocks on disk scans or helper-process spawns (the source of
+// drag / tab-switch lag). Workers fill this snapshot and post a message; the
+// UI thread reads it and repaints.
+
+static void statusWorker() {
+    if (g_appClosing) return;
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        ComponentStatus st = compStatusQuick((Comp)i);
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        g_snapRunning[i] = st.running;
+        g_snapInstalled[i] = st.installed;
+        g_snapCurrent[i] = st.currentVersion;
+        g_snapVersions[i] = st.versions;
+    }
+    g_statusWorkerBusy = false;
+    PostMessageW(g_main, WM_UI_STATUS, 0, 0);
+}
+
+static void pm2Worker() {
+    if (g_appClosing) return;
+    ComponentStatus st = compStatusQuick(Comp::Nodejs);
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        g_snapRunning[(int)Comp::Nodejs] = st.running;
+        g_snapInstalled[(int)Comp::Nodejs] = st.installed;
+        g_snapCurrent[(int)Comp::Nodejs] = st.currentVersion;
+        g_snapVersions[(int)Comp::Nodejs] = st.versions;
+    }
+    if (g_curTab == compToTab(Comp::Nodejs)) {
+        std::vector<PM2App> apps = nodePm2List();
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        g_snapPm2 = apps;
+    }
+    g_pm2WorkerBusy = false;
+    PostMessageW(g_main, WM_UI_PM2, 0, 0);
+}
+
+static void kickStatusPoll() {
+    if (g_statusWorkerBusy.exchange(true)) return;
+    std::thread(statusWorker).detach();
+}
+
+static void kickPm2Poll() {
+    if (g_pm2WorkerBusy.exchange(true)) return;
+    std::thread(pm2Worker).detach();
+}
+
+// ============================ Refresh functions ============================
+
+static void refreshNginxVHosts() {
+    HWND lv = GetDlgItem(g_main, IDC_NG_VHOST_LIST);
+    if (!lv) return;
+    ListView_DeleteAllItems(lv);
+    auto hosts = nginxListVHosts();
+    for (auto& v : hosts) {
+        LVITEMW item = {0};
+        item.mask = LVIF_TEXT;
+        item.iItem = ListView_GetItemCount(lv);
+        item.pszText = (LPWSTR)v.name.c_str();
+        ListView_InsertItem(lv, &item);
+        ListView_SetItemText(lv, item.iItem, 1, (LPWSTR)v.domain.c_str());
+        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)v.port.c_str());
+        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)v.root.c_str());
+    }
+}
+
+static void refreshPgInfo() {
+    HWND info = GetDlgItem(g_main, IDC_PG_INFO);
+    if (!info) return;
+    std::wstring ver;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        ver = g_snapCurrent[(int)Comp::Postgresql];
+        installed = g_snapInstalled[(int)Comp::Postgresql];
+    }
+    std::wstring txt = L"当前版本: " + ver + L"\r\n"
+        + L"端口: " + pgPort() + L"\r\n"
+        + L"用户: " + pgUser() + L"\r\n"
+        + L"数据目录: " + (installed ? compDataVerDir(Comp::Postgresql, ver) : L"(未安装)");
+    SetWindowTextW(info, txt.c_str());
+}
+
+static void refreshRedisInfo() {
+    HWND info = GetDlgItem(g_main, IDC_REDIS_INFO);
+    if (!info) return;
+    std::wstring ver;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        ver = g_snapCurrent[(int)Comp::Redis];
+        installed = g_snapInstalled[(int)Comp::Redis];
+    }
+    std::wstring txt = L"当前版本: " + ver + L"\r\n端口: " + redisPort()
+        + L"\r\n数据目录: " + (installed ? compDataVerDir(Comp::Redis, ver) : L"(未安装)");
+    SetWindowTextW(info, txt.c_str());
+}
+
+static void refreshPm2List() {
+    HWND lv = GetDlgItem(g_main, IDC_NODE_PM2_LIST);
+    if (!lv) return;
+    std::vector<PM2App> apps;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        apps = g_snapPm2;
+    }
+    // remember the selected pm_id so a periodic refresh doesn't drop the selection
+    int selPmId = -1;
+    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    if (sel >= 0) {
+        wchar_t idBuf[64];
+        ListView_GetItemText(lv, sel, 0, idBuf, 64);
+        selPmId = _wtoi(idBuf);
+    }
+    ListView_DeleteAllItems(lv);
+    int selNew = -1;
+    for (auto& a : apps) {
+        LVITEMW item = {0};
+        item.mask = LVIF_TEXT;
+        item.iItem = ListView_GetItemCount(lv);
+        std::wstring id = std::to_wstring(a.id);
+        item.pszText = (LPWSTR)id.c_str();
+        ListView_InsertItem(lv, &item);
+        ListView_SetItemText(lv, item.iItem, 1, (LPWSTR)a.name.c_str());
+        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)a.status.c_str());
+        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)std::to_wstring(a.restarts).c_str());
+        if (a.id == selPmId) selNew = item.iItem;
+    }
+    if (selNew >= 0) {
+        ListView_SetItemState(lv, selNew, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+}
+
+static void refreshAll(Comp c) {
+    refreshVersions(c);
+    switch (c) {
+        case Comp::Nginx: refreshNginxVHosts(); break;
+        case Comp::Postgresql: refreshPgInfo(); break;
+        case Comp::Redis: refreshRedisInfo(); break;
+        case Comp::Nodejs: refreshPm2List(); break;
+        default: break;
+    }
+}
+
+static void refreshOverview() {
+    OverviewUI& ov = g_ov;
+    bool allBusy = ov.busy;
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        if (!ov.dot[i]) continue;
+        bool running, installed;
+        std::wstring ver;
+        {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            running = g_snapRunning[i];
+            installed = g_snapInstalled[i];
+            ver = g_snapCurrent[i];
+        }
+        int state = installed ? (running ? 2 : 1) : 0;
+        SetWindowLongPtrW(ov.dot[i], GWLP_USERDATA, state);
+        InvalidateRect(ov.dot[i], nullptr, TRUE);
+        std::wstring txt = !installed ? L"未安装"
+                         : (running ? L"运行中 " + ver : L"已停止");
+        SetWindowTextW(ov.status[i], txt.c_str());
+        SetWindowTextW(ov.btnToggle[i], running ? L"停止" : L"启动");
+        EnableWindow(ov.btnToggle[i], !g_ui[i].busy && !allBusy);
+    }
+    EnableWindow(ov.btnAllStart, !allBusy);
+    EnableWindow(ov.btnAllRestart, !allBusy);
+    EnableWindow(ov.btnAllStop, !allBusy);
+}
+
+// ============================ Actions ============================
+
+static void actStart(Comp c) {
+    runAsync(c, L"启动 " + std::wstring(compDisplay(c)), [c](std::wstring& err) {
+        return compStart(c, err);
+    });
+}
+
+static void actStop(Comp c) {
+    runAsync(c, L"停止 " + std::wstring(compDisplay(c)), [c](std::wstring& err) {
+        return compStop(c, err);
+    });
+}
+
+static void actSwitch(Comp c) {
+    CompUI& ui = g_ui[(int)c];
+    int idx = (int)SendMessageW(ui.verCombo, CB_GETCURSEL, 0, 0);
+    if (idx < 0) return;
+    wchar_t buf[128];
+    SendMessageW(ui.verCombo, CB_GETLBTEXT, idx, (LPARAM)buf);
+    std::wstring ver = buf;
+    ComponentStatus st = compStatus(c);
+    if (ver == st.currentVersion) {
+        logMsgUi(c, L"已是当前版本 " + ver);
+        return;
+    }
+    runAsync(c, L"切换到版本 " + ver, [c, ver](std::wstring& err) {
+        return compSwitchVersion(c, ver, err);
+    });
+}
+
+// ---- Overview actions ----
+
+static std::wstring ovAutoKey(Comp c) { return L"autostart." + std::wstring(compName(c)); }
+static bool ovAutoEnabled(Comp c) { return iniGet(ovAutoKey(c), L"false") == L"true"; }
+static bool ovAutoAllEnabled() { return iniGet(L"autostart.enabled", L"false") == L"true"; }
+
+static void ovToggle(Comp c) {
+    if (g_ov.busy || g_ui[(int)c].busy) return;
+    bool running = false;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        running = g_snapRunning[(int)c];
+    }
+    std::wstring name = (running ? L"停止 " : L"启动 ") + std::wstring(compDisplay(c));
+    runAsync(c, name, [c, running](std::wstring& err) {
+        return running ? compStop(c, err) : compStart(c, err);
+    });
+}
+
+enum class AllOp { Start, Restart, Stop };
+
+static void ovAllOp(AllOp op) {
+    if (g_ov.busy) return;
+    g_ov.busy = true;
+    refreshOverview();
+    std::thread([op]() {
+        int fail = 0;
+        for (int i = 0; i < (int)Comp::Count; ++i) {
+            if (g_appClosing) break;
+            Comp c = (Comp)i;
+            std::wstring e;
+            bool ok = true;
+            switch (op) {
+                case AllOp::Start: ok = compStart(c, e); break;
+                case AllOp::Restart: ok = compStop(c, e); if (ok) ok = compStart(c, e); break;
+                case AllOp::Stop: ok = compStop(c, e); break;
+            }
+            if (!ok) {
+                bool ignore = (e.find(L"已在运行") != std::wstring::npos) ||
+                              (e.find(L"组件未安装") != std::wstring::npos) ||
+                              (e.find(L"未初始化") != std::wstring::npos) ||
+                              (e.find(L"未选择") != std::wstring::npos);
+                if (!ignore) { ++fail; logMsgUi(c, L"[全部操作] " + e); }
+            }
+        }
+        g_ov.busy = false;
+        PostMessageW(g_main, WM_ALL_DONE, (WPARAM)op, fail);
+    }).detach();
+}
+
+static void ovAutoAll(HWND ctl) {
+    bool on = SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    iniSet(L"autostart.enabled", on ? L"true" : L"false");
+}
+
+static void ovAutoComp(Comp c, HWND ctl) {
+    bool on = SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    iniSet(ovAutoKey(c), on ? L"true" : L"false");
+}
+
+// Called once at startup: start components whose "随管理器启动" box is checked.
+static void autoStartComponents() {
+    if (!ovAutoAllEnabled()) return;
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        Comp c = (Comp)i;
+        if (!ovAutoEnabled(c)) continue;
+        runAsync(c, L"随管理器自动启动 " + std::wstring(compDisplay(c)), [c](std::wstring& err) {
+            return compStart(c, err);
+        });
+    }
+}
+
+// ============================ Boot start (registry Run key) ============================
+
+static const wchar_t* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* RUN_VALUE = L"LNPP Manager";
+
+static bool bootStartEnabled() {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, size = 0;
+    LONG r = RegQueryValueExW(hk, RUN_VALUE, nullptr, &type, nullptr, &size);
+    RegCloseKey(hk);
+    return r == ERROR_SUCCESS;
+}
+
+static void bootStartSet(bool on) {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        // start hidden to tray at Windows login
+        std::wstring exe = L"\"" + joinPath(exeDir(), L"lnpp.exe") + L"\" --hidden";
+        RegSetValueExW(hk, RUN_VALUE, 0, REG_SZ, (const BYTE*)exe.c_str(),
+                       (DWORD)((exe.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(hk, RUN_VALUE);
+    }
+    RegCloseKey(hk);
+}
+
+// ---- user PATH helpers (persist the portable node dir) ----
+
+static bool pathHasNode(std::wstring& path, bool& present) {
+    present = false;
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return false;
+    DWORD type = REG_EXPAND_SZ;
+    wchar_t buf[32768] = {0};
+    DWORD size = sizeof(buf);
+    LONG r = RegQueryValueExW(hk, L"Path", nullptr, &type, (LPBYTE)buf, &size);
+    if (r != ERROR_SUCCESS) { RegCloseKey(hk); path.clear(); return true; }
+    path = buf;
+    RegCloseKey(hk);
+    std::wstring nodeDir = lowerStr(compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L"")));
+    std::wstringstream ss(path);
+    std::wstring item;
+    while (std::getline(ss, item, L';')) {
+        if (lowerStr(trimStr(item)) == nodeDir) { present = true; break; }
+    }
+    return true;
+}
+
+static void pathAddNode() {
+    std::wstring nodeDir = compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L""));
+    if (nodeDir.empty() || !dirExists(nodeDir)) return;
+    std::wstring path;
+    bool present;
+    if (!pathHasNode(path, present)) return;
+    if (present) { logMsg(L"path", L"Node 路径已在 PATH 中: " + nodeDir); return; }
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) return;
+    std::wstring np = path;
+    if (!np.empty() && np.back() != L';') np += L";";
+    np += nodeDir;
+    RegSetValueExW(hk, L"Path", 0, REG_EXPAND_SZ, (const BYTE*)np.c_str(),
+                   (DWORD)((np.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hk);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
+                        SMTO_ABORTIFHUNG, 5000, nullptr);
+    logMsg(L"path", L"已将 Node 目录加入用户 PATH: " + nodeDir);
+}
+
+static void pathRemoveNode() {
+    std::wstring nodeDir = lowerStr(compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L"")));
+    std::wstring path;
+    bool present;
+    if (!pathHasNode(path, present)) return;
+    if (!present) { logMsg(L"path", L"Node 路径不在 PATH 中"); return; }
+    std::wstringstream ss(path);
+    std::wstring item, np;
+    while (std::getline(ss, item, L';')) {
+        if (lowerStr(trimStr(item)) == nodeDir) continue;
+        if (!np.empty()) np += L";";
+        np += item;
+    }
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) return;
+    RegSetValueExW(hk, L"Path", 0, REG_EXPAND_SZ, (const BYTE*)np.c_str(),
+                   (DWORD)((np.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hk);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
+                        SMTO_ABORTIFHUNG, 5000, nullptr);
+    logMsg(L"path", L"已从用户 PATH 移除 Node 目录");
+}
+
+// ============================ System tray ============================
+
+static void trayAdd() {
+    if (g_trayAdded || !g_main) return;
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    // V3 size supports balloons and is the modern recommended struct size
+    g_nid.cbSize = NOTIFYICONDATAW_V3_SIZE;
+    g_nid.hWnd = g_main;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP),
+                                    IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    wcscpy_s(g_nid.szTip, L"LNPP 组件管理器");
+    BOOL ok = Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (!ok) {
+        logMsg(L"tray", L"Shell_NotifyIcon 添加失败 错误 " + std::to_wstring(GetLastError()));
+        return;
+    }
+    g_trayAdded = true;
+    g_nid.uVersion = NOTIFYICON_VERSION;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+}
+
+static void trayRemove() {
+    if (g_trayAdded) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_trayAdded = false;
+    }
+}
+
+static void trayBalloon(const wchar_t* title, const wchar_t* msg) {
+    if (!g_trayAdded || !g_main) return;
+    ZeroMemory(g_nid.szInfoTitle, sizeof(g_nid.szInfoTitle));
+    ZeroMemory(g_nid.szInfo, sizeof(g_nid.szInfo));
+    wcscpy_s(g_nid.szInfoTitle, title);
+    wcscpy_s(g_nid.szInfo, msg);
+    g_nid.dwInfoFlags = NIIF_INFO;
+    g_nid.uTimeout = 3000;
+    g_nid.uFlags = NIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+// Stop every component and verify it is really down (retry a few times).
+static void shutdownAllComponents() {
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        if (g_appClosing) break;
+        Comp c = (Comp)i;
+        std::wstring err;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (!compRunningQuick(c)) break;   // already down
+            compStop(c, err);
+            if (!compRunningQuick(c)) break;   // confirmed down
+            Sleep(500);                        // wait for a lingering process
+        }
+    }
+}
+
+static void trayShowMain() {
+    trayAdd();   // re-add in case explorer dropped the icon
+    ShowWindow(g_main, SW_SHOW);
+    SetForegroundWindow(g_main);
+}
+
+static void showTrayMenu(HWND hwnd) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主窗口");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        bool running = false;
+        {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            running = g_snapRunning[i];
+        }
+        std::wstring label = std::wstring(compDisplay((Comp)i)) +
+                             (running ? L": 运行中" : L": 已停止");
+        AppendMenuW(m, MF_STRING, IDM_TRAY_COMP_BASE + i, label.c_str());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_ALL_START, L"全部启动");
+    AppendMenuW(m, MF_STRING, IDM_TRAY_ALL_STOP, L"全部停止");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_EXIT, L"退出");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    int cmd = (int)TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+
+    if (cmd == IDM_TRAY_SHOW) {
+        trayShowMain();
+    } else if (cmd >= IDM_TRAY_COMP_BASE && cmd < IDM_TRAY_COMP_BASE + (int)Comp::Count) {
+        ovToggle((Comp)(cmd - IDM_TRAY_COMP_BASE));
+    } else if (cmd == IDM_TRAY_ALL_START) {
+        ovAllOp(AllOp::Start);
+    } else if (cmd == IDM_TRAY_ALL_STOP) {
+        ovAllOp(AllOp::Stop);
+    } else if (cmd == IDM_TRAY_EXIT) {
+        // stop all components first (background), then really quit
+        g_realExit = true;
+        ShowWindow(hwnd, SW_HIDE);
+        trayBalloon(L"LNPP 组件管理器", L"正在停止所有组件...");
+        std::thread([]() {
+            shutdownAllComponents();
+            PostMessageW(g_main, WM_REAL_EXIT, 0, 0);
+        }).detach();
+    }
+}
+
+// ============================ Tab control ============================
+static void refreshPgUsers();   // defined later
+
+static void showPage(int idx) {
+    g_curTab = idx;
+    bool ov = (idx == TAB_OVERVIEW);
+    for (HWND h : g_ov.controls)
+        ShowWindow(h, ov ? SW_SHOW : SW_HIDE);
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        bool show = (idx == compToTab((Comp)i));
+        for (HWND h : g_ui[i].pageControls)
+            ShowWindow(h, show ? SW_SHOW : SW_HIDE);
+    }
+    // nginx SSL inputs are toggled by the checkbox (not in pageControls);
+    // hide them when leaving the nginx page, re-apply the checkbox state on entry
+    bool ngActive = (idx == compToTab(Comp::Nginx));
+    bool sslOn = ngActive &&
+                 SendMessageW(GetDlgItem(g_main, IDC_NG_SSL), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    for (int ctl : { IDC_NG_LABEL_CERT, IDC_NG_CERT, IDC_NG_BTN_CERT,
+                     IDC_NG_LABEL_KEY, IDC_NG_KEY, IDC_NG_BTN_KEY }) {
+        HWND c = GetDlgItem(g_main, ctl);
+        if (c) ShowWindow(c, sslOn ? SW_SHOW : SW_HIDE);
+    }
+    // refresh current page content (reads the snapshot) and ask workers for fresh data
+    if (ov) refreshOverview();
+    else refreshAll(tabToComp(idx));
+    if (idx == compToTab(Comp::Postgresql)) refreshPgUsers();
+    kickStatusPoll();
+    kickPm2Poll();
+}
+
+// ============================ Poll timers ============================
+
+static void CALLBACK statusTimer(HWND, UINT, UINT_PTR, DWORD) {
+    kickStatusPoll();
+}
+
+static void CALLBACK pm2Timer(HWND, UINT, UINT_PTR, DWORD) {
+    kickPm2Poll();
+}
+
+// ---- apply snapshots on the UI thread (cheap repaints only) ----
+
+static void applyStatusSnapshot() {
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        CompUI& ui = g_ui[i];
+        if (!ui.statusTxt) continue;
+        bool running, installed;
+        {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            running = g_snapRunning[i];
+            installed = g_snapInstalled[i];
+        }
+        setStatus((Comp)i, running, installed);
+    }
+    int cur = g_tab ? TabCtrl_GetCurSel(g_tab) : -1;
+    if (cur >= TAB_COMP_BASE) refreshVersions(tabToComp(cur));
+    refreshPgInfo();
+    refreshRedisInfo();
+    refreshOverview();
+}
+
+static void applyPm2Snapshot() {
+    CompUI& ui = g_ui[(int)Comp::Nodejs];
+    if (ui.statusTxt) {
+        bool running, installed;
+        {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            running = g_snapRunning[(int)Comp::Nodejs];
+            installed = g_snapInstalled[(int)Comp::Nodejs];
+        }
+        setStatus(Comp::Nodejs, running, installed);
+    }
+    refreshVersions(Comp::Nodejs);
+    int cur = g_tab ? TabCtrl_GetCurSel(g_tab) : -1;
+    if (cur >= TAB_COMP_BASE && tabToComp(cur) == Comp::Nodejs) {
+        refreshPm2List();
+    }
+    refreshOverview();
+}
+
+// ============================ Dot control ============================
+
+static const wchar_t* DOT_CLASS = L"LNPPStatusDot";
+
+static LRESULT CALLBACK DotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(RGB(200, 200, 200));
+            int state = (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (state == 2) br = CreateSolidBrush(RGB(60, 200, 60));     // running
+            else if (state == 1) br = CreateSolidBrush(RGB(220, 60, 60)); // installed but stopped
+            else br = CreateSolidBrush(RGB(150, 150, 150));               // not installed
+            Ellipse(dc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
+            DeleteObject(br);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+// ============================ Overview page (first tab) ============================
+
+static void addTooltip(HWND parent, HWND ctl, const wchar_t* text) {
+    HWND tip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                               parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!tip) return;
+    TOOLINFOW ti = {0};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = parent;
+    ti.uId = (UINT_PTR)ctl;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+static void initOverviewPage(HWND parent) {
+    OverviewUI& ov = g_ov;
+    ov.controls.clear();
+    HWND chk = makeCtl(IDC_OV_AUTOSTART_ALL, L"BUTTON", L"随管理器自动启动",
+                       BS_AUTOCHECKBOX, 20, 40, 340, 20, parent);
+    ov.chkAutoAll = chk;
+    SendMessageW(chk, BM_SETCHECK, ovAutoAllEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+    ov.controls.push_back(chk);
+    addTooltip(parent, chk, L"总开关：勾选后，下方勾选了「随管理器启动」的组件随管理器一起启动");
+
+    HWND chkBoot = makeCtl(IDC_OV_BOOT_START, L"BUTTON", L"开机启动",
+                           BS_AUTOCHECKBOX, 370, 40, 330, 20, parent);
+    SendMessageW(chkBoot, BM_SETCHECK, bootStartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+    ov.controls.push_back(chkBoot);
+    addTooltip(parent, chkBoot, L"勾选后，管理器随 Windows 开机启动（最小化到托盘）");
+
+    ov.btnAllStart = makeCtl(IDC_OV_BTN_ALL_START, L"BUTTON", L"全部启动", BS_PUSHBUTTON, 20, 68, 90, 26, parent);
+    ov.btnAllRestart = makeCtl(IDC_OV_BTN_ALL_RESTART, L"BUTTON", L"全部重启", BS_PUSHBUTTON, 118, 68, 90, 26, parent);
+    ov.btnAllStop = makeCtl(IDC_OV_BTN_ALL_STOP, L"BUTTON", L"全部停止", BS_PUSHBUTTON, 216, 68, 90, 26, parent);
+    ov.controls.push_back(ov.btnAllStart);
+    ov.controls.push_back(ov.btnAllRestart);
+    ov.controls.push_back(ov.btnAllStop);
+
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        int y = 112 + i * 40;
+        Comp c = (Comp)i;
+        HWND dot = makeCtl(0, DOT_CLASS, L"", WS_CHILD | WS_VISIBLE, 24, y + 4, 16, 16, parent);
+        HWND name = makeCtl(0, L"STATIC", compDisplay(c), SS_LEFT, 48, y, 96, 20, parent);
+        HWND st = makeCtl(IDC_OV_COMP_STATUS_BASE + i, L"STATIC", L"", SS_LEFT, 150, y, 110, 20, parent);
+        HWND tgl = makeCtl(IDC_OV_COMP_START_BASE + i, L"BUTTON", L"启动", BS_PUSHBUTTON, 270, y - 2, 80, 24, parent);
+        HWND ac = makeCtl(IDC_OV_COMP_AUTO_BASE + i, L"BUTTON", L"随管理器启动", BS_AUTOCHECKBOX, 365, y, 130, 20, parent);
+        SendMessageW(ac, BM_SETCHECK, ovAutoEnabled(c) ? BST_CHECKED : BST_UNCHECKED, 0);
+        ov.dot[i] = dot;
+        ov.status[i] = st;
+        ov.btnToggle[i] = tgl;
+        ov.chkAuto[i] = ac;
+        ov.controls.push_back(dot);
+        ov.controls.push_back(name);
+        ov.controls.push_back(st);
+        ov.controls.push_back(tgl);
+        ov.controls.push_back(ac);
+    }
+
+    ov.btnPathAdd = makeCtl(IDC_OV_BTN_PATH_ADD, L"BUTTON", L"Node 加入 PATH", BS_PUSHBUTTON, 20, 264, 130, 26, parent);
+    ov.btnPathDel = makeCtl(IDC_OV_BTN_PATH_DEL, L"BUTTON", L"Node 移除 PATH", BS_PUSHBUTTON, 160, 264, 130, 26, parent);
+    ov.controls.push_back(ov.btnPathAdd);
+    ov.controls.push_back(ov.btnPathDel);
+
+    ov.result = makeCtl(IDC_OV_RESULT, L"STATIC", L"", SS_LEFT, 20, 294, 700, 20, parent);
+    ov.controls.push_back(ov.result);
+}
+
+// ============================ Main window proc ============================
+
+static void initNginxPage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Nginx];
+    // NOTE: no clear() here — pageControls already holds the common controls
+    // from initCommonControls; append the page-specific ones on top.
+    HWND lv = makeCtl(IDC_NG_VHOST_LIST, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                      LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                      20, 82, 420, 160, parent);
+    ui.pageControls.push_back(lv);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNW col = {0};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = 120; col.pszText = (LPWSTR)L"站点"; ListView_InsertColumn(lv, 0, &col);
+    col.cx = 160; col.pszText = (LPWSTR)L"域名"; ListView_InsertColumn(lv, 1, &col);
+    col.cx = 60;  col.pszText = (LPWSTR)L"端口"; ListView_InsertColumn(lv, 2, &col);
+    col.cx = 80;  col.pszText = (LPWSTR)L"根目录"; ListView_InsertColumn(lv, 3, &col);
+
+    HWND bAdd = makeCtl(IDC_NG_BTN_ADD, L"BUTTON", L"添加站点", BS_PUSHBUTTON, 20, 248, 90, 26, parent);
+    HWND bDel = makeCtl(IDC_NG_BTN_DEL, L"BUTTON", L"删除", BS_PUSHBUTTON, 120, 248, 70, 26, parent);
+    HWND bReload = makeCtl(IDC_NG_BTN_RELOAD, L"BUTTON", L"重载", BS_PUSHBUTTON, 200, 248, 70, 26, parent);
+
+    HWND lName = makeCtl(IDC_NG_LABEL_NAME, L"STATIC", L"站点名:", SS_LEFT, 450, 82, 60, 20, parent);
+    HWND eName = makeCtl(IDC_NG_ADD_NAME, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 80, 170, 22, parent);
+    HWND lDomain = makeCtl(IDC_NG_LABEL_DOMAIN, L"STATIC", L"域名:", SS_LEFT, 450, 104, 60, 20, parent);
+    HWND eDomain = makeCtl(IDC_NG_ADD_DOMAIN, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 102, 170, 22, parent);
+    HWND lPort = makeCtl(IDC_NG_LABEL_PORT, L"STATIC", L"端口:", SS_LEFT, 450, 126, 60, 20, parent);
+    HWND ePort = makeCtl(IDC_NG_ADD_PORT, L"EDIT", L"80", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 124, 170, 22, parent);
+    HWND lRoot = makeCtl(IDC_NG_LABEL_ROOT, L"STATIC", L"根目录:", SS_LEFT, 450, 148, 60, 20, parent);
+    HWND eRoot = makeCtl(IDC_NG_ROOT, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 146, 150, 22, parent);
+    HWND bRoot = makeCtl(IDC_NG_BTN_ROOT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 146, 45, 22, parent);
+
+    HWND chkSsl = makeCtl(IDC_NG_SSL, L"BUTTON", L"HTTPS/SSL", BS_AUTOCHECKBOX, 450, 170, 120, 20, parent);
+    HWND lCert = makeCtl(IDC_NG_LABEL_CERT, L"STATIC", L"证书:", SS_LEFT, 450, 192, 60, 20, parent);
+    HWND eCert = makeCtl(IDC_NG_CERT, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 190, 150, 22, parent);
+    HWND bCert = makeCtl(IDC_NG_BTN_CERT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 190, 45, 22, parent);
+    HWND lKey = makeCtl(IDC_NG_LABEL_KEY, L"STATIC", L"Key:", SS_LEFT, 450, 214, 60, 20, parent);
+    HWND eKey = makeCtl(IDC_NG_KEY, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 212, 150, 22, parent);
+    HWND bKey = makeCtl(IDC_NG_BTN_KEY, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 212, 45, 22, parent);
+    // SSL inputs start hidden; the HTTPS/SSL checkbox reveals them
+    for (HWND h : { lCert, eCert, bCert, lKey, eKey, bKey }) ShowWindow(h, SW_HIDE);
+    // SSL-only controls are toggled by the checkbox; keep them out of pageControls
+    // so switching tabs never forces them visible
+    ui.pageControls.push_back(lName);
+    ui.pageControls.push_back(lDomain);
+    ui.pageControls.push_back(lPort);
+    ui.pageControls.push_back(lRoot);
+    ui.pageControls.push_back(eRoot);
+    ui.pageControls.push_back(bRoot);
+    ui.pageControls.push_back(chkSsl);
+    ui.pageControls.push_back(eName);
+    ui.pageControls.push_back(eDomain);
+    ui.pageControls.push_back(ePort);
+    ui.pageControls.push_back(bAdd);
+    ui.pageControls.push_back(bDel);
+    ui.pageControls.push_back(bReload);
+}
+
+static void initPgPage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Postgresql];
+    HWND bInit = makeCtl(IDC_PG_BTN_INIT, L"BUTTON", L"初始化数据库", BS_PUSHBUTTON, 20, 88, 120, 26, parent);
+    HWND bPwd = makeCtl(IDC_PG_BTN_PWD, L"BUTTON", L"修改密码", BS_PUSHBUTTON, 20, 122, 120, 26, parent);
+    HWND bAddU = makeCtl(IDC_PG_BTN_ADDUSER, L"BUTTON", L"创建用户", BS_PUSHBUTTON, 20, 156, 120, 26, parent);
+    HWND bDelU = makeCtl(IDC_PG_BTN_DELUSER, L"BUTTON", L"删除用户", BS_PUSHBUTTON, 20, 190, 120, 26, parent);
+    HWND bBak = makeCtl(IDC_PG_BTN_BACKUP, L"BUTTON", L"备份数据库", BS_PUSHBUTTON, 20, 224, 120, 26, parent);
+    ui.pageControls.push_back(bInit);
+    ui.pageControls.push_back(bPwd);
+    ui.pageControls.push_back(bAddU);
+    ui.pageControls.push_back(bDelU);
+    ui.pageControls.push_back(bBak);
+
+    HWND lUser = makeCtl(IDC_PG_LABEL_USER, L"STATIC", L"用户名:", SS_LEFT, 160, 90, 60, 20, parent);
+    HWND eUser = makeCtl(IDC_PG_USER, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                         CBS_DROPDOWN | WS_VSCROLL, 225, 88, 170, 200, parent);
+    HWND lPwd = makeCtl(IDC_PG_LABEL_PWD, L"STATIC", L"密码:", SS_LEFT, 160, 118, 60, 20, parent);
+    HWND ePwd = makeCtl(IDC_PG_PWD, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD, 225, 116, 170, 22, parent);
+    HWND lPort = makeCtl(IDC_PG_LABEL_PORT, L"STATIC", L"端口:", SS_LEFT, 160, 146, 60, 20, parent);
+    HWND ePort = makeCtl(IDC_PG_PORT, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 225, 144, 170, 22, parent);
+    ui.pageControls.push_back(lUser);
+    ui.pageControls.push_back(lPwd);
+    ui.pageControls.push_back(lPort);
+    ui.pageControls.push_back(eUser);
+    ui.pageControls.push_back(ePwd);
+    ui.pageControls.push_back(ePort);
+
+    // pre-fill with current settings
+    SetWindowTextW(eUser, pgUser().c_str());
+    SetWindowTextW(ePort, pgPort().c_str());
+    SetWindowTextW(ePwd, pgPassword().c_str());
+
+    HWND info = makeCtl(IDC_PG_INFO, L"STATIC", L"", SS_LEFT, 160, 178, 300, 90, parent);
+    ui.pageControls.push_back(info);
+}
+
+static void initRedisPage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Redis];
+    HWND info = makeCtl(IDC_REDIS_INFO, L"STATIC", L"", SS_LEFT, 20, 90, 400, 160, parent);
+    ui.pageControls.push_back(info);
+}
+
+static void initNodePage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Nodejs];
+    HWND lv = makeCtl(IDC_NODE_PM2_LIST, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                      LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                      20, 82, 660, 120, parent);
+    ui.pageControls.push_back(lv);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNW col = {0};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = 60;  col.pszText = (LPWSTR)L"ID"; ListView_InsertColumn(lv, 0, &col);
+    col.cx = 220; col.pszText = (LPWSTR)L"名称"; ListView_InsertColumn(lv, 1, &col);
+    col.cx = 100; col.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(lv, 2, &col);
+    col.cx = 80;  col.pszText = (LPWSTR)L"重启次数"; ListView_InsertColumn(lv, 3, &col);
+    HWND bRefresh = makeCtl(IDC_NODE_BTN_REFRESH, L"BUTTON", L"刷新", BS_PUSHBUTTON, 20, 216, 100, 26, parent);
+    HWND bRestartAll = makeCtl(IDC_NODE_BTN_RESTART_ALL, L"BUTTON", L"全部重启", BS_PUSHBUTTON, 130, 216, 100, 26, parent);
+    HWND bDelete = makeCtl(IDC_NODE_BTN_DELETE, L"BUTTON", L"删除选中", BS_PUSHBUTTON, 240, 216, 100, 26, parent);
+    ui.pageControls.push_back(bRefresh);
+    ui.pageControls.push_back(bRestartAll);
+    ui.pageControls.push_back(bDelete);
+}
+
+static void initCommonControls(HWND parent, Comp c) {
+    CompUI& ui = g_ui[(int)c];
+    ui.pageControls.clear();
+    // status row (below the 30px tab strip)
+    HWND dot = makeCtl(IDC_DOT, DOT_CLASS, L"", WS_CHILD | WS_VISIBLE, 14, 42, 16, 16, parent);
+    HWND st = makeCtl(IDC_STATUS_TXT, L"STATIC", L"", SS_LEFT, 34, 40, 100, 20, parent);
+    makeCtl(0, L"STATIC", L"版本:", SS_LEFT, 130, 40, 40, 20, parent);
+    HWND combo = makeCtl(IDC_VER_COMBO, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                         CBS_DROPDOWNLIST | WS_VSCROLL, 175, 38, 140, 200, parent);
+    HWND bSwitch = makeCtl(IDC_BTN_SWITCH, L"BUTTON", L"切换版本", BS_PUSHBUTTON, 325, 38, 80, 24, parent);
+    HWND bStart = makeCtl(IDC_BTN_START, L"BUTTON", L"启动", BS_PUSHBUTTON, 415, 38, 70, 24, parent);
+    HWND bStop = makeCtl(IDC_BTN_STOP, L"BUTTON", L"停止", BS_PUSHBUTTON, 490, 38, 70, 24, parent);
+    HWND bCfg = makeCtl(IDC_BTN_CFG, L"BUTTON", L"配置", BS_PUSHBUTTON, 570, 38, 70, 24, parent);
+    HWND bData = makeCtl(IDC_BTN_DATA, L"BUTTON", L"数据目录", BS_PUSHBUTTON, 645, 38, 80, 24, parent);
+    HWND log = makeCtl(IDC_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
+                       ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 170, parent);
+    SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
+
+    ui.dot = dot; ui.statusTxt = st; ui.verCombo = combo;
+    ui.btnSwitch = bSwitch; ui.btnStart = bStart; ui.btnStop = bStop;
+    ui.btnCfg = bCfg; ui.btnData = bData; ui.logEdit = log;
+
+    ui.pageControls.push_back(dot);
+    ui.pageControls.push_back(st);
+    ui.pageControls.push_back(combo);
+    ui.pageControls.push_back(bSwitch);
+    ui.pageControls.push_back(bStart);
+    ui.pageControls.push_back(bStop);
+    ui.pageControls.push_back(bCfg);
+    ui.pageControls.push_back(bData);
+    ui.pageControls.push_back(log);
+}
+
+// ---- inline field helpers (values come from the pg page, not popups) ----
+
+static std::wstring pgEditText(int id) {
+    wchar_t buf[512];
+    GetDlgItemTextW(g_main, id, buf, 512);
+    return std::wstring(buf);
+}
+
+static void pgOpInit() {
+    std::wstring user = pgEditText(IDC_PG_USER);
+    if (user.empty()) user = L"postgres";
+    std::wstring pwd = pgEditText(IDC_PG_PWD);
+    std::wstring port = pgEditText(IDC_PG_PORT);
+    if (port.empty()) port = L"5432";
+    ComponentStatus st = compStatus(Comp::Postgresql);
+    runAsync(Comp::Postgresql, L"初始化数据库", [st, user, pwd, port](std::wstring& err) {
+        return pgInit(Comp::Postgresql, st.currentVersion, user, pwd, port, err);
+    });
+}
+
+static void pgOpPwd() {
+    std::wstring user = pgEditText(IDC_PG_USER);
+    if (user.empty()) user = pgUser();
+    std::wstring pwd = pgEditText(IDC_PG_PWD);
+    if (pwd.empty()) { logAppend(Comp::Postgresql, L"请填写新密码"); return; }
+    runAsync(Comp::Postgresql, L"修改密码", [user, pwd](std::wstring& err) {
+        return pgChangePassword(Comp::Postgresql, user, pwd, err);
+    });
+}
+
+static void pgOpAddUser() {
+    std::wstring user = pgEditText(IDC_PG_USER);
+    if (user.empty()) { logAppend(Comp::Postgresql, L"请填写用户名"); return; }
+    std::wstring pwd = pgEditText(IDC_PG_PWD);
+    if (pwd.empty()) { logAppend(Comp::Postgresql, L"请填写密码"); return; }
+    runAsync(Comp::Postgresql, L"创建用户", [user, pwd](std::wstring& err) {
+        return pgCreateUser(Comp::Postgresql, user, pwd, err);
+    });
+}
+
+static void pgOpDelUser() {
+    std::wstring user = pgEditText(IDC_PG_USER);
+    if (user.empty()) { logAppend(Comp::Postgresql, L"请填写用户名"); return; }
+    runAsync(Comp::Postgresql, L"删除用户", [user](std::wstring& err) {
+        return pgDropUser(Comp::Postgresql, user, err);
+    });
+}
+
+static void pgOpBackup() {
+    runAsync(Comp::Postgresql, L"备份数据库", [](std::wstring& err) {
+        std::wstring file;
+        bool ok = pgBackup(Comp::Postgresql, file, err);
+        if (ok) err = L"已保存到 " + file;
+        return ok;
+    });
+}
+
+// load the pg user list in the background, then refresh the user combo
+static void refreshPgUsers() {
+    if (g_pgUsersBusy.exchange(true)) return;
+    std::thread([]() {
+        std::vector<std::wstring> users;
+        std::wstring err;
+        if (pgListUsers(users, err)) {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            g_pgUsers = users;
+            PostMessageW(g_main, WM_PG_USERS, 0, 0);
+        }
+        g_pgUsersBusy = false;
+    }).detach();
+}
+
+// reset the nginx "add site" form after a successful add
+static void clearNginxAddForm() {
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_ADD_NAME), L"");
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_ADD_DOMAIN), L"");
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_ADD_PORT), L"80");
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_ROOT), L"");
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_CERT), L"");
+    SetWindowTextW(GetDlgItem(g_main, IDC_NG_KEY), L"");
+    SendMessageW(GetDlgItem(g_main, IDC_NG_SSL), BM_SETCHECK, BST_UNCHECKED, 0);
+    for (int ctl : { IDC_NG_LABEL_CERT, IDC_NG_CERT, IDC_NG_BTN_CERT,
+                     IDC_NG_LABEL_KEY, IDC_NG_KEY, IDC_NG_BTN_KEY }) {
+        HWND c = GetDlgItem(g_main, ctl);
+        if (c) ShowWindow(c, SW_HIDE);
+    }
+}
+
+static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_tab = makeCtl(IDC_TAB, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 720, 30, hwnd);
+            TCITEMW ti = {0};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = (LPWSTR)L"总览";
+            TabCtrl_InsertItem(g_tab, TAB_OVERVIEW, &ti);
+            ti.pszText = (LPWSTR)L"nginx";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Nginx), &ti);
+            ti.pszText = (LPWSTR)L"PostgreSQL";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Postgresql), &ti);
+            ti.pszText = (LPWSTR)L"Redis";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Redis), &ti);
+            ti.pszText = (LPWSTR)L"Node.js";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Nodejs), &ti);
+
+            initOverviewPage(hwnd);
+            initCommonControls(hwnd, Comp::Nginx);
+            initNginxPage(hwnd);
+            initCommonControls(hwnd, Comp::Postgresql);
+            initPgPage(hwnd);
+            initCommonControls(hwnd, Comp::Redis);
+            initRedisPage(hwnd);
+            initCommonControls(hwnd, Comp::Nodejs);
+            initNodePage(hwnd);
+
+            showPage(TAB_OVERVIEW);
+            kickStatusPoll();
+            kickPm2Poll();
+            SetTimer(hwnd, 1, 3000, pm2Timer);    // pm2 refresh
+            SetTimer(hwnd, 2, 2000, statusTimer); // status poll
+            autoStartComponents();
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            int cur = TabCtrl_GetCurSel(g_tab);
+            switch (id) {
+                case IDC_OV_AUTOSTART_ALL: ovAutoAll((HWND)lParam); break;
+                case IDC_OV_BOOT_START: {
+                    bool on = SendMessageW((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    bootStartSet(on);
+                    break;
+                }
+                case IDC_OV_BTN_ALL_START: ovAllOp(AllOp::Start); break;
+                case IDC_OV_BTN_ALL_RESTART: ovAllOp(AllOp::Restart); break;
+                case IDC_OV_BTN_ALL_STOP: ovAllOp(AllOp::Stop); break;
+                case IDC_OV_BTN_PATH_ADD: pathAddNode(); break;
+                case IDC_OV_BTN_PATH_DEL: pathRemoveNode(); break;
+                case IDC_OV_COMP_START_BASE + 0: ovToggle(Comp::Nginx); break;
+                case IDC_OV_COMP_START_BASE + 1: ovToggle(Comp::Postgresql); break;
+                case IDC_OV_COMP_START_BASE + 2: ovToggle(Comp::Redis); break;
+                case IDC_OV_COMP_START_BASE + 3: ovToggle(Comp::Nodejs); break;
+                case IDC_OV_COMP_AUTO_BASE + 0: ovAutoComp(Comp::Nginx, (HWND)lParam); break;
+                case IDC_OV_COMP_AUTO_BASE + 1: ovAutoComp(Comp::Postgresql, (HWND)lParam); break;
+                case IDC_OV_COMP_AUTO_BASE + 2: ovAutoComp(Comp::Redis, (HWND)lParam); break;
+                case IDC_OV_COMP_AUTO_BASE + 3: ovAutoComp(Comp::Nodejs, (HWND)lParam); break;
+                case IDC_BTN_START:
+                    if (cur >= TAB_COMP_BASE) actStart(tabToComp(cur));
+                    break;
+                case IDC_BTN_STOP:
+                    if (cur >= TAB_COMP_BASE) actStop(tabToComp(cur));
+                    break;
+                case IDC_BTN_SWITCH:
+                    if (cur >= TAB_COMP_BASE) actSwitch(tabToComp(cur));
+                    break;
+                case IDC_BTN_CFG: {
+                    if (cur < TAB_COMP_BASE) break;
+                    Comp c = tabToComp(cur);
+                    ShellExecuteW(hwnd, L"open", compEtcDir(c).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
+                }
+                case IDC_BTN_DATA: {
+                    if (cur < TAB_COMP_BASE) break;
+                    Comp c = tabToComp(cur);
+                    ComponentStatus st = compStatus(c);
+                    if (st.installed) {
+                        std::wstring dir = compDataVerDir(c, st.currentVersion);
+                        makeDirs(dir);
+                        ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    break;
+                }
+                case IDC_NG_BTN_ADD: {
+                    wchar_t name[256], domain[256], port[256], cert[1024], key[1024], root[1024];
+                    GetDlgItemTextW(hwnd, IDC_NG_ADD_NAME, name, 256);
+                    GetDlgItemTextW(hwnd, IDC_NG_ADD_DOMAIN, domain, 256);
+                    GetDlgItemTextW(hwnd, IDC_NG_ADD_PORT, port, 256);
+                    GetDlgItemTextW(hwnd, IDC_NG_ROOT, root, 1024);
+                    bool ssl = SendMessageW(GetDlgItem(hwnd, IDC_NG_SSL), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    GetDlgItemTextW(hwnd, IDC_NG_CERT, cert, 1024);
+                    GetDlgItemTextW(hwnd, IDC_NG_KEY, key, 1024);
+                    std::wstring nm = name, dm = domain, pt = port, ct = cert, ky = key, rt = root;
+                    g_pendingVhostClear = true;
+                    runAsync(Comp::Nginx, L"添加虚拟站点 " + nm, [nm, dm, pt, ssl, ct, ky, rt](std::wstring& err) {
+                        return nginxAddVHostEx(nm, dm, pt, ssl, ct, ky, rt, err);
+                    });
+                    break;
+                }
+                case IDC_NG_BTN_ROOT: {
+                    BROWSEINFOW bi = {0};
+                    bi.hwndOwner = hwnd;
+                    bi.lpszTitle = L"选择站点根目录";
+                    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+                    if (pidl) {
+                        wchar_t path[MAX_PATH];
+                        if (SHGetPathFromIDListW(pidl, path)) {
+                            SetWindowTextW(GetDlgItem(hwnd, IDC_NG_ROOT), path);
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                    break;
+                }
+                case IDC_NG_SSL: {
+                    bool on = SendMessageW((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    // default port: 80 for http, 443 for https (only if untouched)
+                    HWND portCtl = GetDlgItem(hwnd, IDC_NG_ADD_PORT);
+                    wchar_t pbuf[32];
+                    GetWindowTextW(portCtl, pbuf, 32);
+                    std::wstring cur = pbuf;
+                    if (on && cur == L"80") SetWindowTextW(portCtl, L"443");
+                    else if (!on && cur == L"443") SetWindowTextW(portCtl, L"80");
+                    for (int ctl : { IDC_NG_LABEL_CERT, IDC_NG_CERT, IDC_NG_BTN_CERT,
+                                     IDC_NG_LABEL_KEY, IDC_NG_KEY, IDC_NG_BTN_KEY }) {
+                        HWND c = GetDlgItem(hwnd, ctl);
+                        if (c) ShowWindow(c, on ? SW_SHOW : SW_HIDE);
+                    }
+                    break;
+                }
+                case IDC_NG_BTN_CERT:
+                case IDC_NG_BTN_KEY: {
+                    bool isCert = (id == IDC_NG_BTN_CERT);
+                    static const wchar_t FILTER_CERT[] = L"证书文件 (*.crt;*.pem;*.cer)\0*.crt;*.pem;*.cer\0所有文件 (*.*)\0*.*\0";
+                    static const wchar_t FILTER_KEY[]  = L"Key 文件 (*.key;*.pem)\0*.key;*.pem\0所有文件 (*.*)\0*.*\0";
+                    OPENFILENAMEW ofn = {0};
+                    wchar_t file[1024] = {0};
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFilter = isCert ? FILTER_CERT : FILTER_KEY;
+                    ofn.lpstrFile = file;
+                    ofn.nMaxFile = 1024;
+                    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if (GetOpenFileNameW(&ofn)) {
+                        SetWindowTextW(GetDlgItem(hwnd, isCert ? IDC_NG_CERT : IDC_NG_KEY), file);
+                    }
+                    break;
+                }
+                case IDC_NG_BTN_DEL: {
+                    HWND lv = GetDlgItem(hwnd, IDC_NG_VHOST_LIST);
+                    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+                    if (sel < 0) { logAppend(Comp::Nginx, L"请先选中要删除的站点"); break; }
+                    wchar_t name[256];
+                    ListView_GetItemText(lv, sel, 0, name, 256);
+                    std::wstring nm = name;
+                    runAsync(Comp::Nginx, L"删除虚拟站点 " + nm, [nm](std::wstring& err) {
+                        return nginxRemoveVHost(nm, err);
+                    });
+                    break;
+                }
+                case IDC_NG_BTN_RELOAD: {
+                    runAsync(Comp::Nginx, L"重载 nginx 配置", [](std::wstring& err) {
+                        return nginxReload(err);
+                    });
+                    break;
+                }
+                case IDC_PG_BTN_INIT: pgOpInit(); break;
+                case IDC_PG_BTN_PWD: pgOpPwd(); break;
+                case IDC_PG_BTN_ADDUSER: pgOpAddUser(); break;
+                case IDC_PG_BTN_DELUSER: pgOpDelUser(); break;
+                case IDC_PG_BTN_BACKUP: pgOpBackup(); break;
+                case IDC_NODE_BTN_RESTART_ALL:
+                    runAsync(Comp::Nodejs, L"重启全部 PM2 应用", [](std::wstring& err) {
+                        return nodePm2RestartAll(err);
+                    });
+                    break;
+                case IDC_NODE_BTN_DELETE: {
+                    HWND lv = GetDlgItem(hwnd, IDC_NODE_PM2_LIST);
+                    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+                    if (sel < 0) { logAppend(Comp::Nodejs, L"请先选中要删除的项目"); break; }
+                    wchar_t idBuf[64];
+                    ListView_GetItemText(lv, sel, 0, idBuf, 64);
+                    int id = _wtoi(idBuf);
+                    runAsync(Comp::Nodejs, L"删除 PM2 项目 #" + std::to_wstring(id), [id](std::wstring& err) {
+                        return nodePm2Delete(id, err);
+                    });
+                    break;
+                }
+                case IDC_NODE_BTN_REFRESH:
+                    refreshPm2List();
+                    break;
+            }
+            return 0;
+        }
+        case WM_NOTIFY: {
+            NMHDR* nm = (NMHDR*)lParam;
+            if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
+                showPage(TabCtrl_GetCurSel(g_tab));
+            }
+            break;
+        }
+        case WM_OP_DONE: {
+            Comp c = (Comp)wParam;
+            CompUI& ui = g_ui[(int)c];
+            ui.busy = false;
+            refreshAll(c);
+            refreshOverview();
+            kickStatusPoll();
+            kickPm2Poll();
+            if (c == Comp::Nginx && lParam == 0 && g_pendingVhostClear) {
+                g_pendingVhostClear = false;
+                clearNginxAddForm();
+            }
+            break;
+        }
+        case WM_ALL_DONE: {
+            AllOp op = (AllOp)wParam;
+            int fail = (int)lParam;
+            if (g_ov.result) {
+                std::wstring txt = (op == AllOp::Start ? L"全部启动" :
+                                    op == AllOp::Restart ? L"全部重启" : L"全部停止");
+                txt += fail == 0 ? L"完成" : (L"完成，失败 " + std::to_wstring(fail) + L" 项");
+                SetWindowTextW(g_ov.result, txt.c_str());
+            }
+            refreshOverview();
+            kickStatusPoll();
+            kickPm2Poll();
+            break;
+        }
+        case WM_REAL_EXIT:
+            // components are already stopped; tear down and quit
+            DestroyWindow(hwnd);
+            break;
+        case WM_PG_USERS: {
+            HWND combo = GetDlgItem(hwnd, IDC_PG_USER);
+            if (!combo) break;
+            std::vector<std::wstring> users;
+            {
+                std::lock_guard<std::mutex> lk(g_snapMtx);
+                users = g_pgUsers;
+            }
+            wchar_t cur[128];
+            GetWindowTextW(combo, cur, 128);
+            SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+            for (auto& u : users) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)u.c_str());
+            SetWindowTextW(combo, cur);
+            break;
+        }
+        case WM_UI_STATUS:
+            applyStatusSnapshot();
+            break;
+        case WM_UI_PM2:
+            applyPm2Snapshot();
+            break;
+        case WM_TRAYICON: {
+            UINT evt = LOWORD(lParam);
+            if (evt == WM_RBUTTONUP) {
+                showTrayMenu(hwnd);
+            } else if (evt == WM_LBUTTONDBLCLK) {
+                trayShowMain();
+            }
+            break;
+        }
+        case WM_CLOSE:
+            // closing the window minimizes to tray instead of exiting;
+            // return 0 so DefWindowProc doesn't destroy the window
+            if (!g_realExit) {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_SIZE: {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            MoveWindow(g_tab, 0, 0, rc.right, 30, TRUE);
+            break;
+        }
+        case WM_DESTROY:
+            g_appClosing = true;
+            trayRemove();
+            // stop all components
+            for (int i = 0; i < (int)Comp::Count; ++i) {
+                std::wstring err;
+                compStop((Comp)i, err);
+            }
+            KillTimer(hwnd, 1);
+            KillTimer(hwnd, 2);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ============================ Entry ============================
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
+    // single-instance guard: a second launch just focuses the existing window
+    HANDLE hSingle = CreateMutexW(nullptr, FALSE, L"LNPPManager_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"LNPPManager", nullptr);
+        if (existing) {
+            ShowWindow(existing, SW_SHOW);
+            SetForegroundWindow(existing);
+        }
+        return 0;
+    }
+    // boot start ("开机启动") launches minimized into the tray
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--hidden")) g_startHidden = true;
+
+    INITCOMMONCONTROLSEX icc = {0};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_WIN95_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    g_font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+    g_monoFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+
+    WNDCLASSW dotClass = {0};
+    dotClass.lpfnWndProc = DotProc;
+    dotClass.hInstance = hInst;
+    dotClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    dotClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    dotClass.lpszClassName = DOT_CLASS;
+    RegisterClassW(&dotClass);
+
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = MainProc;
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
+    wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP),
+                                   IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"LNPPManager";
+    RegisterClassExW(&wc);
+
+    g_main = CreateWindowExW(0, L"LNPPManager", L"LNPP 组件管理器",
+                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+                             WS_MINIMIZEBOX | WS_CLIPCHILDREN,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
+                             nullptr, nullptr, hInst, nullptr);
+    if (!g_main) return 0;
+
+    if (g_startHidden) ShowWindow(g_main, SW_HIDE);
+    else ShowWindow(g_main, nCmdShow);
+    UpdateWindow(g_main);
+    trayAdd();
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}

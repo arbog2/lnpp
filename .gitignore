@@ -1,0 +1,29 @@
+# build / runtime artifacts
+build/
+*.exe
+*.obj
+*.res
+*.user
+
+# third-party component binaries (hundreds of MB, manually copied)
+bin/
+
+# runtime data & sensitive files
+data/
+backup/
+logs/
+ssl/
+
+# unrelated / user-specific files
+packages.conf
+etc/nginx/vhosts/jwxt.conf
+
+# test-generated www sites (keep the dir via www/.gitkeep)
+www/final1/
+www/s1/
+www/site1/
+www/test1/
+
+# misc
+Thumbs.db
+Desktop.ini
