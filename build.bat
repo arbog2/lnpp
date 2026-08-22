@@ -15,8 +15,8 @@ if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
 
-rem compile the icon resource (app.rc -> build\app.res)
-rc /nologo /fo"build\\app.res" app.rc
+rem compile the icon + version resource (app.rc -> build\app.res)
+rc /nologo /c 65001 /fo"build\\app.res" app.rc
 if errorlevel 1 (
     echo [ERROR] Resource compile failed
     exit /b 1
