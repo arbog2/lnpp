@@ -39,8 +39,10 @@ int wmain() {
         check(tname.c_str(), compSwitchVersion(Comp::Nginx, target, err), err);
         Sleep(1200);
         check(L"running", compIsRunning(Comp::Nginx));
+        int before = (int)nginxListVHosts().size();
         check(L"add vhost", nginxAddVHost(L"final1", L"final1.local", L"8081", err), err);
-        check(L"list=1", nginxListVHosts().size() == 1);
+        std::wstring vc = L"list=" + std::to_wstring(before + 1);
+        check(vc.c_str(), nginxListVHosts().size() == before + 1);
         check(L"del vhost", nginxRemoveVHost(L"final1", err), err);
         check(L"stop", compStop(Comp::Nginx, err), err);
         Sleep(800);
