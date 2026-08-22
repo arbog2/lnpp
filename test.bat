@@ -28,21 +28,21 @@ if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
 
-set LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib
+set LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib winhttp.lib version.lib
 set FAILED=0
 
 if not "%MODE%"=="run" (
     echo [BUILD] selftest.exe
     cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"selftest.exe" ^
-        src\selftest.cpp src\common.cpp src\process.cpp src\manager.cpp /link %LIBS%
+        src\selftest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
     echo [BUILD] proctest.exe
     cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"proctest.exe" ^
-        src\proctest.cpp src\common.cpp src\process.cpp src\manager.cpp /link %LIBS%
+        src\proctest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
     echo [BUILD] migtest.exe
     cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"migtest.exe" ^
-        src\migtest.cpp src\common.cpp src\process.cpp src\manager.cpp /link %LIBS%
+        src\migtest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
 )
 

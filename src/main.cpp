@@ -1,6 +1,7 @@
 #include "common.h"
 #include "process.h"
 #include "manager.h"
+#include "downloader.h"
 #include <commdlg.h>
 #include <shlobj.h>
 
@@ -36,6 +37,7 @@ enum {
     IDC_OV_AUTOSTART_ALL = 700, IDC_OV_BTN_ALL_START = 701, IDC_OV_BTN_ALL_RESTART = 702,
     IDC_OV_BTN_ALL_STOP = 703, IDC_OV_RESULT = 704, IDC_OV_BOOT_START = 705,
     IDC_OV_BTN_PATH_ADD = 706, IDC_OV_BTN_PATH_DEL = 707,
+    IDC_OV_BTN_DL = 708, IDC_OV_VER_TXT = 709, IDC_OV_ABOUT_LINK = 714,
     IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
@@ -59,6 +61,9 @@ enum {
     WM_TRAYICON = WM_APP + 5,     // tray icon callback
     WM_REAL_EXIT = WM_APP + 6,    // all components stopped -> destroy window / quit
     WM_PG_USERS = WM_APP + 7,     // pg user list loaded -> fill the user combo
+    WM_DL_STAGE = WM_APP + 8,     // downloader: stage changed (lParam = heap wchar_t*)
+    WM_DL_PROGRESS = WM_APP + 9,  // downloader: bytes (wParam=done, lParam=total)
+    WM_DL_DONE = WM_APP + 10,     // downloader: finished (wParam=ok, lParam=heap wchar_t* err)
 };
 
 // ============================ Globals ============================
@@ -66,6 +71,8 @@ static HWND g_main = nullptr;
 static HWND g_tab = nullptr;
 static HFONT g_font = nullptr;
 static HFONT g_monoFont = nullptr;
+static HFONT g_linkFont = nullptr;
+static std::wstring appVersion();   // defined below
 
 // Background status / pm2 polling snapshot (see statusWorker / pm2Worker).
 static std::mutex g_snapMtx;
@@ -114,6 +121,8 @@ struct OverviewUI {
     HWND btnToggle[(int)Comp::Count];
     HWND chkAuto[(int)Comp::Count];
     HWND result = nullptr;
+    HWND aboutLink = nullptr;
+    HWND verTxt = nullptr;
     std::vector<HWND> controls;
     std::atomic<bool> busy{false};
 };
@@ -882,8 +891,22 @@ static void initOverviewPage(HWND parent) {
     ov.controls.push_back(ov.btnPathAdd);
     ov.controls.push_back(ov.btnPathDel);
 
+    HWND btnDl = makeCtl(IDC_OV_BTN_DL, L"BUTTON", L"下载组件", BS_PUSHBUTTON, 300, 264, 130, 26, parent);
+    ov.controls.push_back(btnDl);
+    addTooltip(parent, btnDl, L"从 packages.conf 列出的地址下载并解压组件到 bin（首次运行也会自动弹出）");
+
     ov.result = makeCtl(IDC_OV_RESULT, L"STATIC", L"", SS_LEFT, 20, 294, 700, 20, parent);
     ov.controls.push_back(ov.result);
+
+    // bottom-right: version text + "关于" link
+    std::wstring verTxt = L"v" + appVersion();
+    HWND ver = makeCtl(IDC_OV_VER_TXT, L"STATIC", verTxt.c_str(), SS_RIGHT, 620, 292, 90, 20, parent);
+    ov.controls.push_back(ver);
+    HWND about = makeCtl(IDC_OV_ABOUT_LINK, L"STATIC", L"关于", SS_NOTIFY | SS_RIGHT, 690, 292, 40, 20, parent);
+    SendMessageW(about, WM_SETFONT, (WPARAM)g_linkFont, TRUE);
+    ov.controls.push_back(about);
+    ov.aboutLink = about;
+    ov.verTxt = ver;
 }
 
 // ============================ Main window proc ============================
@@ -1128,6 +1151,338 @@ static void clearNginxAddForm() {
     }
 }
 
+// ============================ About dialog ============================
+
+static std::wstring appVersion() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    DWORD handle = 0;
+    DWORD size = GetFileVersionInfoSizeW(exe, &handle);
+    if (size > 0) {
+        std::vector<BYTE> data(size);
+        if (GetFileVersionInfoW(exe, 0, size, data.data())) {
+            VS_FIXEDFILEINFO* fi = nullptr;
+            UINT len = 0;
+            if (VerQueryValueW(data.data(), L"\\", (LPVOID*)&fi, &len) && fi) {
+                return std::to_wstring(HIWORD(fi->dwFileVersionMS)) + L"." +
+                       std::to_wstring(LOWORD(fi->dwFileVersionMS)) + L"." +
+                       std::to_wstring(HIWORD(fi->dwFileVersionLS)) + L"." +
+                       std::to_wstring(LOWORD(fi->dwFileVersionLS));
+            }
+        }
+    }
+    return L"1.0.0.0";
+}
+
+static void modal_loop(HWND dlg, HWND owner) {
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (!IsWindow(dlg)) break;
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+}
+
+static void centerOn(HWND dlg, HWND owner) {
+    RECT orc, drc;
+    GetWindowRect(owner, &orc);
+    GetWindowRect(dlg, &drc);
+    int w = drc.right - drc.left, h = drc.bottom - drc.top;
+    int x = orc.left + ((orc.right - orc.left) - w) / 2;
+    int y = orc.top + ((orc.bottom - orc.top) - h) / 2;
+    SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// About dialog control ids (local range)
+enum { IDC_AB_LINK = 950, IDC_AB_OK = 951 };
+
+static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HWND t = CreateWindowExW(0, L"STATIC", L"LNPP 组件管理器", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                     20, 22, 300, 24, hwnd, (HMENU)0, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(t, WM_SETFONT, (WPARAM)g_font, TRUE);
+            std::wstring ver = L"版本: v" + appVersion();
+            t = CreateWindowExW(0, L"STATIC", ver.c_str(), WS_CHILD | WS_VISIBLE,
+                                20, 54, 300, 20, hwnd, (HMENU)0, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(t, WM_SETFONT, (WPARAM)g_font, TRUE);
+            std::wstring ab = L"作者: arbog";
+            t = CreateWindowExW(0, L"STATIC", ab.c_str(), WS_CHILD | WS_VISIBLE,
+                                20, 80, 300, 20, hwnd, (HMENU)0, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(t, WM_SETFONT, (WPARAM)g_font, TRUE);
+            // clickable GitHub link
+            t = CreateWindowExW(0, L"STATIC", L"GitHub: https://github.com/arbog2/lnpp",
+                                WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+                                20, 106, 300, 20, hwnd, (HMENU)IDC_AB_LINK, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(t, WM_SETFONT, (WPARAM)g_linkFont, TRUE);
+            // OK
+            HWND ok = CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                      130, 148, 90, 28, hwnd, (HMENU)IDC_AB_OK, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC: {
+            int id = GetDlgCtrlID((HWND)lParam);
+            if (id == IDC_AB_LINK) {
+                SetTextColor((HDC)wParam, RGB(0, 102, 204));
+                SetBkMode((HDC)wParam, TRANSPARENT);
+                return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            }
+            break;
+        }
+        case WM_SETCURSOR: {
+            if ((HWND)wParam == GetDlgItem(hwnd, IDC_AB_LINK)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == IDC_AB_LINK && HIWORD(wParam) == STN_CLICKED) {
+                ShellExecuteW(hwnd, L"open", L"https://github.com/arbog2/lnpp", nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+            if (LOWORD(wParam) == IDC_AB_OK) { DestroyWindow(hwnd); return 0; }
+            break;
+        }
+        case WM_CLOSE: DestroyWindow(hwnd); return 0;
+        case WM_DESTROY: return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void showAboutDialog(HWND owner) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = AboutProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"LNPPAbout";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPAbout", L"关于",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 360, 220,
+                               owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!dlg) return;
+    centerOn(dlg, owner);
+    modal_loop(dlg, owner);
+    DestroyWindow(dlg);
+}
+
+// ============================ Downloader dialog ============================
+
+struct DlState {
+    HWND list = nullptr, btnGo = nullptr, btnCancel = nullptr, btnClose = nullptr;
+    HWND progress = nullptr, statusTxt = nullptr;
+    std::vector<PkgItem> items;
+    std::atomic<bool> busy{false};
+    std::atomic<bool> cancel{false};
+    std::wstring stage;
+    std::wstring curName;
+};
+
+// dl control ids (local range)
+enum { IDC_DL_LIST = 960, IDC_DL_GO = 961, IDC_DL_CANCEL = 962, IDC_DL_CLOSE = 963 };
+
+static void dlPopulate(DlState& st) {
+    ListView_DeleteAllItems(st.list);
+    st.items.clear();
+    std::wstring err;
+    auto secs = pkgsParseConf(err);
+    if (secs.empty()) { SetWindowTextW(st.statusTxt, err.c_str()); return; }
+    for (auto& s : secs) {
+        for (auto& it : s.items) st.items.push_back(it);
+    }
+    for (size_t i = 0; i < st.items.size(); ++i) {
+        auto& it = st.items[i];
+        LVITEMW vi = {0};
+        vi.mask = LVIF_TEXT;
+        vi.iItem = (int)i;
+        vi.pszText = (LPWSTR)it.comp.c_str();
+        ListView_InsertItem(st.list, &vi);
+        ListView_SetItemText(st.list, (int)i, 1, (LPWSTR)it.name.c_str());
+        std::wstring target = joinPath(binCompDir(it.comp), it.ver);
+        std::wstring status = dirExists(target) ? L"已安装" : L"未安装";
+        ListView_SetItemText(st.list, (int)i, 2, (LPWSTR)status.c_str());
+    }
+}
+
+static DlState* dlState(HWND hwnd) { return (DlState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA); }
+
+static void dlStart(HWND hwnd) {
+    DlState* st = dlState(hwnd);
+    if (!st || st->busy.load()) return;
+    int sel = ListView_GetNextItem(st->list, -1, LVNI_SELECTED);
+    if (sel < 0) { SetWindowTextW(st->statusTxt, L"请先选择要下载的组件"); return; }
+    PkgItem item = st->items[sel];
+    std::wstring target = joinPath(binCompDir(item.comp), item.ver);
+    if (dirExists(target)) { SetWindowTextW(st->statusTxt, L"该版本已安装"); return; }
+    st->busy = true;
+    st->cancel = false;
+    st->curName = item.name;
+    EnableWindow(st->btnGo, FALSE);
+    EnableWindow(st->btnClose, FALSE);
+    EnableWindow(st->btnCancel, TRUE);
+    PkgItem copy = item;
+    std::thread([hwnd, copy]() {
+        std::wstring err;
+        auto prog = [hwnd](const std::wstring& stage, DWORD done, DWORD total) {
+            wchar_t* s = _wcsdup(stage.c_str());
+            PostMessageW(hwnd, WM_DL_STAGE, 0, (LPARAM)s);
+            PostMessageW(hwnd, WM_DL_PROGRESS, (WPARAM)done, (LPARAM)total);
+        };
+        DlState* st2 = dlState(hwnd);
+        bool ok = pkgsInstall(copy, prog, st2 ? &st2->cancel : nullptr, err);
+        wchar_t* e = _wcsdup(err.c_str());
+        PostMessageW(hwnd, WM_DL_DONE, ok ? 1 : 0, (LPARAM)e);
+    }).detach();
+}
+
+static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    DlState* st = dlState(hwnd);
+    switch (msg) {
+        case WM_CREATE: {
+            st = new DlState();
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+            makeCtl(IDC_DL_LIST, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                    LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 16, 12, 560, 300, hwnd);
+            st->list = GetDlgItem(hwnd, IDC_DL_LIST);
+            ListView_SetExtendedListViewStyle(st->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            LVCOLUMNW col = {0};
+            col.mask = LVCF_TEXT | LVCF_WIDTH;
+            col.cx = 90;  col.pszText = (LPWSTR)L"组件"; ListView_InsertColumn(st->list, 0, &col);
+            col.cx = 250; col.pszText = (LPWSTR)L"条目"; ListView_InsertColumn(st->list, 1, &col);
+            col.cx = 80;  col.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(st->list, 2, &col);
+
+            st->progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER,
+                                           16, 320, 420, 20, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(st->progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+            st->statusTxt = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                            16, 348, 560, 20, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(st->statusTxt, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+            st->btnGo = makeCtl(IDC_DL_GO, L"BUTTON", L"下载", BS_PUSHBUTTON, 452, 316, 122, 28, hwnd);
+            st->btnCancel = makeCtl(IDC_DL_CANCEL, L"BUTTON", L"取消", BS_PUSHBUTTON, 452, 352, 122, 28, hwnd);
+            EnableWindow(st->btnCancel, FALSE);
+            st->btnClose = makeCtl(IDC_DL_CLOSE, L"BUTTON", L"关闭", BS_PUSHBUTTON, 452, 388, 122, 28, hwnd);
+
+            dlPopulate(*st);
+            return 0;
+        }
+        case WM_SIZE: {
+            if (st && st->list) {
+                int w = LOWORD(lParam);
+                MoveWindow(st->list, 16, 12, w - 32, 300, TRUE);
+                MoveWindow(st->progress, 16, 320, w - 200, 20, TRUE);
+                MoveWindow(st->statusTxt, 16, 348, w - 32, 20, TRUE);
+            }
+            break;
+        }
+        case WM_DL_STAGE: {
+            std::wstring stage((const wchar_t*)lParam);
+            free((void*)lParam);
+            if (st) st->stage = stage;
+            if (st) SetWindowTextW(st->statusTxt, (stage + L"  " + st->curName).c_str());
+            return 0;
+        }
+        case WM_DL_PROGRESS: {
+            if (st) {
+                DWORD done = (DWORD)wParam;
+                DWORD total = (DWORD)lParam;
+                if (total > 0) {
+                    int pct = (int)(done * 100 / total);
+                    SendMessageW(st->progress, PBM_SETPOS, pct, 0);
+                    wchar_t buf[64];
+                    swprintf(buf, 64, L"%s  %s  %u%%", st->stage.c_str(), st->curName.c_str(), pct);
+                    SetWindowTextW(st->statusTxt, buf);
+                } else {
+                    int pct = (int)((done / 1024) % 100);
+                    SendMessageW(st->progress, PBM_SETPOS, pct, 0);
+                    wchar_t buf[64];
+                    swprintf(buf, 64, L"%s  %s  %u KB", st->stage.c_str(), st->curName.c_str(), done / 1024);
+                    SetWindowTextW(st->statusTxt, buf);
+                }
+            }
+            return 0;
+        }
+        case WM_DL_DONE: {
+            bool ok = (wParam != 0);
+            std::wstring err((const wchar_t*)lParam);
+            free((void*)lParam);
+            if (st) {
+                st->busy = false;
+                EnableWindow(st->btnGo, TRUE);
+                EnableWindow(st->btnClose, TRUE);
+                EnableWindow(st->btnCancel, FALSE);
+                if (ok) {
+                    SetWindowTextW(st->statusTxt, L"安装完成");
+                    dlPopulate(*st);
+                    // refresh main window version combos
+                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Nodejs, 0);
+                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Postgresql, 0);
+                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Nginx, 0);
+                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Redis, 0);
+                } else {
+                    SetWindowTextW(st->statusTxt, (L"失败: " + err).c_str());
+                }
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            switch (LOWORD(wParam)) {
+                case IDC_DL_GO: dlStart(hwnd); break;
+                case IDC_DL_CANCEL:
+                    if (st) { st->cancel = true; SetWindowTextW(st->statusTxt, L"正在取消..."); }
+                    break;
+                case IDC_DL_CLOSE: {
+                    if (st && st->busy.load()) { SetWindowTextW(st->statusTxt, L"正在下载，请先取消"); return 0; }
+                    DestroyWindow(hwnd);
+                    break;
+                }
+            }
+            return 0;
+        }
+        case WM_CLOSE: {
+            if (st && st->busy.load()) { SetWindowTextW(st->statusTxt, L"正在下载，请先取消"); return 0; }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        case WM_DESTROY: {
+            if (st) { delete st; SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); }
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void showDownloaderDialog(HWND owner) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = DownloaderProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"LNPPDownloader";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPDownloader", L"下载组件",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
+                               0, 0, 610, 440, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!dlg) return;
+    centerOn(dlg, owner);
+    modal_loop(dlg, owner);
+    DestroyWindow(dlg);
+}
+
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1178,6 +1533,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_BTN_ALL_STOP: ovAllOp(AllOp::Stop); break;
                 case IDC_OV_BTN_PATH_ADD: pathAddNode(); break;
                 case IDC_OV_BTN_PATH_DEL: pathRemoveNode(); break;
+                case IDC_OV_BTN_DL: showDownloaderDialog(hwnd); break;
+                case IDC_OV_ABOUT_LINK:
+                    if (HIWORD(wParam) == STN_CLICKED) showAboutDialog(hwnd);
+                    break;
                 case IDC_OV_COMP_START_BASE + 0: ovToggle(Comp::Nginx); break;
                 case IDC_OV_COMP_START_BASE + 1: ovToggle(Comp::Postgresql); break;
                 case IDC_OV_COMP_START_BASE + 2: ovToggle(Comp::Redis); break;
@@ -1383,6 +1742,25 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_UI_PM2:
             applyPm2Snapshot();
             break;
+        case WM_CTLCOLORSTATIC: {
+            if ((int)GetDlgCtrlID((HWND)lParam) == IDC_OV_ABOUT_LINK) {
+                SetTextColor((HDC)wParam, RGB(0, 102, 204));
+                SetBkMode((HDC)wParam, TRANSPARENT);
+                return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            }
+            break;
+        }
+        case WM_SETCURSOR: {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            HWND h = ChildWindowFromPoint(hwnd, pt);
+            if (h && GetDlgCtrlID(h) == IDC_OV_ABOUT_LINK) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        }
         case WM_TRAYICON: {
             UINT evt = LOWORD(lParam);
             if (evt == WM_RBUTTONUP) {
@@ -1450,6 +1828,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     g_monoFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+    {
+        LOGFONTW lf = {0};
+        GetObjectW(g_font, sizeof(lf), &lf);
+        lf.lfUnderline = TRUE;
+        g_linkFont = CreateFontIndirectW(&lf);
+    }
 
     WNDCLASSW dotClass = {0};
     dotClass.lpfnWndProc = DotProc;
@@ -1482,6 +1866,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     else ShowWindow(g_main, nCmdShow);
     UpdateWindow(g_main);
     trayAdd();
+
+    // first run: no components under bin -> prompt the downloader automatically
+    if (pkgsNeedSetup()) showDownloaderDialog(g_main);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
