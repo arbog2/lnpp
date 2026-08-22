@@ -36,7 +36,53 @@ std::wstring compBinDirVer(Comp c, const std::wstring& ver) {
 // ============================ Component discovery ============================
 
 std::vector<std::wstring> compVersions(Comp c) {
-    return listSubDirs(compBinDir(c));
+    std::vector<std::wstring> versions;
+    for (const auto& ver : listSubDirs(compBinDir(c))) {
+        if (compVersionUsable(c, ver)) versions.push_back(ver);
+    }
+    // Sort version names naturally (for example 1.30 before 1.9).
+    auto parts = [](const std::wstring& value) {
+        std::vector<unsigned long long> result;
+        size_t i = 0;
+        while (i < value.size()) {
+            while (i < value.size() && !iswdigit(value[i])) ++i;
+            if (i == value.size()) break;
+            unsigned long long n = 0;
+            while (i < value.size() && iswdigit(value[i])) {
+                n = n * 10 + (value[i] - L'0');
+                ++i;
+            }
+            result.push_back(n);
+        }
+        return result;
+    };
+    std::sort(versions.begin(), versions.end(), [&](const auto& a, const auto& b) {
+        auto pa = parts(a), pb = parts(b);
+        size_t n = pa.size() > pb.size() ? pa.size() : pb.size();
+        for (size_t i = 0; i < n; ++i) {
+            auto va = i < pa.size() ? pa[i] : 0;
+            auto vb = i < pb.size() ? pb[i] : 0;
+            if (va != vb) return va > vb;
+        }
+        return lowerStr(a) > lowerStr(b);
+    });
+    return versions;
+}
+
+bool compVersionUsable(Comp c, const std::wstring& ver) {
+    if (ver.empty() || !dirExists(compBinDirVer(c, ver))) return false;
+    switch (c) {
+        case Comp::Nginx:
+            return fileExists(joinPath(compBinDirVer(c, ver), L"nginx.exe"));
+        case Comp::Postgresql:
+            return fileExists(joinPath(joinPath(compBinDirVer(c, ver), L"bin"), L"pg_ctl.exe"));
+        case Comp::Redis:
+            return fileExists(joinPath(compBinDirVer(c, ver), L"redis-server.exe"));
+        case Comp::Nodejs:
+            return fileExists(joinPath(compBinDirVer(c, ver), L"node.exe"));
+        default:
+            return false;
+    }
 }
 
 ComponentStatus compStatusImpl(Comp c, bool quick) {
@@ -47,7 +93,7 @@ ComponentStatus compStatusImpl(Comp c, bool quick) {
         // Current version persisted in ini
         std::wstring key = std::wstring(L"ver.") + compName(c);
         st.currentVersion = iniGet(key, L"");
-        if (st.currentVersion.empty() || !dirExists(compBinDirVer(c, st.currentVersion))) {
+        if (st.currentVersion.empty() || !compVersionUsable(c, st.currentVersion)) {
             st.currentVersion = st.versions.front();
             iniSet(key, st.currentVersion);
         }
@@ -249,7 +295,7 @@ bool compIsRunning(Comp c) {
     ComponentStatus st;
     st.currentVersion = iniGet(std::wstring(L"ver.") + compName(c), L"");
     if (st.currentVersion.empty()) return false;
-    if (!dirExists(compBinDirVer(c, st.currentVersion))) return false;
+    if (!compVersionUsable(c, st.currentVersion)) return false;
     switch (c) {
         case Comp::Nginx:      return nginxRunningVer(st.currentVersion);
         case Comp::Postgresql: return pgRunningVer(c, st.currentVersion);
@@ -447,7 +493,7 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
     if (!st.installed) { err = L"组件未安装"; return false; }
     if (st.currentVersion == ver) { err = L"已是当前版本"; return false; }
     // verify new version dir exists
-    if (!dirExists(compBinDirVer(c, ver))) { err = L"版本目录不存在: " + ver; return false; }
+    if (!compVersionUsable(c, ver)) { err = L"版本不可用或目录不存在: " + ver; return false; }
 
     // Stop current
     if (st.running) {

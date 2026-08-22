@@ -38,6 +38,7 @@ struct VHost {
 
 // ---- Component discovery ----
 std::vector<std::wstring> compVersions(Comp c);
+bool compVersionUsable(Comp c, const std::wstring& ver);
 ComponentStatus compStatus(Comp c);
 // Same as compStatus but never spawns helper processes (redis-cli / pm2);
 // meant for background status polling.

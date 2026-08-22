@@ -1,4 +1,5 @@
 #include "downloader.h"
+#include "manager.h"
 #include "process.h"
 #include <winhttp.h>
 #include <shellapi.h>
@@ -66,8 +67,9 @@ bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstrin
 }
 
 bool pkgsNeedSetup() {
-    for (const wchar_t* c : {L"nginx", L"nodejs", L"postgresql", L"redis"}) {
-        if (!listSubDirs(binCompDir(c)).empty()) return false;
+    const Comp components[] = {Comp::Nginx, Comp::Nodejs, Comp::Postgresql, Comp::Redis};
+    for (Comp c : components) {
+        if (!compVersions(c).empty()) return false;
     }
     return true;
 }
@@ -281,6 +283,16 @@ bool pkgsInstall(const PkgItem& item,
     makeDirs(binCompDir(comp));
     if (!shCopyDir(srcDir, target)) {
         err = L"复制到 " + target + L" 失败";
+        shDeleteTree(root);
+        return false;
+    }
+
+    Comp c = comp == L"nginx" ? Comp::Nginx :
+             comp == L"nodejs" ? Comp::Nodejs :
+             comp == L"postgresql" ? Comp::Postgresql : Comp::Redis;
+    if (!compVersionUsable(c, ver)) {
+        err = L"安装完成但缺少组件核心文件: " + target;
+        shDeleteTree(target);
         shDeleteTree(root);
         return false;
     }

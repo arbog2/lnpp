@@ -1154,8 +1154,10 @@ static void clearNginxAddForm() {
 // ============================ About dialog ============================
 
 static std::wstring appVersion() {
+    static const std::wstring cached = []() {
     wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    DWORD pathLen = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (pathLen == 0 || pathLen >= MAX_PATH) return std::wstring(L"1.0.0.0");
     DWORD handle = 0;
     DWORD size = GetFileVersionInfoSizeW(exe, &handle);
     if (size > 0) {
@@ -1163,7 +1165,9 @@ static std::wstring appVersion() {
         if (GetFileVersionInfoW(exe, 0, size, data.data())) {
             VS_FIXEDFILEINFO* fi = nullptr;
             UINT len = 0;
-            if (VerQueryValueW(data.data(), L"\\", (LPVOID*)&fi, &len) && fi) {
+            if (VerQueryValueW(data.data(), L"\\", (LPVOID*)&fi, &len) &&
+                fi && len >= sizeof(VS_FIXEDFILEINFO) &&
+                fi->dwSignature == VS_FFI_SIGNATURE) {
                 return std::to_wstring(HIWORD(fi->dwFileVersionMS)) + L"." +
                        std::to_wstring(LOWORD(fi->dwFileVersionMS)) + L"." +
                        std::to_wstring(HIWORD(fi->dwFileVersionLS)) + L"." +
@@ -1171,7 +1175,9 @@ static std::wstring appVersion() {
             }
         }
     }
-    return L"1.0.0.0";
+    return std::wstring(L"1.0.0.0");
+    }();
+    return cached;
 }
 
 static void modal_loop(HWND dlg, HWND owner) {
@@ -1309,8 +1315,10 @@ static void dlPopulate(DlState& st) {
         vi.pszText = (LPWSTR)it.comp.c_str();
         ListView_InsertItem(st.list, &vi);
         ListView_SetItemText(st.list, (int)i, 1, (LPWSTR)it.name.c_str());
-        std::wstring target = joinPath(binCompDir(it.comp), it.ver);
-        std::wstring status = dirExists(target) ? L"已安装" : L"未安装";
+        Comp c = it.comp == L"nginx" ? Comp::Nginx :
+                 it.comp == L"nodejs" ? Comp::Nodejs :
+                 it.comp == L"postgresql" ? Comp::Postgresql : Comp::Redis;
+        std::wstring status = compVersionUsable(c, it.ver) ? L"已安装" : L"未安装";
         ListView_SetItemText(st.list, (int)i, 2, (LPWSTR)status.c_str());
     }
 }
@@ -1868,7 +1876,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     trayAdd();
 
     // first run: no components under bin -> prompt the downloader automatically
-    if (pkgsNeedSetup()) showDownloaderDialog(g_main);
+    if (!g_startHidden && pkgsNeedSetup()) showDownloaderDialog(g_main);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
