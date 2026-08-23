@@ -38,6 +38,7 @@ enum {
     IDC_OV_BTN_ALL_STOP = 703, IDC_OV_RESULT = 704, IDC_OV_BOOT_START = 705,
     IDC_OV_BTN_PATH_ADD = 706, IDC_OV_BTN_PATH_DEL = 707,
     IDC_OV_BTN_DL = 708, IDC_OV_VER_TXT = 709, IDC_OV_ABOUT_LINK = 714,
+    IDC_OV_LOG = 715,
     IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
@@ -121,6 +122,7 @@ struct OverviewUI {
     HWND btnToggle[(int)Comp::Count];
     HWND chkAuto[(int)Comp::Count];
     HWND result = nullptr;
+    HWND logEdit = nullptr;
     HWND aboutLink = nullptr;
     HWND verTxt = nullptr;
     std::vector<HWND> controls;
@@ -130,8 +132,7 @@ static OverviewUI g_ov;
 
 // ============================ Utilities ============================
 
-static void logAppend(Comp c, const std::wstring& line) {
-    HWND edit = g_ui[(int)c].logEdit;
+static void logAppendTo(HWND edit, const std::wstring& line) {
     if (!edit) return;
     std::wstring text = nowText() + L"  " + line + L"\r\n";
     int len = GetWindowTextLengthW(edit);
@@ -139,6 +140,14 @@ static void logAppend(Comp c, const std::wstring& line) {
     SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
     // auto scroll
     SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+}
+
+static void logAppend(Comp c, const std::wstring& line) {
+    logAppendTo(g_ui[(int)c].logEdit, line);
+}
+
+static void ovLogAppend(const std::wstring& line) {
+    logAppendTo(g_ov.logEdit, line);
 }
 
 static void logMsgUi(Comp c, const std::wstring& msg) {
@@ -236,6 +245,18 @@ static void runAsync(Comp c, const std::wstring& name,
         bool ok = fn(err);
         endOp(c, ok, err);
     }).detach();
+}
+
+static void ovRunAsync(Comp c, const std::wstring& name,
+                       std::function<bool(std::wstring&)> fn) {
+    if (g_ov.busy || g_ui[(int)c].busy) return;
+    ovLogAppend(L"==> " + name + L" ...");
+    runAsync(c, name, [c, name, fn](std::wstring& err) {
+        bool ok = fn(err);
+        ovLogAppend(ok ? L"==> " + name + L" 完成"
+                       : L"==> " + name + L" 失败: " + err);
+        return ok;
+    });
 }
 
 // ============================ Background polling ============================
@@ -456,7 +477,7 @@ static void ovToggle(Comp c) {
         running = g_snapRunning[(int)c];
     }
     std::wstring name = (running ? L"停止 " : L"启动 ") + std::wstring(compDisplay(c));
-    runAsync(c, name, [c, running](std::wstring& err) {
+    ovRunAsync(c, name, [c, running](std::wstring& err) {
         return running ? compStop(c, err) : compStart(c, err);
     });
 }
@@ -467,6 +488,10 @@ static void ovAllOp(AllOp op) {
     if (g_ov.busy) return;
     g_ov.busy = true;
     refreshOverview();
+    const wchar_t* opName =
+        op == AllOp::Start ? L"全部启动" :
+        op == AllOp::Restart ? L"全部重启" : L"全部停止";
+    ovLogAppend(L"==> " + std::wstring(opName) + L" ...");
     std::thread([op]() {
         int fail = 0;
         for (int i = 0; i < (int)Comp::Count; ++i) {
@@ -484,7 +509,15 @@ static void ovAllOp(AllOp op) {
                               (e.find(L"组件未安装") != std::wstring::npos) ||
                               (e.find(L"未初始化") != std::wstring::npos) ||
                               (e.find(L"未选择") != std::wstring::npos);
-                if (!ignore) { ++fail; logMsgUi(c, L"[全部操作] " + e); }
+                if (ignore) {
+                    ovLogAppend(L"- " + std::wstring(compDisplay(c)) + L": 跳过 (" + e + L")");
+                } else {
+                    ++fail;
+                    logMsgUi(c, L"[全部操作] " + e);
+                    ovLogAppend(L"- " + std::wstring(compDisplay(c)) + L": 失败 (" + e + L")");
+                }
+            } else {
+                ovLogAppend(L"- " + std::wstring(compDisplay(c)) + L": 成功");
             }
         }
         g_ov.busy = false;
@@ -495,11 +528,16 @@ static void ovAllOp(AllOp op) {
 static void ovAutoAll(HWND ctl) {
     bool on = SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
     iniSet(L"autostart.enabled", on ? L"true" : L"false");
+    ovLogAppend(on ? L"随管理器自动启动：总开关已开启"
+                   : L"随管理器自动启动：总开关已关闭");
 }
 
 static void ovAutoComp(Comp c, HWND ctl) {
     bool on = SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
     iniSet(ovAutoKey(c), on ? L"true" : L"false");
+    ovLogAppend(std::wstring(compDisplay(c)) +
+                (on ? L"：已设置为随管理器启动"
+                    : L"：已取消随管理器启动"));
 }
 
 // Called once at startup: start components whose "随管理器启动" box is checked.
@@ -508,7 +546,7 @@ static void autoStartComponents() {
     for (int i = 0; i < (int)Comp::Count; ++i) {
         Comp c = (Comp)i;
         if (!ovAutoEnabled(c)) continue;
-        runAsync(c, L"随管理器自动启动 " + std::wstring(compDisplay(c)), [c](std::wstring& err) {
+        ovRunAsync(c, L"随管理器自动启动 " + std::wstring(compDisplay(c)), [c](std::wstring& err) {
             return compStart(c, err);
         });
     }
@@ -569,13 +607,26 @@ static bool pathHasNode(std::wstring& path, bool& present) {
 
 static void pathAddNode() {
     std::wstring nodeDir = compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L""));
-    if (nodeDir.empty() || !dirExists(nodeDir)) return;
+    if (nodeDir.empty() || !dirExists(nodeDir)) {
+        ovLogAppend(L"Node 路径不可用，未加入用户 PATH");
+        return;
+    }
     std::wstring path;
     bool present;
-    if (!pathHasNode(path, present)) return;
-    if (present) { logMsg(L"path", L"Node 路径已在 PATH 中: " + nodeDir); return; }
+    if (!pathHasNode(path, present)) {
+        ovLogAppend(L"读取用户 PATH 失败，未加入 Node 目录");
+        return;
+    }
+    if (present) {
+        ovLogAppend(L"Node 路径已在用户 PATH 中: " + nodeDir);
+        logMsg(L"path", L"Node 路径已在 PATH 中: " + nodeDir);
+        return;
+    }
     HKEY hk;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) return;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) {
+        ovLogAppend(L"打开用户环境变量失败，未加入 Node 目录");
+        return;
+    }
     std::wstring np = path;
     if (!np.empty() && np.back() != L';') np += L";";
     np += nodeDir;
@@ -585,14 +636,22 @@ static void pathAddNode() {
     SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
                         SMTO_ABORTIFHUNG, 5000, nullptr);
     logMsg(L"path", L"已将 Node 目录加入用户 PATH: " + nodeDir);
+    ovLogAppend(L"已将 Node 目录加入用户 PATH: " + nodeDir);
 }
 
 static void pathRemoveNode() {
     std::wstring nodeDir = lowerStr(compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L"")));
     std::wstring path;
     bool present;
-    if (!pathHasNode(path, present)) return;
-    if (!present) { logMsg(L"path", L"Node 路径不在 PATH 中"); return; }
+    if (!pathHasNode(path, present)) {
+        ovLogAppend(L"读取用户 PATH 失败，未移除 Node 目录");
+        return;
+    }
+    if (!present) {
+        ovLogAppend(L"Node 路径不在用户 PATH 中");
+        logMsg(L"path", L"Node 路径不在 PATH 中");
+        return;
+    }
     std::wstringstream ss(path);
     std::wstring item, np;
     while (std::getline(ss, item, L';')) {
@@ -601,13 +660,17 @@ static void pathRemoveNode() {
         np += item;
     }
     HKEY hk;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) return;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_SET_VALUE, &hk) != ERROR_SUCCESS) {
+        ovLogAppend(L"打开用户环境变量失败，未移除 Node 目录");
+        return;
+    }
     RegSetValueExW(hk, L"Path", 0, REG_EXPAND_SZ, (const BYTE*)np.c_str(),
                    (DWORD)((np.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(hk);
     SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
                         SMTO_ABORTIFHUNG, 5000, nullptr);
     logMsg(L"path", L"已从用户 PATH 移除 Node 目录");
+    ovLogAppend(L"已从用户 PATH 移除 Node 目录");
 }
 
 // ============================ System tray ============================
@@ -897,6 +960,13 @@ static void initOverviewPage(HWND parent) {
 
     ov.result = makeCtl(IDC_OV_RESULT, L"STATIC", L"", SS_LEFT, 20, 294, 700, 20, parent);
     ov.controls.push_back(ov.result);
+
+    HWND log = makeCtl(IDC_OV_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                       ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+                       10, 320, 700, 170, parent);
+    SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
+    ov.logEdit = log;
+    ov.controls.push_back(log);
 
     // bottom-right: version text + "关于" link
     std::wstring verTxt = L"v" + appVersion();
@@ -1433,6 +1503,7 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 if (ok) {
                     SetWindowTextW(st->statusTxt, L"安装完成");
                     dlPopulate(*st);
+                    ovLogAppend(L"组件下载安装完成: " + st->curName);
                     // refresh main window version combos
                     if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Nodejs, 0);
                     if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Postgresql, 0);
@@ -1440,6 +1511,7 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Redis, 0);
                 } else {
                     SetWindowTextW(st->statusTxt, (L"失败: " + err).c_str());
+                    ovLogAppend(L"组件下载失败: " + st->curName + L" (" + err + L")");
                 }
             }
             return 0;
@@ -1534,6 +1606,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_BOOT_START: {
                     bool on = SendMessageW((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
                     bootStartSet(on);
+                    ovLogAppend(on ? L"开机启动：已启用"
+                                   : L"开机启动：已关闭");
                     break;
                 }
                 case IDC_OV_BTN_ALL_START: ovAllOp(AllOp::Start); break;
@@ -1541,9 +1615,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_BTN_ALL_STOP: ovAllOp(AllOp::Stop); break;
                 case IDC_OV_BTN_PATH_ADD: pathAddNode(); break;
                 case IDC_OV_BTN_PATH_DEL: pathRemoveNode(); break;
-                case IDC_OV_BTN_DL: showDownloaderDialog(hwnd); break;
+                case IDC_OV_BTN_DL:
+                    ovLogAppend(L"打开组件下载器");
+                    showDownloaderDialog(hwnd);
+                    break;
                 case IDC_OV_ABOUT_LINK:
-                    if (HIWORD(wParam) == STN_CLICKED) showAboutDialog(hwnd);
+                    if (HIWORD(wParam) == STN_CLICKED) {
+                        ovLogAppend(L"打开关于对话框");
+                        showAboutDialog(hwnd);
+                    }
                     break;
                 case IDC_OV_COMP_START_BASE + 0: ovToggle(Comp::Nginx); break;
                 case IDC_OV_COMP_START_BASE + 1: ovToggle(Comp::Postgresql); break;
@@ -1714,12 +1794,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_ALL_DONE: {
             AllOp op = (AllOp)wParam;
             int fail = (int)lParam;
+            std::wstring txt = (op == AllOp::Start ? L"全部启动" :
+                                op == AllOp::Restart ? L"全部重启" : L"全部停止");
+            txt += fail == 0 ? L"完成" : (L"完成，失败 " + std::to_wstring(fail) + L" 项");
             if (g_ov.result) {
-                std::wstring txt = (op == AllOp::Start ? L"全部启动" :
-                                    op == AllOp::Restart ? L"全部重启" : L"全部停止");
-                txt += fail == 0 ? L"完成" : (L"完成，失败 " + std::to_wstring(fail) + L" 项");
                 SetWindowTextW(g_ov.result, txt.c_str());
             }
+            ovLogAppend(L"==> " + txt);
             refreshOverview();
             kickStatusPoll();
             kickPm2Poll();
