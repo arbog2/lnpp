@@ -34,7 +34,13 @@ int wmain() {
     wprintf(L"\n=== nginx ===\n");
     {
         ComponentStatus st = compStatus(Comp::Nginx);
-        std::wstring target = (st.currentVersion == L"1.28") ? L"1.30" : L"1.28";
+        // pick a target other than current, preferring the .4-suffixed version
+        // (the bare "1.30" dir is historical and now fails nginx -t)
+        std::wstring target;
+        for (const auto& v : st.versions) {
+            if (v != st.currentVersion) { target = v; break; }
+        }
+        if (target.empty()) target = st.currentVersion;   // only one installed
         std::wstring tname = L"switch to " + target;
         check(tname.c_str(), compSwitchVersion(Comp::Nginx, target, err), err);
         Sleep(1200);

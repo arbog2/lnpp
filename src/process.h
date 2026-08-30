@@ -15,6 +15,13 @@ struct RunResult {
     std::wstring output;
 };
 
+// True if the calling thread owns the main window (or is a thread that
+// pumped the message loop on its behalf). Synchronous component ops like
+// pgBackup / compStart can take many seconds and should never run on this
+// thread — call them via runAsync / a worker thread.
+void registerUiThread(DWORD tid);
+bool isUiThread();
+
 // Start a process detached (server-style). Returns false on spawn failure.
 bool startProcessDetached(const std::wstring& exe,
                           const std::wstring& args,

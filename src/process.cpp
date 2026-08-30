@@ -1,5 +1,13 @@
 #include "process.h"
 
+static DWORD g_uiThreadId = 0;
+
+void registerUiThread(DWORD tid) { g_uiThreadId = tid; }
+
+bool isUiThread() {
+    return g_uiThreadId != 0 && GetCurrentThreadId() == g_uiThreadId;
+}
+
 bool startProcessDetached(const std::wstring& exe,
                           const std::wstring& args,
                           const std::wstring& workDir,
@@ -93,6 +101,16 @@ RunResult runProcessCapture(const std::wstring& exe,
                             const std::wstring& workDir,
                             int timeoutMs,
                             const std::map<std::wstring, std::wstring>& env) {
+    // runProcessCapture is synchronous and can block for the full timeout
+    // (default 60s, some callers pass 120s+ for pg_restore). When called
+    // from the UI thread, the main window freezes — no repaints, no
+    // WM_QUIT, nothing. Catch this early in debug builds so a future
+    // change that bypasses runAsync fails fast instead of in the wild.
+#ifdef _DEBUG
+    if (isUiThread()) {
+        OutputDebugStringW(L"[lnpp] WARNING: runProcessCapture called from UI thread — will block the window.\n");
+    }
+#endif
     RunResult result;
     if (!fileExists(exe)) {
         result.output = L"命令不存在: " + exe;

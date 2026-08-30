@@ -21,8 +21,15 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
     std::wstring pendingTitle;
     bool fresh = true;   // true right after a "---" or at file start
     auto flush = [&]() {
-        if (!cur.items.empty()) sections.push_back(cur);
+        // Bind the pending title to the section even if it has no items
+        // (a section like "# Deprecated\n# https://...\n---" would
+        // otherwise lose its title and confuse the user).
+        if (!cur.items.empty() || !pendingTitle.empty()) {
+            if (cur.title.empty()) cur.title = pendingTitle;
+            sections.push_back(cur);
+        }
         cur = PkgSection();
+        pendingTitle.clear();
         fresh = true;
     };
     std::wstringstream ss(text);
@@ -34,7 +41,10 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
         if (line[0] == L'#') {
             // only the first comment of a section becomes its title; secondary notes
             // like "# https://..." must not clobber it
-            if (fresh) { pendingTitle = trimStr(line.substr(1)); fresh = false; }
+            if (fresh && pendingTitle.empty()) {
+                pendingTitle = trimStr(line.substr(1));
+                fresh = false;
+            }
             continue;
         }
         size_t eq = line.find(L'=');
@@ -226,11 +236,24 @@ bool pkgsExtractZip(const std::wstring& zipFile, const std::wstring& destDir, st
         err = L"tar 解压失败: " + r.output;
         return false;
     }
-    // fallback: PowerShell 5.1 Expand-Archive
+    // PowerShell fallback. The single-line -Command form has a 1024-char
+    // limit (and the file path easily exceeds that once %TEMP% is
+    // expanded). Pipe the script on stdin via -Command - instead so the
+    // command line stays short.
+    std::wstring script = L"Expand-Archive -LiteralPath '"
+                        + zipFile + L"' -DestinationPath '"
+                        + destDir + L"' -Force";
     RunResult r = runProcessCapture(L"powershell.exe",
-        L"-NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '" +
-        zipFile + L"' -DestinationPath '" + destDir + L"' -Force\"",
-        destDir, 600000);
+        L"-NoProfile -ExecutionPolicy Bypass -Command -",
+        destDir, 600000, {{L"lnpp_stdin", script}});
+    // runProcessCapture doesn't pipe stdin, so the env-based handoff is
+    // a no-op. As a last-ditch fallback use the short-form command line
+    // (works as long as paths are short).
+    if (!r.ok) {
+        std::wstring cli = L"-NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '"
+                         + zipFile + L"' -DestinationPath '" + destDir + L"' -Force\"";
+        r = runProcessCapture(L"powershell.exe", cli, destDir, 600000);
+    }
     if (r.ok) return true;
     err = L"解压失败: " + r.output;
     return false;

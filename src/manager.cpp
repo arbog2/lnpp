@@ -201,17 +201,15 @@ static std::wstring redisPidFile(const std::wstring& ver) {
 }
 
 static bool redisRunningVer(const std::wstring& ver) {
+    // Pidfile is the source of truth. A redis started by us always writes
+    // <data>/redis/<ver>/redis.pid, and we control the start, so any live
+    // instance we own must be in there. Probing with `redis-cli ping` was
+    // the wrong fallback: it would happily answer PONG for an unrelated
+    // Redis on the same port, or stick around for a few seconds after a
+    // clean shutdown while the kernel reclaims the socket — both cases
+    // made the UI flicker "running → stopped" right after Stop.
     DWORD pid = readPid(redisPidFile(ver));
-    if (isPidAlive(pid)) return true;
-    // pidfile may be stale/missing (crash, external instance on the port):
-    // fall back to probing the configured port with redis-cli
-    std::wstring cli;
-    if (findExe(Comp::Redis, ver, L"redis-cli.exe", cli)) {
-        RunResult r = runProcessCapture(cli, L"-p " + redisPort() + L" ping",
-                                        compBinDirVer(Comp::Redis, ver), 3000);
-        if (r.ok && r.output.find(L"PONG") != std::wstring::npos) return true;
-    }
-    return false;
+    return isPidAlive(pid);
 }
 
 // ---- nodejs / pm2 ----
@@ -782,7 +780,15 @@ bool nginxTestConfig(const std::wstring& ver, std::wstring& out) {
     std::wstring exe;
     if (!findExe(Comp::Nginx, ver, L"nginx.exe", exe)) { out = L"未找到 nginx.exe"; return false; }
     std::wstring prefix = compDataVerDir(Comp::Nginx, ver);
-    RunResult r = runProcessCapture(exe, L"-t -p \"" + toForward(prefix) + L"\"", prefix, 15000);
+    // Pass the conf as an absolute path so nginx doesn't try to resolve it
+    // relative to the prefix (newer nginx versions reject the joined path
+    // in some setups, e.g. when the prefix contains a forward-slash
+    // segment the parser doesn't recognize).
+    std::wstring conf = joinPath(prefix, L"conf\\nginx.conf");
+    std::wstring prefixArg = toForward(prefix);
+    RunResult r = runProcessCapture(exe,
+        L"-t -p \"" + prefixArg + L"\" -c \"" + toForward(conf) + L"\"",
+        prefix, 15000);
     out = r.output;
     return r.ok;
 }

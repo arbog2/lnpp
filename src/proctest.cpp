@@ -22,10 +22,18 @@ int wmain() {
     }
     check(L"running before switch", compIsRunning(Comp::Nodejs));
 
-    // switch v24 -> v22 (or vice versa based on current)
+    // switch between the two installed node versions (e.g. 24.12 <-> 22.21)
     ComponentStatus st = compStatus(Comp::Nodejs);
     std::wstring from = st.currentVersion;
-    std::wstring to = (from == L"v24") ? L"v22" : L"v24";
+    std::wstring to;
+    for (const auto& v : st.versions) {
+        if (v != from) { to = v; break; }
+    }
+    if (to.empty()) {
+        wprintf(L"  only one node version installed, skipping switch\n");
+        wprintf(L"\nFAILURES: %d\n", g_fail);
+        return g_fail;
+    }
     wprintf(L"  switching %s -> %s\n", from.c_str(), to.c_str());
 
     check(L"switch version", compSwitchVersion(Comp::Nodejs, to, err), err);

@@ -73,6 +73,7 @@ static HWND g_tab = nullptr;
 static HFONT g_font = nullptr;
 static HFONT g_monoFont = nullptr;
 static HFONT g_linkFont = nullptr;
+static HWND g_tip = nullptr;   // shared tooltip, created once at WM_CREATE
 static std::wstring appVersion();   // defined below
 
 // Background status / pm2 polling snapshot (see statusWorker / pm2Worker).
@@ -824,6 +825,12 @@ static void CALLBACK pm2Timer(HWND, UINT, UINT_PTR, DWORD) {
     kickPm2Poll();
 }
 
+// drain any pending ini writes. Runs on the UI thread every 50ms; cheap
+// when nothing's dirty.
+static void CALLBACK iniFlushTimer(HWND, UINT, UINT_PTR, DWORD) {
+    iniFlushIfDue();
+}
+
 // ---- apply snapshots on the UI thread (cheap repaints only) ----
 
 static void applyStatusSnapshot() {
@@ -893,17 +900,20 @@ static LRESULT CALLBACK DotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // ============================ Overview page (first tab) ============================
 
 static void addTooltip(HWND parent, HWND ctl, const wchar_t* text) {
-    HWND tip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
-                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                               parent, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!tip) return;
+    if (!g_tip) {
+        g_tip = CreateWindowExW(0, TOOLTIPS_CLASSW, nullptr,
+                                WS_POPUP | TTS_ALWAYSTIP,
+                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!g_tip) return;
+    }
     TOOLINFOW ti = {0};
     ti.cbSize = sizeof(ti);
-    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.uFlags = TTF_IDISHWND;
     ti.hwnd = parent;
     ti.uId = (UINT_PTR)ctl;
     ti.lpszText = (LPWSTR)text;
-    SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 }
 
 static void initOverviewPage(HWND parent) {
@@ -1255,14 +1265,22 @@ static void modal_loop(HWND dlg, HWND owner) {
     ShowWindow(dlg, SW_SHOW);
     SetForegroundWindow(dlg);
     MSG msg;
+    bool parentQuitting = false;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
+        if (msg.message == WM_QUIT) {
+            // Don't re-post: the parent message loop owns the quit signal.
+            // Remember it so we can hand control back to wWinMain instead
+            // of swallowing the quit forever.
+            parentQuitting = true;
+            break;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
         if (!IsWindow(dlg)) break;
     }
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);
+    if (parentQuitting) PostQuitMessage((int)msg.wParam);
 }
 
 static void centerOn(HWND dlg, HWND owner) {
@@ -1595,6 +1613,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             kickPm2Poll();
             SetTimer(hwnd, 1, 3000, pm2Timer);    // pm2 refresh
             SetTimer(hwnd, 2, 2000, statusTimer); // status poll
+            SetTimer(hwnd, 3, 50, iniFlushTimer); // drain pending ini writes
             autoStartComponents();
             return 0;
         }
@@ -1808,6 +1827,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         case WM_REAL_EXIT:
             // components are already stopped; tear down and quit
+            // Flush any pending ini writes (autostart toggles etc.) before
+            // the window dies, since the debounce timer won't fire again.
+            iniFlushNow();
             DestroyWindow(hwnd);
             break;
         case WM_PG_USERS: {
@@ -1860,10 +1882,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         }
         case WM_CLOSE:
-            // closing the window minimizes to tray instead of exiting;
-            // return 0 so DefWindowProc doesn't destroy the window
+            // closing the window always goes through the "shutdown, then
+            // really exit" path. Even when minimized-to-tray was intended,
+            // we still need a clean shutdown when the user picks Quit from
+            // the tray menu; running compStop synchronously inside
+            // WM_DESTROY would block the UI thread for up to 30s×4
+            // (each component has its own 30s stop timeout).
             if (!g_realExit) {
+                g_realExit = true;
                 ShowWindow(hwnd, SW_HIDE);
+                trayBalloon(L"LNPP 组件管理器", L"正在停止所有组件...");
+                std::thread([]() {
+                    shutdownAllComponents();
+                    PostMessageW(g_main, WM_REAL_EXIT, 0, 0);
+                }).detach();
                 return 0;
             }
             DestroyWindow(hwnd);
@@ -1884,6 +1916,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
+            KillTimer(hwnd, 3);
+            // flush any pending ini writes before we exit; without this
+            // the last 200ms of toggles would be lost.
+            iniFlushNow();
             PostQuitMessage(0);
             return 0;
     }
@@ -1905,6 +1941,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     }
     // boot start ("开机启动") launches minimized into the tray
     if (lpCmdLine && wcsstr(lpCmdLine, L"--hidden")) g_startHidden = true;
+
+    // Mark this thread as the UI thread so isUiThread() can guard
+    // synchronous component ops (pgBackup / compStart / pgRestore etc.)
+    // that would otherwise hang the window for 30s+.
+    registerUiThread(GetCurrentThreadId());
 
     INITCOMMONCONTROLSEX icc = {0};
     icc.dwSize = sizeof(icc);

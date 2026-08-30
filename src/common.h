@@ -61,6 +61,11 @@ std::wstring nowText();
 std::wstring iniGet(const std::wstring& key, const std::wstring& def);
 void iniSet(const std::wstring& key, const std::wstring& val);
 bool iniDelete(const std::wstring& key);
+// Writes are debounced; the UI thread calls iniFlushIfDue() from its idle
+// hook to drain pending changes. Use iniFlushNow() before exit / before
+// reading the on-disk file from outside the cache.
+void iniFlushIfDue();
+void iniFlushNow();
 
 // ---- Config paths ----
 std::wstring settingsIniPath();

@@ -116,17 +116,28 @@ std::wstring readFileText(const std::wstring& path) {
     if (h == INVALID_HANDLE_VALUE) return L"";
     LARGE_INTEGER size;
     GetFileSizeEx(h, &size);
-    if (size.QuadPart <= 0) { CloseHandle(h); return L""; }
-    std::wstring data(size.QuadPart / sizeof(wchar_t) + 1, L'\0');
+    if (size.QuadPart <= 0 || size.QuadPart > 64 * 1024 * 1024) {
+        // Empty or absurdly large; refuse to allocate blindly. 64MB cap is well
+        // above any template/ini we read; protects against corrupt size fields.
+        CloseHandle(h);
+        return L"";
+    }
+    std::string bytes((size_t)size.QuadPart, '\0');
     DWORD read = 0;
-    ReadFile(h, &data[0], (DWORD)(size.QuadPart & 0xFFFFFFFF), &read, nullptr);
+    BOOL ok = ReadFile(h, &bytes[0], (DWORD)size.QuadPart, &read, nullptr);
     CloseHandle(h);
-    // Read as bytes then convert UTF-8 to wide
-    std::string bytes((const char*)&data[0], read);
+    if (!ok || read == 0) return L"";
+    bytes.resize(read);
     if (bytes.empty()) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    if (len <= 0) {
+        // Not valid UTF-8; fall back to ANSI so the user still sees *something*.
+        len = MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+        if (len <= 0) return L"";
+    }
     std::wstring w(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &w[0], len);
+    if (MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &w[0], len) == 0)
+        MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), &w[0], len);
     return w;
 }
 
@@ -166,10 +177,28 @@ std::wstring replaceAll(const std::wstring& s, const std::wstring& from, const s
 }
 
 std::wstring renderTemplate(const std::wstring& tpl, const std::map<std::wstring, std::wstring>& kv) {
-    std::wstring result = tpl;
-    for (auto& p : kv) {
-        std::wstring key = L"{{" + p.first + L"}}";
-        result = replaceAll(result, key, p.second);
+    // Single-pass scan: copy tpl into result, but whenever we see a {{name}}
+    // placeholder we look it up in kv. If the name isn't a key, leave the
+    // placeholder untouched (so unknown substitutions don't vanish silently).
+    // The single-pass approach also prevents cascade substitution: a value
+    // containing "{{OTHER}}" used to be re-expanded, which was wrong.
+    std::wstring result;
+    result.reserve(tpl.size());
+    size_t i = 0;
+    while (i < tpl.size()) {
+        if (i + 1 < tpl.size() && tpl[i] == L'{' && tpl[i + 1] == L'{') {
+            size_t end = tpl.find(L"}}", i + 2);
+            if (end != std::wstring::npos) {
+                std::wstring name = trimStr(tpl.substr(i + 2, end - (i + 2)));
+                auto it = kv.find(name);
+                if (it != kv.end()) {
+                    result += it->second;
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
+        result += tpl[i++];
     }
     return result;
 }
@@ -204,8 +233,19 @@ std::wstring nowText() {
 }
 
 // ---- INI ----
+// All keys are normalized to lower case on read/write so callers don't have
+// to remember the exact spelling (ver.nodejs vs Ver.NodeJS). The on-disk
+// file is therefore always written with lower-case keys, even if the original
+// code paths used mixed case.
+//
+// Writes are debounced: iniSet / iniDelete mutate the in-memory map and
+// schedule a flush after ~200 ms. Repeated sets (e.g. toggling 4 autostart
+// checkboxes in a row) collapse into a single disk write.
 std::map<std::wstring, std::wstring> g_iniCache;
 bool g_iniLoaded = false;
+bool g_iniDirty = false;
+DWORD g_iniLastChangeTick = 0;
+constexpr DWORD INI_DEBOUNCE_MS = 200;
 
 std::map<std::wstring, std::wstring>& iniMap() {
     if (!g_iniLoaded) {
@@ -218,9 +258,9 @@ std::map<std::wstring, std::wstring>& iniMap() {
             while (std::getline(ss, line)) {
                 size_t eq = line.find(L'=');
                 if (eq != std::wstring::npos) {
-                    std::wstring k = trimStr(line.substr(0, eq));
+                    std::wstring k = lowerStr(trimStr(line.substr(0, eq)));
                     std::wstring v = trimStr(line.substr(eq + 1));
-                    if (!k.empty()) g_iniCache[lowerStr(k)] = v;
+                    if (!k.empty()) g_iniCache[k] = v;
                 }
             }
         }
@@ -234,6 +274,18 @@ void iniSave() {
         content += p.first + L"=" + p.second + L"\r\n";
     }
     writeFileText(settingsIniPath(), content);
+    g_iniDirty = false;
+}
+
+void iniFlushIfDue() {
+    if (!g_iniDirty) return;
+    DWORD now = GetTickCount();
+    if (now - g_iniLastChangeTick < INI_DEBOUNCE_MS) return;
+    iniSave();
+}
+
+void iniFlushNow() {
+    if (g_iniDirty) iniSave();
 }
 
 std::wstring iniGet(const std::wstring& key, const std::wstring& def) {
@@ -244,7 +296,8 @@ std::wstring iniGet(const std::wstring& key, const std::wstring& def) {
 
 void iniSet(const std::wstring& key, const std::wstring& val) {
     iniMap()[lowerStr(key)] = val;
-    iniSave();
+    g_iniDirty = true;
+    g_iniLastChangeTick = GetTickCount();
 }
 
 bool iniDelete(const std::wstring& key) {
@@ -252,7 +305,8 @@ bool iniDelete(const std::wstring& key) {
     auto it = m.find(lowerStr(key));
     if (it == m.end()) return false;
     m.erase(it);
-    iniSave();
+    g_iniDirty = true;
+    g_iniLastChangeTick = GetTickCount();
     return true;
 }
 
