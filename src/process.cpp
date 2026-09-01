@@ -62,8 +62,16 @@ bool killProcessByPid(DWORD pid) {
 }
 
 // Encode an env map into a block; include current process env for unspecified vars.
-// Returns allocated buffer (caller must free with freeEnvBlock).
+// Returns an allocated buffer (caller must free with delete[]).
 wchar_t* buildEnvBlock(const std::map<std::wstring, std::wstring>& overrides) {
+    // Windows env var names are case-insensitive; skip inherited entries that
+    // collide with an override in any case (e.g. existing "Path" vs "PATH").
+    auto isOverridden = [&](const std::wstring& k) {
+        std::wstring lk = lowerStr(k);
+        for (auto& kv : overrides)
+            if (lowerStr(kv.first) == lk) return true;
+        return false;
+    };
     std::wstring block;
     wchar_t* cur = GetEnvironmentStringsW();
     if (cur) {
@@ -76,7 +84,7 @@ wchar_t* buildEnvBlock(const std::map<std::wstring, std::wstring>& overrides) {
             size_t eq = line.find(L'=');
             if (eq != std::wstring::npos) {
                 std::wstring key = line.substr(0, eq);
-                if (overrides.find(key) == overrides.end()) {
+                if (!isOverridden(key)) {
                     block += line;
                     block += L'\0';
                 }
@@ -134,7 +142,9 @@ RunResult runProcessCapture(const std::wstring& exe,
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    // GUI subsystem: this process has no console stdin. Leave it NULL so a
+    // child that reads stdin gets immediate EOF instead of an invalid handle.
+    si.hStdInput = nullptr;
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi;
@@ -143,40 +153,29 @@ RunResult runProcessCapture(const std::wstring& exe,
     std::vector<wchar_t> cmdBuf(cmdline.begin(), cmdline.end());
     cmdBuf.push_back(0);
 
-    // Temporarily set env vars in current process, spawn, then restore.
-    // (avoids building a custom env block, which is fragile with inherited pipes)
-    std::vector<std::wstring> savedKeys;
-    std::vector<std::wstring> savedVals;
-    std::vector<bool> existed;
+    // Build a dedicated environment block instead of temporarily mutating the
+    // current process's environment (SetEnvironmentVariable) and restoring it
+    // afterwards. The save/restore dance is not thread-safe: two concurrent
+    // runProcessCapture calls (e.g. the pm2 poller setting PATH while a pg
+    // backup sets PGPASSWORD) could interleave and leave the wrong values in
+    // place — or leak one process's env into another's child.
+    wchar_t* envBlock = nullptr;
     if (!env.empty()) {
-        for (auto& kv : env) {
-            wchar_t buf[32768];
-            DWORD n = GetEnvironmentVariableW(kv.first.c_str(), buf, 32768);
-            savedKeys.push_back(kv.first);
-            if (n == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
-                existed.push_back(false);
-                savedVals.push_back(L"");
-            } else {
-                existed.push_back(true);
-                savedVals.push_back(std::wstring(buf, n));
-            }
-            SetEnvironmentVariableW(kv.first.c_str(), kv.second.c_str());
+        envBlock = buildEnvBlock(env);
+        if (!envBlock) {
+            CloseHandle(hReadPipe);
+            result.output = L"环境变量构建失败";
+            return result;
         }
     }
 
     std::wstring wd = workDir.empty() ? exeDir() : workDir;
 
     BOOL created = CreateProcessW(exe.c_str(), &cmdBuf[0], nullptr, nullptr, TRUE,
-                                  CREATE_NO_WINDOW, nullptr, wd.c_str(), &si, &pi);
+                                  CREATE_NO_WINDOW | (envBlock ? CREATE_UNICODE_ENVIRONMENT : 0),
+                                  envBlock, wd.c_str(), &si, &pi);
 
-    if (!env.empty()) {
-        for (size_t i = 0; i < savedKeys.size(); ++i) {
-            if (existed[i])
-                SetEnvironmentVariableW(savedKeys[i].c_str(), savedVals[i].c_str());
-            else
-                SetEnvironmentVariableW(savedKeys[i].c_str(), nullptr);
-        }
-    }
+    delete[] envBlock;
     CloseHandle(hWritePipe); // child holds its own copy
 
     if (!created) {
@@ -213,16 +212,20 @@ RunResult runProcessCapture(const std::wstring& exe,
     CloseHandle(hReadPipe);
     CloseHandle(pi.hProcess);
 
-    // Decode output (try UTF-8, fall back to ACP)
+    // Decode output (try UTF-8, fall back to ACP). Size the buffer from the
+    // code page actually used — the old code allocated from the UTF-8 length
+    // but wrote the ACP result into it, which can overrun when the two
+    // encodings disagree on character count.
     if (!rawOutput.empty()) {
-        int len = MultiByteToWideChar(CP_UTF8, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);
+        UINT cp = CP_UTF8;
+        int len = MultiByteToWideChar(cp, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);
         if (len <= 0) {
-            len = MultiByteToWideChar(CP_ACP, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);
+            cp = CP_ACP;
+            len = MultiByteToWideChar(cp, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);
         }
-        std::wstring w(len, L'\0');
         if (len > 0) {
-            if (MultiByteToWideChar(CP_UTF8, 0, rawOutput.c_str(), (int)rawOutput.size(), &w[0], len) == 0)
-                MultiByteToWideChar(CP_ACP, 0, rawOutput.c_str(), (int)rawOutput.size(), &w[0], len);
+            std::wstring w(len, L'\0');
+            MultiByteToWideChar(cp, 0, rawOutput.c_str(), (int)rawOutput.size(), &w[0], len);
             result.output = w;
         }
     }

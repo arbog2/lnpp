@@ -25,7 +25,7 @@ if errorlevel 1 (
 cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 ^
     /Fo"build\\" /Fe"lnpp.exe" ^
     src\main.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp ^
-    /link user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib comdlg32.lib winhttp.lib version.lib ^
+    /link user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib comdlg32.lib winhttp.lib version.lib crypt32.lib ^
     build\\app.res
 
 if errorlevel 1 (

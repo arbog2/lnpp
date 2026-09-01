@@ -10,6 +10,8 @@ struct PkgItem {
     std::wstring url;
     std::wstring comp;   // mapped component dir: nginx/nodejs/postgresql/redis
     std::wstring ver;    // text after the first '-', e.g. 1.30.4
+    std::wstring sha256; // optional lowercase 64-char hex; "" = not verified.
+                         // Fed by a companion "Nginx-1.30.4.sha256=hex" entry.
 };
 
 struct PkgSection {

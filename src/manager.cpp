@@ -33,6 +33,12 @@ std::wstring compBinDirVer(Comp c, const std::wstring& ver) {
     return joinPath(compBinDir(c), ver);
 }
 
+// Forward declarations: the SQL / command-line validators are defined in the
+// postgresql section, but the version-switch migration code above it also
+// builds a psql command line and needs them first.
+static bool pgValidIdent(const std::wstring& s);
+static bool pgValidPort(const std::wstring& s);
+
 // ============================ Component discovery ============================
 
 std::vector<std::wstring> compVersions(Comp c) {
@@ -133,7 +139,29 @@ static DWORD readPid(const std::wstring& file) {
     try { return (DWORD)_wtoi(s.c_str()); } catch (...) { return 0; }
 }
 
-static bool anyNginxRunning() {
+// True when `pid` is an nginx.exe whose image lives under our own
+// bin\nginx\<ver> directory. Matching by process name alone (the old code)
+// made the manager "adopt" any nginx.exe on the system — its master pid then
+// got written into our pidfile, and Stop/Reload would TerminateProcess a
+// server we don't own.
+static bool isOurNginx(DWORD pid, const std::wstring& ver) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
+    CloseHandle(h);
+    if (!ok) return false;
+    std::wstring exeDir = toForward(dirOf(path));
+    std::wstring ours = toForward(compBinDirVer(Comp::Nginx, ver));
+    std::wstring e = lowerStr(exeDir), o = lowerStr(ours);
+    // dirOf gives e.g. ...\bin\nginx\1.30; must sit directly under ours
+    // (trailing separator check keeps bin\nginx\1.30x from matching 1.30)
+    if (e.size() < o.size() + 1) return false;
+    return e.compare(0, o.size(), o) == 0 && e[o.size()] == L'/';
+}
+
+static bool anyNginxRunning(const std::wstring& ver) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
     PROCESSENTRY32W pe = {0};
@@ -141,15 +169,19 @@ static bool anyNginxRunning() {
     bool found = false;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0) { found = true; break; }
+            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0 && isOurNginx(pe.th32ProcessID, ver)) {
+                found = true; break;
+            }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
     return found;
 }
 
-// nginx master = a nginx.exe process whose parent is not another nginx.exe
-static DWORD nginxMasterPid() {
+// nginx master = an nginx.exe process we own whose parent is not another
+// nginx.exe (workers are children of the master; only the master answers
+// -s quit / -s reload).
+static DWORD nginxMasterPid(const std::wstring& ver) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe = {0};
@@ -157,7 +189,7 @@ static DWORD nginxMasterPid() {
     std::vector<DWORD> pids, ppids;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0) {
+            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0 && isOurNginx(pe.th32ProcessID, ver)) {
                 pids.push_back(pe.th32ProcessID);
                 ppids.push_back(pe.th32ParentProcessID);
             }
@@ -175,11 +207,12 @@ static DWORD nginxMasterPid() {
 
 static bool nginxRunningVer(const std::wstring& ver) {
     DWORD pid = readPid(nginxPidFile(ver));
-    if (isPidAlive(pid)) return true;
-    if (!anyNginxRunning()) return false;
-    // stale pidfile (e.g. nginx started outside the manager): repoint it at the
-    // live master so `-s reload` / `-s quit` address the right process
-    DWORD mp = nginxMasterPid();
+    if (pid && isPidAlive(pid) && isOurNginx(pid, ver)) return true;
+    if (!anyNginxRunning(ver)) return false;
+    // stale pidfile (e.g. nginx started outside the manager or the pidfile
+    // was wiped): repoint it at the live master so `-s reload` / `-s quit`
+    // address the right process
+    DWORD mp = nginxMasterPid(ver);
     if (mp) writeFileText(nginxPidFile(ver), std::to_wstring(mp));
     return true;
 }
@@ -421,10 +454,18 @@ bool compStop(Comp c, std::wstring& err) {
                 err = L"未找到 nginx.exe"; return false;
             }
             std::wstring prefix = compDataVerDir(Comp::Nginx, ver);
-            // graceful quit first
-            RunResult r = runProcessCapture(exe, L"-s quit -p \"" + toForward(prefix) + L"\"",
-                                            prefix, 10000);
-            // fallback: kill by pidfile
+            // Graceful quit first: `-s quit` is *asynchronous* — the master
+            // waits for workers to finish in-flight requests before exiting.
+            // The old code checked the pidfile immediately after sending the
+            // signal (still alive, of course) and force-killed, so the
+            // graceful shutdown never actually happened. Poll up to 3s first.
+            runProcessCapture(exe, L"-s quit -p \"" + toForward(prefix) + L"\"",
+                              prefix, 10000);
+            for (int i = 0; i < 30; ++i) {
+                if (!nginxRunningVer(ver)) return true;
+                Sleep(100);
+            }
+            // grace period exhausted: force kill by pidfile
             DWORD pid = readPid(nginxPidFile(ver));
             if (isPidAlive(pid)) killProcessByPid(pid);
             for (int i = 0; i < 30; ++i) {
@@ -514,7 +555,13 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
                 err = L"启动旧版本以备份失败: " + serr;
                 return false;
             }
-            Sleep(2000);
+            // poll for readiness instead of a fixed sleep (fast machines are
+            // ready sooner; slow ones would otherwise race the dump)
+            for (int i = 0; i < 60 && !pgRunningVer(c, oldVer); ++i) Sleep(200);
+            if (!pgRunningVer(c, oldVer)) {
+                err = L"旧版本启动后未就绪: " + oldVer;
+                return false;
+            }
         }
 
         std::wstring backupFile;
@@ -546,7 +593,10 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
         // so initdb sees a fresh dir; the old copy is preserved as safety
         if (dirExists(newData)) {
             std::wstring oldDir = newData + L".old-" + nowStamp();
-            MoveFileW(newData.c_str(), oldDir.c_str());
+            if (!MoveFileW(newData.c_str(), oldDir.c_str())) {
+                err = L"无法移动旧数据目录（可能被占用）: " + newData;
+                return false;
+            }
         }
 
         // init target with fresh dir
@@ -564,17 +614,27 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
                 err = L"启动新版本以恢复失败: " + berr;
                 return false;
             }
-            Sleep(2000);
+            for (int i = 0; i < 60 && !pgRunningVer(c, ver); ++i) Sleep(200);
+            if (!pgRunningVer(c, ver)) {
+                err = L"新版本启动后未就绪: " + ver;
+                return false;
+            }
             std::wstring psql;
             if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) {
                 err = L"未找到 psql.exe"; return false;
             }
-            std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
+            // port/user come from settings.ini and land on the command line
+            std::wstring port = pgPort();
+            std::wstring user = pgUser();
+            if (!pgValidPort(port)) { err = L"端口号无效: " + port; return false; }
+            if (!pgValidIdent(user)) { err = L"用户名含非法字符: " + user; return false; }
+            std::wstring cmd = L"-h 127.0.0.1 -p " + port + L" -U " + user +
                                L" -d postgres -f \"" + backupFile + L"\"";
             RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 120000,
                                             {{L"PGPASSWORD", pgPassword()}});
             if (!r.ok) {
-                err = L"恢复备份失败: " + r.output;
+                // point the user at the dump so a failed restore isn't data loss
+                err = L"恢复备份失败: " + r.output + L"（备份文件: " + backupFile + L"）";
                 return false;
             }
         }
@@ -768,7 +828,28 @@ bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir) {
 // ============================ Pg connection settings ============================
 
 std::wstring pgUser()     { return iniGet(L"pg.user", L"postgres"); }
-std::wstring pgPassword() { return iniGet(L"pg.password", L"postgres"); }
+// Password is stored DPAPI-encrypted (pg.password.enc) since the "DPAPI" fix;
+// pg.password remains as a plaintext fallback for installs created before
+// that change, and is removed as soon as the secret is re-stored encrypted.
+std::wstring pgPassword() {
+    std::wstring enc = iniGet(L"pg.password.enc", L"");
+    if (!enc.empty()) {
+        std::wstring p = dpUnprotect(enc);
+        if (!p.empty()) return p;
+    }
+    return iniGet(L"pg.password", L"postgres");
+}
+// Store the password encrypted and drop any plaintext copy. If DPAPI fails
+// (rare), keep the plaintext path so the manager still works.
+static void pgStorePassword(const std::wstring& password) {
+    std::wstring enc = dpProtect(password);
+    if (!enc.empty()) {
+        iniSet(L"pg.password.enc", enc);
+        iniDelete(L"pg.password");
+    } else {
+        iniSet(L"pg.password", password);
+    }
+}
 std::wstring pgPort()     { return iniGet(L"pg.port", L"5432"); }
 std::wstring nginxPort()  { return iniGet(L"nginx.port", L"80"); }
 std::wstring redisPort()  { return iniGet(L"redis.port", L"6379"); }
@@ -933,12 +1014,136 @@ bool nginxRemoveVHost(const std::wstring& name, std::wstring& err) {
 
 // ============================ postgresql ============================
 
+// ---- SQL / command-line safety helpers ----
+// Usernames and passwords come straight from the pg page's edit boxes. They
+// used to be concatenated into the psql command line verbatim, so a password
+// like  a'; DROP DATABASE appdb; --  executed arbitrary SQL. Two measures:
+//
+//   1. Identifiers and the port are whitelisted. They also land on the psql
+//      command line (-U, -p), where a space or quote would either split into
+//      extra arguments or corrupt the quoting.
+//   2. The statement itself is written to a temporary .sql file and run with
+//      -f. That removes the command line from the picture entirely: the only
+//      escaping left is PostgreSQL's own literal/identifier rules, which are
+//      simple and handled here.
+
+static bool pgValidIdent(const std::wstring& s) {
+    if (s.empty() || s.size() > 63) return false;
+    auto isStart = [](wchar_t c) {
+        return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'_';
+    };
+    auto isCont = [&](wchar_t c) {
+        return isStart(c) || (c >= L'0' && c <= L'9') || c == L'$';
+    };
+    if (!isStart(s[0])) return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        if (!isCont(s[i])) return false;
+    }
+    return true;
+}
+
+static bool pgValidPort(const std::wstring& s) {
+    if (s.empty() || s.size() > 5) return false;
+    long v = 0;
+    for (wchar_t c : s) {
+        if (c < L'0' || c > L'9') return false;
+        v = v * 10 + (c - L'0');
+    }
+    return v > 0 && v <= 65535;
+}
+
+// Wrap as a PostgreSQL string literal. While standard_conforming_strings is
+// on (the default since 9.1, and what initdb sets here) doubling the single
+// quote is the only transformation needed; backslashes are ordinary chars.
+static std::wstring pgEscapeLiteral(const std::wstring& s) {
+    std::wstring out = L"'";
+    for (wchar_t c : s) {
+        if (c == L'\'') out += L"''";
+        else out += c;
+    }
+    out += L'\'';
+    return out;
+}
+
+// Bare when already a plain identifier, otherwise double-quoted with
+// embedded quotes doubled. This keeps non-ASCII names (e.g. 张三) usable.
+static std::wstring pgEscapeIdent(const std::wstring& s) {
+    if (pgValidIdent(s)) return s;
+    std::wstring out = L"\"";
+    for (wchar_t c : s) {
+        if (c == L'"') out += L"\"\"";
+        else out += c;
+    }
+    out += L'"';
+    return out;
+}
+
+// Run `sql` against the running server through a temp file. extraArgs are
+// inserted verbatim before -f (caller-owned literals such as "-t -A").
+// On failure returns false with out.output holding the reason.
+static bool pgRunSql(Comp c, const std::wstring& ver, const std::wstring& extraArgs,
+                     const std::wstring& sql, RunResult& out) {
+    out = RunResult();
+    std::wstring ver2 = ver.empty() ? iniGet(L"ver.postgresql", L"") : ver;
+    if (ver2.empty()) { out.output = L"未选择 PostgreSQL 版本"; return false; }
+
+    std::wstring port = pgPort();
+    std::wstring user = pgUser();
+    if (!pgValidPort(port)) { out.output = L"端口号无效: " + port; return false; }
+    if (!pgValidIdent(user)) {
+        out.output = L"用户名含非法字符（只允许字母、数字、下划线）: " + user;
+        return false;
+    }
+    std::wstring psql;
+    if (!findExe(Comp::Postgresql, ver2, L"psql.exe", psql)) {
+        out.output = L"未找到 psql.exe";
+        return false;
+    }
+
+    wchar_t tmpDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmpDir);
+    std::wstring sqlFile = joinPath(tmpDir, L"lnpp_sql_" + nowStamp() + L"_" +
+                                    std::to_wstring(GetCurrentProcessId()) + L".sql");
+    // Pin the encoding: writeFileText emits UTF-8, but psql would otherwise
+    // decode the file with the OS ANSI code page and mangle non-ASCII names.
+    std::wstring content = L"\\encoding UTF8\r\n" + sql + L"\r\n";
+    if (!writeFileText(sqlFile, content)) {
+        out.output = L"无法写入临时 SQL 文件: " + sqlFile;
+        return false;
+    }
+
+    std::wstring cmd = L"-h 127.0.0.1 -p " + port + L" -U " + user +
+                       L" -d postgres -v ON_ERROR_STOP=1";
+    if (!extraArgs.empty()) cmd += L" " + extraArgs;
+    cmd += L" -f \"" + sqlFile + L"\"";
+
+    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver2),
+                                    15000, {{L"PGPASSWORD", pgPassword()}});
+    DeleteFileW(sqlFile.c_str());
+    if (!r.ok) {
+        out.output = r.output.empty() ? L"SQL 执行失败" : r.output;
+        return false;
+    }
+    out = r;
+    return true;
+}
+
 bool pgDataInitialized(const std::wstring& ver) {
     return fileExists(joinPath(pgDataDir(Comp::Postgresql, ver), L"PG_VERSION"));
 }
 
 bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
             const std::wstring& password, const std::wstring& port, std::wstring& err) {
+    // Validate before touching the disk: both values end up on the initdb
+    // command line, so anything but a plain identifier / plain number would
+    // either be rejected by initdb or split into bogus arguments.
+    if (!pgValidIdent(user)) {
+        err = L"用户名只能包含字母、数字、下划线、$，且以字母或下划线开头";
+        return false;
+    }
+    std::wstring effPort = port.empty() ? L"5432" : port;
+    if (!pgValidPort(effPort)) { err = L"端口号无效（应为 1-65535）: " + port; return false; }
+
     std::wstring dataDir = pgDataDir(c, ver);
     if (pgDataInitialized(ver)) { err = L"数据库已初始化"; return false; }
     if (!makeDirs(dataDir)) { err = L"无法创建数据目录"; return false; }
@@ -948,11 +1153,17 @@ bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
         err = L"未找到 initdb.exe"; return false;
     }
 
-    // write temp pw file to system temp (outside data dir so initdb sees empty dir)
+    // write temp pw file to system temp (outside data dir so initdb sees empty dir).
+    // Random-ish name: a fixed name like lnpp_pwfile.tmp could collide with a
+    // stale/foreign file of the same name and feed initdb the wrong password.
     wchar_t tmpDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tmpDir);
-    std::wstring pwFile = joinPath(tmpDir, L"lnpp_pwfile.tmp");
-    writeFileText(pwFile, password);
+    std::wstring pwFile = joinPath(tmpDir, L"lnpp_pw_" + nowStamp() + L"_" +
+                                  std::to_wstring(GetCurrentProcessId()) + L".tmp");
+    if (!writeFileText(pwFile, password)) {
+        err = L"无法写入临时密码文件: " + pwFile;
+        return false;
+    }
 
     std::wstring args = L"-D \"" + dataDir + L"\" -U " + user +
                         L" -E UTF8 --locale=C -A scram-sha-256 --pwfile=\"" + pwFile + L"\"";
@@ -964,54 +1175,48 @@ bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
         return false;
     }
 
-    // persist settings
+    // persist settings (password stored DPAPI-encrypted)
     iniSet(L"pg.user", user);
-    iniSet(L"pg.password", password);
-    iniSet(L"pg.port", port.empty() ? L"5432" : port);
+    pgStorePassword(password);
+    iniSet(L"pg.port", effPort);
 
     if (!genPgConfig(ver, dataDir)) { err = L"生成配置失败"; return false; }
     return true;
 }
 
 bool pgChangePassword(Comp c, const std::wstring& user, const std::wstring& password, std::wstring& err) {
-    std::wstring ver = iniGet(L"ver.postgresql", L"");
-    if (ver.empty()) { err = L"未选择 PostgreSQL 版本"; return false; }
-    std::wstring psql;
-    if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) { err = L"未找到 psql.exe"; return false; }
-    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
-                       L" -d postgres -c \"ALTER USER " + user + L" WITH PASSWORD '" + password + L"';\"";
-
-    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 15000,
-                                    {{L"PGPASSWORD", pgPassword()}});
-    if (!r.ok) { err = r.output.empty() ? L"修改密码失败" : r.output; return false; }
-    if (lowerStr(user) == lowerStr(pgUser())) iniSet(L"pg.password", password);
+    if (user.empty()) { err = L"用户名为空"; return false; }
+    std::wstring sql = L"ALTER USER " + pgEscapeIdent(user) +
+                       L" WITH PASSWORD " + pgEscapeLiteral(password) + L";";
+    RunResult r;
+    if (!pgRunSql(c, iniGet(L"ver.postgresql", L""), L"", sql, r)) {
+        err = r.output.empty() ? L"修改密码失败" : r.output;
+        return false;
+    }
+    if (lowerStr(user) == lowerStr(pgUser())) pgStorePassword(password);
     return true;
 }
 
 bool pgCreateUser(Comp c, const std::wstring& user, const std::wstring& password, std::wstring& err) {
-    std::wstring ver = iniGet(L"ver.postgresql", L"");
-    if (ver.empty()) { err = L"未选择 PostgreSQL 版本"; return false; }
-    std::wstring psql;
-    if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) { err = L"未找到 psql.exe"; return false; }
-    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
-                       L" -d postgres -c \"CREATE USER " + user + L" WITH PASSWORD '" + password + L"';\"";
-
-    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 15000,
-                                    {{L"PGPASSWORD", pgPassword()}});
-    if (!r.ok) { err = r.output.empty() ? L"创建用户失败" : r.output; return false; }
+    if (user.empty()) { err = L"用户名为空"; return false; }
+    std::wstring sql = L"CREATE USER " + pgEscapeIdent(user) +
+                       L" WITH PASSWORD " + pgEscapeLiteral(password) + L";";
+    RunResult r;
+    if (!pgRunSql(c, iniGet(L"ver.postgresql", L""), L"", sql, r)) {
+        err = r.output.empty() ? L"创建用户失败" : r.output;
+        return false;
+    }
     return true;
 }
 
 bool pgDropUser(Comp c, const std::wstring& user, std::wstring& err) {
-    std::wstring ver = iniGet(L"ver.postgresql", L"");
-    if (ver.empty()) { err = L"未选择 PostgreSQL 版本"; return false; }
-    std::wstring psql;
-    if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) { err = L"未找到 psql.exe"; return false; }
-    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
-                       L" -d postgres -c \"DROP USER IF EXISTS " + user + L";\"";
-    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 15000,
-                                    {{L"PGPASSWORD", pgPassword()}});
-    if (!r.ok) { err = r.output.empty() ? L"删除用户失败" : r.output; return false; }
+    if (user.empty()) { err = L"用户名为空"; return false; }
+    std::wstring sql = L"DROP USER IF EXISTS " + pgEscapeIdent(user) + L";";
+    RunResult r;
+    if (!pgRunSql(c, iniGet(L"ver.postgresql", L""), L"", sql, r)) {
+        err = r.output.empty() ? L"删除用户失败" : r.output;
+        return false;
+    }
     return true;
 }
 
@@ -1020,13 +1225,12 @@ bool pgListUsers(std::vector<std::wstring>& users, std::wstring& err) {
     std::wstring ver = iniGet(L"ver.postgresql", L"");
     if (ver.empty()) { err = L"未选择 PostgreSQL 版本"; return false; }
     if (!pgRunningVer(Comp::Postgresql, ver)) { err = L"PostgreSQL 未运行"; return false; }
-    std::wstring psql;
-    if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) { err = L"未找到 psql.exe"; return false; }
-    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
-                       L" -d postgres -t -A -c \"SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY 1\"";
-    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(Comp::Postgresql, ver), 15000,
-                                    {{L"PGPASSWORD", pgPassword()}});
-    if (!r.ok) { err = r.output; return false; }
+    RunResult r;
+    if (!pgRunSql(Comp::Postgresql, ver, L"-t -A",
+                  L"SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY 1", r)) {
+        err = r.output;
+        return false;
+    }
     std::wstringstream ss(r.output);
     std::wstring line;
     while (std::getline(ss, line)) {
@@ -1051,7 +1255,12 @@ bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err) {
     makeDirs(backupDir());
     if (backupFile.empty())
         backupFile = joinPath(backupDir(), L"postgresql-" + ver + L"-" + nowStamp() + L".sql");
-    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
+    // port/user come from settings.ini and land on the command line
+    std::wstring port = pgPort();
+    std::wstring user = pgUser();
+    if (!pgValidPort(port)) { err = L"端口号无效: " + port; return false; }
+    if (!pgValidIdent(user)) { err = L"用户名含非法字符: " + user; return false; }
+    std::wstring cmd = L"-h 127.0.0.1 -p " + port + L" -U " + user +
                        L" -f \"" + backupFile + L"\"";
     RunResult r = runProcessCapture(pgDumpall, cmd, compBinDirVer(c, ver), 120000,
                                     {{L"PGPASSWORD", pgPassword()}});
@@ -1074,11 +1283,18 @@ bool redisTestConfig(const std::wstring& ver, std::wstring& out) {
         out = L"启动失败";
         return false;
     }
+    // A config error makes redis exit quickly; surviving the window means the
+    // config parsed. Either way, shut the test instance down — the old code
+    // just closed the handle and left a live redis-server running forever.
     WaitForSingleObject(pi.hProcess, 2000);
     DWORD code = 0;
     GetExitCodeProcess(pi.hProcess, &code);
+    if (code == STILL_ACTIVE) {
+        killProcessByPid(pi.pid);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
     CloseHandle(pi.hProcess);
-    return code == STILL_ACTIVE || redisRunningVer(ver);
+    return code == STILL_ACTIVE;
 }
 
 // ============================ nodejs / pm2 ============================
@@ -1147,9 +1363,8 @@ static std::vector<PM2App> parsePm2List(const std::wstring& json) {
             if (q1 != std::wstring::npos && q2 != std::wstring::npos)
                 app.interpreter = obj.substr(q1 + 1, q2 - q1 - 1);
         }
-        // restarts
+        // restarts (the first find is the only one needed: same search)
         k = obj.find(L"\"restart_time\"");
-        if (k == std::wstring::npos) k = obj.find(L"\"restart_time\":");
         if (k != std::wstring::npos) {
             size_t colon = obj.find(L':', k);
             size_t s = obj.find_first_of(L"0123456789", colon);

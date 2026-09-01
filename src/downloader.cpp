@@ -17,8 +17,13 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
     // "---". A "#" comment is the title of the section and precedes its delimiter;
     // only the FIRST comment after a "---" (or file start) is used (secondary "#
     // https://..." notes are ignored).
+    //
+    // A companion "name.sha256=hex" entry attaches an optional integrity digest
+    // to a package; it is attached after the section is fully parsed, so the
+    // digest may appear before or after its package line.
     PkgSection cur;
     std::wstring pendingTitle;
+    std::map<std::wstring, std::wstring> shaMap;
     bool fresh = true;   // true right after a "---" or at file start
     auto flush = [&]() {
         // Bind the pending title to the section even if it has no items
@@ -26,10 +31,15 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
         // otherwise lose its title and confuse the user).
         if (!cur.items.empty() || !pendingTitle.empty()) {
             if (cur.title.empty()) cur.title = pendingTitle;
+            for (auto& it : cur.items) {
+                auto s = shaMap.find(it.name);
+                if (s != shaMap.end()) it.sha256 = s->second;
+            }
             sections.push_back(cur);
         }
         cur = PkgSection();
         pendingTitle.clear();
+        shaMap.clear();
         fresh = true;
     };
     std::wstringstream ss(text);
@@ -55,6 +65,16 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
         item.name = trimStr(line.substr(0, eq));
         item.url  = trimStr(line.substr(eq + 1));
         if (item.name.empty() || item.url.empty()) continue;
+        // Digest companion entries MUST be recognized before the generic
+        // component parse: pkgsNameToCompVer would otherwise happily accept
+        // "Nginx-1.30.4.sha256" as a package with version "1.30.4.sha256".
+        const std::wstring SUFFIX = L".sha256";
+        if (item.name.size() > SUFFIX.size() &&
+            lowerStr(item.name.substr(item.name.size() - SUFFIX.size())) == SUFFIX) {
+            std::wstring base = item.name.substr(0, item.name.size() - SUFFIX.size());
+            if (!base.empty()) shaMap[base] = item.url;
+            continue;
+        }
         std::wstring comp, ver;
         if (!pkgsNameToCompVer(item.name, comp, ver)) continue;   // unknown component
         item.comp = comp;
@@ -224,6 +244,40 @@ done:
 
 // ============================ extraction ============================
 
+// Compute the SHA-256 hex digest (lowercase, 64 chars) of a file using the
+// OS-provided certutil. Returns "" on any failure. Zero extra dependencies
+// and no code that parses the zip ourselves.
+static std::wstring fileSha256(const std::wstring& path) {
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    std::wstring certutil = joinPath(sysDir, L"certutil.exe");
+    if (!fileExists(certutil)) return L"";
+    RunResult r = runProcessCapture(certutil,
+        L"-hashfile \"" + path + L"\" SHA256", dirOf(path), 60000);
+    if (!r.ok) return L"";
+    // Output looks like:
+    //   SHA256 的 <path> 哈希:
+    //   abc123...64 hex chars...
+    //   CertUtil: -hashfile 命令成功完成。
+    // Accept any line that is exactly 64 hex chars after stripping spaces
+    // (certutil may group pairs on some locales).
+    std::wstring hex;
+    std::wstringstream ss(r.output);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        std::wstring t = lowerStr(trimStr(line));
+        t.erase(std::remove_if(t.begin(), t.end(), [](wchar_t c) {
+            return c == L' ' || c == L'\t' || c == L'\r';
+        }), t.end());
+        if (t.size() == 64 &&
+            t.find_first_not_of(L"0123456789abcdef") == std::wstring::npos) {
+            hex = t;
+            break;
+        }
+    }
+    return hex;
+}
+
 bool pkgsExtractZip(const std::wstring& zipFile, const std::wstring& destDir, std::wstring& err) {
     if (!makeDirs(destDir)) { err = L"无法创建解压目录"; return false; }
     wchar_t sysDir[MAX_PATH];
@@ -236,24 +290,23 @@ bool pkgsExtractZip(const std::wstring& zipFile, const std::wstring& destDir, st
         err = L"tar 解压失败: " + r.output;
         return false;
     }
-    // PowerShell fallback. The single-line -Command form has a 1024-char
-    // limit (and the file path easily exceeds that once %TEMP% is
-    // expanded). Pipe the script on stdin via -Command - instead so the
-    // command line stays short.
+    // PowerShell fallback (tar.exe absent). Write a temp .ps1 and run it with
+    // -File: the old "-Command -" variant tried to pipe the script through
+    // stdin, which runProcessCapture never does, so the first call always
+    // failed and was dead code; the short command-line fallback also broke on
+    // paths containing quotes. A script file avoids both problems.
+    std::wstring psFile = zipFile + L".ps1";
     std::wstring script = L"Expand-Archive -LiteralPath '"
                         + zipFile + L"' -DestinationPath '"
                         + destDir + L"' -Force";
-    RunResult r = runProcessCapture(L"powershell.exe",
-        L"-NoProfile -ExecutionPolicy Bypass -Command -",
-        destDir, 600000, {{L"lnpp_stdin", script}});
-    // runProcessCapture doesn't pipe stdin, so the env-based handoff is
-    // a no-op. As a last-ditch fallback use the short-form command line
-    // (works as long as paths are short).
-    if (!r.ok) {
-        std::wstring cli = L"-NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '"
-                         + zipFile + L"' -DestinationPath '" + destDir + L"' -Force\"";
-        r = runProcessCapture(L"powershell.exe", cli, destDir, 600000);
+    if (!writeFileText(psFile, script)) {
+        err = L"无法写入临时解压脚本";
+        return false;
     }
+    RunResult r = runProcessCapture(L"powershell.exe",
+        L"-NoProfile -ExecutionPolicy Bypass -File \"" + psFile + L"\"",
+        destDir, 600000);
+    DeleteFileW(psFile.c_str());
     if (r.ok) return true;
     err = L"解压失败: " + r.output;
     return false;
@@ -282,16 +335,41 @@ bool pkgsInstall(const PkgItem& item,
     std::wstring extractDir = joinPath(root, L"extract");
     if (!makeDirs(extractDir)) { err = L"无法创建解压目录"; return false; }
 
-    progress(L"下载中", 0, 0);
+    auto progressSafe = [&progress](const std::wstring& s, DWORD d, DWORD t) {
+        if (progress) progress(s, d, t);
+    };
+    progressSafe(L"下载中", 0, 0);
     if (!pkgsDownload(item.url, zipFile,
-                      [&](DWORD d, DWORD t) { progress(L"下载中", d, t); },
+                      [&](DWORD d, DWORD t) { progressSafe(L"下载中", d, t); },
                       cancel, err)) {
+        shDeleteTree(root);   // never leave a partial download behind
         return false;
     }
-    if (cancel && cancel->load()) { err = L"已取消"; return false; }
+    if (cancel && cancel->load()) { err = L"已取消"; shDeleteTree(root); return false; }
 
-    progress(L"解压中", 0, 0);
-    if (!pkgsExtractZip(zipFile, extractDir, err)) return false;
+    // Integrity check: when the conf carries a sha256 digest, verify the
+    // downloaded bytes before extracting anything. A mismatch means the file
+    // is corrupt or the source was tampered with — bail out and clean up.
+    if (!item.sha256.empty()) {
+        progressSafe(L"校验中", 0, 0);
+        std::wstring hex = fileSha256(zipFile);
+        if (hex.empty()) {
+            err = L"无法计算下载文件的 SHA256（certutil 不可用？）";
+            shDeleteTree(root);
+            return false;
+        }
+        if (lowerStr(item.sha256) != hex) {
+            err = L"SHA256 校验失败：期望 " + item.sha256 + L"，实际 " + hex;
+            shDeleteTree(root);
+            return false;
+        }
+    }
+
+    progressSafe(L"解压中", 0, 0);
+    if (!pkgsExtractZip(zipFile, extractDir, err)) {
+        shDeleteTree(root);
+        return false;
+    }
 
     // nginx/node/pg zips wrap everything in one top-level folder; redis ships
     // loose files. Normalize to "the folder that holds component files".
@@ -302,7 +380,7 @@ bool pkgsInstall(const PkgItem& item,
         if (subs.size() == 1 && files.empty()) srcDir = joinPath(extractDir, subs[0]);
     }
 
-    progress(L"安装中", 0, 0);
+    progressSafe(L"安装中", 0, 0);
     makeDirs(binCompDir(comp));
     if (!shCopyDir(srcDir, target)) {
         err = L"复制到 " + target + L" 失败";
@@ -321,6 +399,6 @@ bool pkgsInstall(const PkgItem& item,
     }
 
     shDeleteTree(root);
-    progress(L"完成", 0, 0);
+    progressSafe(L"完成", 0, 0);
     return true;
 }

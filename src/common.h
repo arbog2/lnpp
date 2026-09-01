@@ -39,7 +39,9 @@ std::wstring dataCompDir(const std::wstring& name);
 std::wstring dataCompVerDir(const std::wstring& name, const std::wstring& ver);
 
 // ---- String utils ----
-std::wstring wsprintf(const wchar_t* fmt, ...);
+// Named wstrfmt, not wsprintf: windows.h defines a wsprintf macro that would
+// expand into our declaration and break it.
+std::wstring wstrfmt(const wchar_t* fmt, ...);
 std::vector<std::wstring> listSubDirs(const std::wstring& path);
 std::vector<std::wstring> listFiles(const std::wstring& path, const std::wstring& ext);
 bool dirExists(const std::wstring& path);
@@ -58,6 +60,9 @@ std::wstring nowStamp();
 std::wstring nowText();
 
 // ---- INI (key=value, section-less) ----
+// Every function below is safe to call from any thread; the cache is guarded
+// internally. Keys are normalized to lower case, so "Ver.NodeJS" and
+// "ver.nodejs" are the same setting.
 std::wstring iniGet(const std::wstring& key, const std::wstring& def);
 void iniSet(const std::wstring& key, const std::wstring& val);
 bool iniDelete(const std::wstring& key);
@@ -69,6 +74,15 @@ void iniFlushNow();
 
 // ---- Config paths ----
 std::wstring settingsIniPath();
+
+// ---- Secret protection (DPAPI) ----
+// Encrypt/decrypt a string with the current Windows user's DPAPI key.
+// dpProtect returns "" on failure; the ciphertext is base64 (no CR/LF) so it
+// can live in the INI file. Keys are bound to the user account: on another
+// machine the ciphertext cannot be decrypted (callers must fall back to
+// asking the user again).
+std::wstring dpProtect(const std::wstring& plain);
+std::wstring dpUnprotect(const std::wstring& enc);
 
 // ---- Log ----
 void logMsg(const std::wstring& tag, const std::wstring& msg);

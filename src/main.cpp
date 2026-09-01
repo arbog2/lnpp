@@ -65,6 +65,7 @@ enum {
     WM_DL_STAGE = WM_APP + 8,     // downloader: stage changed (lParam = heap wchar_t*)
     WM_DL_PROGRESS = WM_APP + 9,  // downloader: bytes (wParam=done, lParam=total)
     WM_DL_DONE = WM_APP + 10,     // downloader: finished (wParam=ok, lParam=heap wchar_t* err)
+    WM_UI_LOG = WM_APP + 11,      // worker thread -> UI: append log line (wParam=edit, lParam=heap wchar_t*)
 };
 
 // ============================ Globals ============================
@@ -133,14 +134,30 @@ static OverviewUI g_ov;
 
 // ============================ Utilities ============================
 
-static void logAppendTo(HWND edit, const std::wstring& line) {
-    if (!edit) return;
-    std::wstring text = nowText() + L"  " + line + L"\r\n";
+// write an already-formatted line (timestamp included) to an edit control.
+// UI thread only — must not be called from worker threads.
+static void logAppendRaw(HWND edit, const std::wstring& text) {
     int len = GetWindowTextLengthW(edit);
     SendMessageW(edit, EM_SETSEL, len, len);
     SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
     // auto scroll
     SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+}
+
+static void logAppendTo(HWND edit, const std::wstring& line) {
+    if (!edit) return;
+    std::wstring text = nowText() + L"  " + line + L"\r\n";
+    // Worker threads (runAsync / ovAllOp) must not touch the edit control
+    // directly: a cross-thread SendMessage can deadlock during shutdown or
+    // race a destroyed window. Hand the formatted line to the UI thread via
+    // WM_UI_LOG; the UI thread frees the copy.
+    if (!isUiThread()) {
+        wchar_t* copy = _wcsdup(text.c_str());
+        if (!PostMessageW(g_main, WM_UI_LOG, (WPARAM)edit, (LPARAM)copy))
+            free(copy);   // queue full or window gone: drop the line
+        return;
+    }
+    logAppendRaw(edit, text);
 }
 
 static void logAppend(Comp c, const std::wstring& line) {
@@ -882,13 +899,22 @@ static LRESULT CALLBACK DotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             HDC dc = BeginPaint(hwnd, &ps);
             RECT rc;
             GetClientRect(hwnd, &rc);
-            HBRUSH br = CreateSolidBrush(RGB(200, 200, 200));
+            // 0 = not installed, 1 = installed but stopped, 2 = running.
+            // Create one brush and actually select it into the DC: the old code
+            // built two brushes per paint (leaking the first) and never selected
+            // either, so every dot rendered with the DC's default white brush.
+            static const COLORREF kStateColor[3] = {
+                RGB(150, 150, 150), RGB(220, 60, 60), RGB(60, 200, 60)
+            };
             int state = (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if (state == 2) br = CreateSolidBrush(RGB(60, 200, 60));     // running
-            else if (state == 1) br = CreateSolidBrush(RGB(220, 60, 60)); // installed but stopped
-            else br = CreateSolidBrush(RGB(150, 150, 150));               // not installed
-            Ellipse(dc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
-            DeleteObject(br);
+            if (state < 0 || state > 2) state = 0;
+            HBRUSH br = CreateSolidBrush(kStateColor[state]);
+            if (br) {
+                HGDIOBJ oldBr = SelectObject(dc, br);
+                Ellipse(dc, rc.left + 2, rc.top + 2, rc.right - 2, rc.bottom - 2);
+                SelectObject(dc, oldBr);
+                DeleteObject(br);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -1074,10 +1100,11 @@ static void initPgPage(HWND parent) {
     ui.pageControls.push_back(ePwd);
     ui.pageControls.push_back(ePort);
 
-    // pre-fill with current settings
+    // pre-fill with current settings (password left blank: never round-trip
+    // the stored secret through the UI; the user types it when operating)
     SetWindowTextW(eUser, pgUser().c_str());
     SetWindowTextW(ePort, pgPort().c_str());
-    SetWindowTextW(ePwd, pgPassword().c_str());
+    SetWindowTextW(ePwd, L"");
 
     HWND info = makeCtl(IDC_PG_INFO, L"STATIC", L"", SS_LEFT, 160, 178, 300, 90, parent);
     ui.pageControls.push_back(info);
@@ -1378,7 +1405,10 @@ struct DlState {
     HWND progress = nullptr, statusTxt = nullptr;
     std::vector<PkgItem> items;
     std::atomic<bool> busy{false};
-    std::atomic<bool> cancel{false};
+    // shared_ptr so the download thread outlives the dialog: if the window is
+    // destroyed mid-download (app quit), the worker still owns a live cancel
+    // flag instead of dereferencing a freed DlState.
+    std::shared_ptr<std::atomic<bool>> cancel = std::make_shared<std::atomic<bool>>(false);
     std::wstring stage;
     std::wstring curName;
 };
@@ -1418,27 +1448,30 @@ static void dlStart(HWND hwnd) {
     if (!st || st->busy.load()) return;
     int sel = ListView_GetNextItem(st->list, -1, LVNI_SELECTED);
     if (sel < 0) { SetWindowTextW(st->statusTxt, L"请先选择要下载的组件"); return; }
+    if (sel >= (int)st->items.size()) { SetWindowTextW(st->statusTxt, L"列表与数据不同步，请刷新后重试"); return; }
     PkgItem item = st->items[sel];
     std::wstring target = joinPath(binCompDir(item.comp), item.ver);
     if (dirExists(target)) { SetWindowTextW(st->statusTxt, L"该版本已安装"); return; }
     st->busy = true;
-    st->cancel = false;
+    st->cancel = std::make_shared<std::atomic<bool>>(false);
     st->curName = item.name;
     EnableWindow(st->btnGo, FALSE);
     EnableWindow(st->btnClose, FALSE);
     EnableWindow(st->btnCancel, TRUE);
     PkgItem copy = item;
-    std::thread([hwnd, copy]() {
+    std::shared_ptr<std::atomic<bool>> cancelSp = st->cancel;
+    std::thread([hwnd, copy, cancelSp]() {
         std::wstring err;
         auto prog = [hwnd](const std::wstring& stage, DWORD done, DWORD total) {
             wchar_t* s = _wcsdup(stage.c_str());
+            if (!IsWindow(hwnd)) { free(s); return; }   // dialog gone: drop progress
             PostMessageW(hwnd, WM_DL_STAGE, 0, (LPARAM)s);
             PostMessageW(hwnd, WM_DL_PROGRESS, (WPARAM)done, (LPARAM)total);
         };
-        DlState* st2 = dlState(hwnd);
-        bool ok = pkgsInstall(copy, prog, st2 ? &st2->cancel : nullptr, err);
+        bool ok = pkgsInstall(copy, prog, cancelSp.get(), err);
         wchar_t* e = _wcsdup(err.c_str());
-        PostMessageW(hwnd, WM_DL_DONE, ok ? 1 : 0, (LPARAM)e);
+        if (IsWindow(hwnd)) PostMessageW(hwnd, WM_DL_DONE, ok ? 1 : 0, (LPARAM)e);
+        else free(e);
     }).detach();
 }
 
@@ -1494,7 +1527,9 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 DWORD done = (DWORD)wParam;
                 DWORD total = (DWORD)lParam;
                 if (total > 0) {
-                    int pct = (int)(done * 100 / total);
+                    // done is DWORD; done*100 overflows past ~42MB, so widen
+                    // before multiplying (postgresql zips are ~300MB)
+                    int pct = (int)((__int64)done * 100 / total);
                     SendMessageW(st->progress, PBM_SETPOS, pct, 0);
                     wchar_t buf[64];
                     swprintf(buf, 64, L"%s  %s  %u%%", st->stage.c_str(), st->curName.c_str(), pct);
@@ -1538,7 +1573,7 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             switch (LOWORD(wParam)) {
                 case IDC_DL_GO: dlStart(hwnd); break;
                 case IDC_DL_CANCEL:
-                    if (st) { st->cancel = true; SetWindowTextW(st->statusTxt, L"正在取消..."); }
+                    if (st && st->cancel) { *st->cancel = true; SetWindowTextW(st->statusTxt, L"正在取消..."); }
                     break;
                 case IDC_DL_CLOSE: {
                     if (st && st->busy.load()) { SetWindowTextW(st->statusTxt, L"正在下载，请先取消"); return 0; }
@@ -1847,6 +1882,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetWindowTextW(combo, cur);
             break;
         }
+        case WM_UI_LOG: {
+            HWND edit = (HWND)wParam;
+            const wchar_t* text = (const wchar_t*)lParam;
+            if (IsWindow(edit) && text) logAppendRaw(edit, text);
+            free((void*)lParam);
+            break;
+        }
         case WM_UI_STATUS:
             applyStatusSnapshot();
             break;
@@ -1931,14 +1973,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
     // single-instance guard: a second launch just focuses the existing window
     HANDLE hSingle = CreateMutexW(nullptr, FALSE, L"LNPPManager_SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (!hSingle) {
+        // guard creation failed (rare); run anyway rather than dying silently
+        logMsg(L"app", L"单实例互斥体创建失败，跳过单实例检查");
+    } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(L"LNPPManager", nullptr);
         if (existing) {
             ShowWindow(existing, SW_SHOW);
             SetForegroundWindow(existing);
         }
+        CloseHandle(hSingle);
         return 0;
     }
+    // primary instance: keep hSingle open for the process lifetime
+    // (the kernel releases it when we exit — no explicit CloseHandle needed)
     // boot start ("开机启动") launches minimized into the tray
     if (lpCmdLine && wcsstr(lpCmdLine, L"--hidden")) g_startHidden = true;
 

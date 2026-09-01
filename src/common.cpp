@@ -1,4 +1,5 @@
 #include "common.h"
+#include <wincrypt.h>   // CryptProtectData / CryptStringToBinary (DPAPI)
 
 std::wstring exeDir() {
     static std::wstring cached;
@@ -37,7 +38,7 @@ std::wstring dataCompVerDir(const std::wstring& name, const std::wstring& ver) {
 
 std::wstring settingsIniPath() { return joinPath(dataDir(), L"settings.ini"); }
 
-std::wstring wsprintf(const wchar_t* fmt, ...) {
+std::wstring wstrfmt(const wchar_t* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     wchar_t buf[4096];
@@ -129,21 +130,30 @@ std::wstring readFileText(const std::wstring& path) {
     if (!ok || read == 0) return L"";
     bytes.resize(read);
     if (bytes.empty()) return L"";
-    int len = MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    // Decode as UTF-8; fall back to the ANSI code page for non-UTF-8 files
+    // (older confs / logs). The buffer is sized from the *same* code page as
+    // the conversion that fills it — the old code sized it from the UTF-8
+    // length but wrote the ACP result into it, which can overrun on byte
+    // sequences whose UTF-8 and ACP character counts differ.
+    UINT cp = CP_UTF8;
+    int len = MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
     if (len <= 0) {
-        // Not valid UTF-8; fall back to ANSI so the user still sees *something*.
-        len = MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
-        if (len <= 0) return L"";
+        cp = CP_ACP;
+        len = MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
     }
+    if (len <= 0) return L"";
     std::wstring w(len, L'\0');
-    if (MultiByteToWideChar(CP_UTF8, 0, bytes.c_str(), (int)bytes.size(), &w[0], len) == 0)
-        MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), &w[0], len);
+    MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), &w[0], len);
     return w;
 }
 
 bool writeFileText(const std::wstring& path, const std::wstring& content) {
     makeDirs(dirOf(path));
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+    // Write to a sibling temp file then rename, so a crash or power loss
+    // mid-write can never leave the target half-written (settings.ini would
+    // otherwise be corrupted and every preference lost).
+    std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     // Convert wide to UTF-8
@@ -153,7 +163,12 @@ bool writeFileText(const std::wstring& path, const std::wstring& content) {
     DWORD written = 0;
     bool ok = WriteFile(h, bytes.c_str(), (DWORD)bytes.size(), &written, nullptr) != FALSE;
     CloseHandle(h);
-    return ok;
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 std::wstring dirOf(const std::wstring& path) {
@@ -223,13 +238,13 @@ std::wstring toForward(const std::wstring& s) {
 std::wstring nowStamp() {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    return wsprintf(L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return wstrfmt(L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 }
 
 std::wstring nowText() {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    return wsprintf(L"%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return wstrfmt(L"%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 }
 
 // ---- INI ----
@@ -241,13 +256,23 @@ std::wstring nowText() {
 // Writes are debounced: iniSet / iniDelete mutate the in-memory map and
 // schedule a flush after ~200 ms. Repeated sets (e.g. toggling 4 autostart
 // checkboxes in a row) collapse into a single disk write.
+//
+// Threading: the cache is touched from several threads at once — the
+// background status / pm2 pollers (compStatusQuick -> compStatus -> iniSet
+// for the current version) and the UI thread (the 50 ms flush timer plus
+// every user action that toggles a setting). A std::map under concurrent
+// insert + iteration is a hard crash, so every access goes through
+// g_iniMtx. Disk writes run outside the lock on a snapshot, so a slow or
+// contended disk never blocks a poller.
 std::map<std::wstring, std::wstring> g_iniCache;
 bool g_iniLoaded = false;
 bool g_iniDirty = false;
 DWORD g_iniLastChangeTick = 0;
 constexpr DWORD INI_DEBOUNCE_MS = 200;
+std::mutex g_iniMtx;
 
-std::map<std::wstring, std::wstring>& iniMap() {
+// Caller must hold g_iniMtx.
+static std::map<std::wstring, std::wstring>& iniMapLocked() {
     if (!g_iniLoaded) {
         g_iniLoaded = true;
         std::wstring path = settingsIniPath();
@@ -268,46 +293,101 @@ std::map<std::wstring, std::wstring>& iniMap() {
     return g_iniCache;
 }
 
-void iniSave() {
+// Caller must NOT hold g_iniMtx: this does file IO.
+static void iniWriteSnapshot(const std::map<std::wstring, std::wstring>& snapshot) {
     std::wstring content;
-    for (auto& p : g_iniCache) {
+    for (auto& p : snapshot) {
         content += p.first + L"=" + p.second + L"\r\n";
     }
     writeFileText(settingsIniPath(), content);
-    g_iniDirty = false;
 }
 
 void iniFlushIfDue() {
-    if (!g_iniDirty) return;
-    DWORD now = GetTickCount();
-    if (now - g_iniLastChangeTick < INI_DEBOUNCE_MS) return;
-    iniSave();
+    std::map<std::wstring, std::wstring> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(g_iniMtx);
+        if (!g_iniDirty) return;
+        DWORD now = GetTickCount();
+        if (now - g_iniLastChangeTick < INI_DEBOUNCE_MS) return;
+        iniMapLocked();   // never flush an unloaded cache: that would blank the file
+        snapshot = g_iniCache;
+        g_iniDirty = false;
+    }
+    iniWriteSnapshot(snapshot);
 }
 
 void iniFlushNow() {
-    if (g_iniDirty) iniSave();
+    std::map<std::wstring, std::wstring> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(g_iniMtx);
+        if (!g_iniDirty) return;
+        iniMapLocked();   // never flush an unloaded cache: that would blank the file
+        snapshot = g_iniCache;
+        g_iniDirty = false;
+    }
+    iniWriteSnapshot(snapshot);
 }
 
 std::wstring iniGet(const std::wstring& key, const std::wstring& def) {
-    auto& m = iniMap();
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    auto& m = iniMapLocked();
     auto it = m.find(lowerStr(key));
     return it == m.end() ? def : it->second;
 }
 
 void iniSet(const std::wstring& key, const std::wstring& val) {
-    iniMap()[lowerStr(key)] = val;
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    iniMapLocked()[lowerStr(key)] = val;
     g_iniDirty = true;
     g_iniLastChangeTick = GetTickCount();
 }
 
 bool iniDelete(const std::wstring& key) {
-    auto& m = iniMap();
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    auto& m = iniMapLocked();
     auto it = m.find(lowerStr(key));
     if (it == m.end()) return false;
     m.erase(it);
     g_iniDirty = true;
     g_iniLastChangeTick = GetTickCount();
     return true;
+}
+
+// ---- DPAPI secret protection ----
+std::wstring dpProtect(const std::wstring& plain) {
+    DATA_BLOB in = {(DWORD)(plain.size() * sizeof(wchar_t)), (BYTE*)plain.c_str()};
+    DATA_BLOB out = {0, nullptr};
+    if (!CryptProtectData(&in, L"LNPP settings", nullptr, nullptr, nullptr, 0, &out))
+        return L"";
+    // base64 without CR/LF so the ciphertext survives the INI format
+    DWORD len = 0;
+    CryptBinaryToStringW(out.pbData, out.cbData,
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &len);
+    std::wstring r(len, L'\0');
+    if (len > 0)
+        CryptBinaryToStringW(out.pbData, out.cbData,
+                             CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &r[0], &len);
+    LocalFree(out.pbData);
+    return r;
+}
+
+std::wstring dpUnprotect(const std::wstring& enc) {
+    if (enc.empty()) return L"";
+    DWORD len = 0;
+    if (!CryptStringToBinaryW(enc.c_str(), (DWORD)enc.size(), CRYPT_STRING_BASE64,
+                              nullptr, &len, nullptr, nullptr))
+        return L"";
+    std::vector<BYTE> bytes(len);
+    if (!CryptStringToBinaryW(enc.c_str(), (DWORD)enc.size(), CRYPT_STRING_BASE64,
+                              bytes.data(), &len, nullptr, nullptr))
+        return L"";
+    DATA_BLOB in = {len, bytes.data()};
+    DATA_BLOB out = {0, nullptr};
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out))
+        return L"";
+    std::wstring r((wchar_t*)out.pbData, out.cbData / sizeof(wchar_t));
+    LocalFree(out.pbData);
+    return r;
 }
 
 // ---- Log ----
