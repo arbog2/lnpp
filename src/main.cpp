@@ -94,7 +94,6 @@ static std::atomic<bool> g_pgUsersBusy{false};
 
 // ---- system tray / boot start ----
 static bool g_trayAdded = false;
-static bool g_realExit = false;
 static bool g_startHidden = false;
 static NOTIFYICONDATAW g_nid = {};
 
@@ -791,7 +790,6 @@ static void showTrayMenu(HWND hwnd) {
         ovAllOp(AllOp::Stop);
     } else if (cmd == IDM_TRAY_EXIT) {
         // stop all components first (background), then really quit
-        g_realExit = true;
         ShowWindow(hwnd, SW_HIDE);
         trayBalloon(L"LNPP 组件管理器", L"正在停止所有组件...");
         std::thread([]() {
@@ -1924,23 +1922,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         }
         case WM_CLOSE:
-            // closing the window always goes through the "shutdown, then
-            // really exit" path. Even when minimized-to-tray was intended,
-            // we still need a clean shutdown when the user picks Quit from
-            // the tray menu; running compStop synchronously inside
-            // WM_DESTROY would block the UI thread for up to 30s×4
-            // (each component has its own 30s stop timeout).
-            if (!g_realExit) {
-                g_realExit = true;
-                ShowWindow(hwnd, SW_HIDE);
-                trayBalloon(L"LNPP 组件管理器", L"正在停止所有组件...");
-                std::thread([]() {
-                    shutdownAllComponents();
-                    PostMessageW(g_main, WM_REAL_EXIT, 0, 0);
-                }).detach();
-                return 0;
-            }
-            DestroyWindow(hwnd);
+            // Clicking the window's close button only hides it to the tray —
+            // components keep running. Real exit happens exclusively from the
+            // tray menu's "退出" item (IDM_TRAY_EXIT -> shutdownAllComponents
+            // -> WM_REAL_EXIT), so a user who hits X by accident loses nothing.
+            ShowWindow(hwnd, SW_HIDE);
+            trayBalloon(L"LNPP 组件管理器", L"已最小化到系统托盘，退出请右键托盘图标");
             return 0;
         case WM_SIZE: {
             RECT rc;
