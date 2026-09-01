@@ -38,7 +38,7 @@ lnpp.exe
 - nginx：可视化添加/删除虚拟站点（写 etc\nginx\vhosts\），www\ 下自动建目录
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）
 - Node.js：pm2 进程列表实时监控，支持重启/停止
-- 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 packages.conf，下载完成后自动解压到 bin\<组件>\<版本>
+- 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `packages.conf`（仓库提供 `packages.conf.example`，复制改名后按需增删），下载完成后自动解压到 bin\<组件>\<版本>
 - 总览页右下角：版本号 + 「关于」弹窗（作者、可点击 GitHub 链接）
 
 ## 配置模板
@@ -76,3 +76,4 @@ test.bat all      # 编译并运行（默认）
 - PostgreSQL 默认端口 5432，redis 6379，nginx 80；在 `data\settings.ini` 中可改
 - 首次使用 PostgreSQL：切到对应页签点「初始化数据库」
 - 组件下载源：根目录 `packages.conf` 按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis 组件
+- 可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（用 `certutil -hashfile <文件> SHA256` 生成），下载后自动比对，不匹配则拒绝安装；没有该行时跳过校验

@@ -16,7 +16,9 @@ ssl/
 
 # unrelated / user-specific files
 packages.conf
-etc/nginx/vhosts/jwxt.conf
+# per-site nginx configs are user data; keep only the templates tracked
+etc/nginx/vhosts/*.conf
+!etc/nginx/vhosts/_template*.conf
 
 # test-generated www sites (keep the dir via www/.gitkeep)
 www/final1/
@@ -27,3 +29,6 @@ www/test1/
 # misc
 Thumbs.db
 Desktop.ini
+
+# WorkBuddy project data
+.workbuddy/
