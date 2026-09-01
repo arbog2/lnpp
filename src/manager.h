@@ -38,6 +38,8 @@ struct VHost {
 
 // ---- Component discovery ----
 std::vector<std::wstring> compVersions(Comp c);
+// Natural descending version comparison used by compVersions ("1.30" > "1.9").
+bool naturalGt(const std::wstring& a, const std::wstring& b);
 bool compVersionUsable(Comp c, const std::wstring& ver);
 ComponentStatus compStatus(Comp c);
 // Same as compStatus but never spawns helper processes (redis-cli / pm2);
@@ -89,6 +91,8 @@ bool redisTestConfig(const std::wstring& ver, std::wstring& out);
 // nodejs / pm2
 bool nodePm2Installed();
 std::vector<PM2App> nodePm2List();
+// Parse `pm2 jlist` JSON text into PM2App records (pure text parsing).
+std::vector<PM2App> parsePm2List(const std::wstring& json);
 bool nodePm2Restart(int id, std::wstring& err);
 bool nodePm2Stop(int id, std::wstring& err);
 bool nodePm2RestartAll(std::wstring& err);

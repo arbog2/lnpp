@@ -60,12 +60,23 @@ bool fileExists(const std::wstring& path) {
 bool makeDirs(const std::wstring& path) {
     if (path.empty()) return false;
     if (dirExists(path)) return true;
+    // UNC paths "\\server\share\dir\..." — the server and share components
+    // must already exist; only create directories from the third component on.
+    size_t start = 0;
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        size_t i = 2;
+        while (i < path.size() && path[i] != L'\\' && path[i] != L'/') ++i;  // server
+        if (i >= path.size()) return dirExists(path);                        // "\\server"
+        ++i;
+        while (i < path.size() && path[i] != L'\\' && path[i] != L'/') ++i;  // share
+        start = i;                                                           // past share
+        if (start >= path.size()) return dirExists(path);                    // "\\server\share"
+    }
     // Create intermediate directories
-    std::wstring cur;
-    for (size_t i = 0; i < path.size(); ++i) {
+    for (size_t i = start; i < path.size(); ++i) {
         wchar_t c = path[i];
-        cur += c;
         if (c == L'\\' || c == L'/' || i == path.size() - 1) {
+            std::wstring cur = path.substr(0, i + 1);
             if (!dirExists(cur)) {
                 if (!CreateDirectoryW(cur.c_str(), nullptr)) {
                     if (GetLastError() != ERROR_ALREADY_EXISTS) return false;
@@ -271,23 +282,39 @@ DWORD g_iniLastChangeTick = 0;
 constexpr DWORD INI_DEBOUNCE_MS = 200;
 std::mutex g_iniMtx;
 
+// Pure helpers (unit-testable, no IO): parse "k=v" lines (keys lowercased,
+// values trimmed) and serialize a map back to text. Empty keys / comment or
+// blank lines are skipped on parse.
+std::map<std::wstring, std::wstring> parseIniText(const std::wstring& content) {
+    std::map<std::wstring, std::wstring> m;
+    std::wstringstream ss(content);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        size_t eq = line.find(L'=');
+        if (eq != std::wstring::npos) {
+            std::wstring k = lowerStr(trimStr(line.substr(0, eq)));
+            std::wstring v = trimStr(line.substr(eq + 1));
+            if (!k.empty()) m[k] = v;
+        }
+    }
+    return m;
+}
+
+std::wstring serializeIni(const std::map<std::wstring, std::wstring>& m) {
+    std::wstring content;
+    for (auto& p : m) {
+        content += p.first + L"=" + p.second + L"\r\n";
+    }
+    return content;
+}
+
 // Caller must hold g_iniMtx.
 static std::map<std::wstring, std::wstring>& iniMapLocked() {
     if (!g_iniLoaded) {
         g_iniLoaded = true;
         std::wstring path = settingsIniPath();
         if (fileExists(path)) {
-            std::wstring content = readFileText(path);
-            std::wstringstream ss(content);
-            std::wstring line;
-            while (std::getline(ss, line)) {
-                size_t eq = line.find(L'=');
-                if (eq != std::wstring::npos) {
-                    std::wstring k = lowerStr(trimStr(line.substr(0, eq)));
-                    std::wstring v = trimStr(line.substr(eq + 1));
-                    if (!k.empty()) g_iniCache[k] = v;
-                }
-            }
+            g_iniCache = parseIniText(readFileText(path));
         }
     }
     return g_iniCache;
@@ -295,11 +322,7 @@ static std::map<std::wstring, std::wstring>& iniMapLocked() {
 
 // Caller must NOT hold g_iniMtx: this does file IO.
 static void iniWriteSnapshot(const std::map<std::wstring, std::wstring>& snapshot) {
-    std::wstring content;
-    for (auto& p : snapshot) {
-        content += p.first + L"=" + p.second + L"\r\n";
-    }
-    writeFileText(settingsIniPath(), content);
+    writeFileText(settingsIniPath(), serializeIni(snapshot));
 }
 
 void iniFlushIfDue() {

@@ -41,12 +41,9 @@ static bool pgValidPort(const std::wstring& s);
 
 // ============================ Component discovery ============================
 
-std::vector<std::wstring> compVersions(Comp c) {
-    std::vector<std::wstring> versions;
-    for (const auto& ver : listSubDirs(compBinDir(c))) {
-        if (compVersionUsable(c, ver)) versions.push_back(ver);
-    }
-    // Sort version names naturally (for example 1.30 before 1.9).
+// Natural (version-aware) descending comparison: "1.30" > "1.9", "2.0" > "1.99".
+// Public so unit tests can verify the sort order without touching disk.
+bool naturalGt(const std::wstring& a, const std::wstring& b) {
     auto parts = [](const std::wstring& value) {
         std::vector<unsigned long long> result;
         size_t i = 0;
@@ -62,16 +59,22 @@ std::vector<std::wstring> compVersions(Comp c) {
         }
         return result;
     };
-    std::sort(versions.begin(), versions.end(), [&](const auto& a, const auto& b) {
-        auto pa = parts(a), pb = parts(b);
-        size_t n = pa.size() > pb.size() ? pa.size() : pb.size();
-        for (size_t i = 0; i < n; ++i) {
-            auto va = i < pa.size() ? pa[i] : 0;
-            auto vb = i < pb.size() ? pb[i] : 0;
-            if (va != vb) return va > vb;
-        }
-        return lowerStr(a) > lowerStr(b);
-    });
+    auto pa = parts(a), pb = parts(b);
+    size_t n = pa.size() > pb.size() ? pa.size() : pb.size();
+    for (size_t i = 0; i < n; ++i) {
+        auto va = i < pa.size() ? pa[i] : 0;
+        auto vb = i < pb.size() ? pb[i] : 0;
+        if (va != vb) return va > vb;
+    }
+    return lowerStr(a) > lowerStr(b);
+}
+
+std::vector<std::wstring> compVersions(Comp c) {
+    std::vector<std::wstring> versions;
+    for (const auto& ver : listSubDirs(compBinDir(c))) {
+        if (compVersionUsable(c, ver)) versions.push_back(ver);
+    }
+    std::sort(versions.begin(), versions.end(), naturalGt);
     return versions;
 }
 
@@ -246,10 +249,6 @@ static bool redisRunningVer(const std::wstring& ver) {
 }
 
 // ---- nodejs / pm2 ----
-static bool nodeExe(const std::wstring& ver, std::wstring& out) {
-    out = joinPath(compBinDirVer(Comp::Nodejs, ver), L"node.exe");
-    return fileExists(out);
-}
 
 // True iff the pm2 God daemon process is alive. Detected via the daemon pid
 // file ($PM2_HOME\pm2.pid); we must NOT probe with `pm2 ping` / `pm2 pid`,
@@ -813,6 +812,7 @@ bool genRedisConfig(const std::wstring& ver) {
 }
 
 bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir) {
+    (void)ver;   // template only needs dataDir; keep the signature uniform with genNginxConfig
     std::wstring tpl = readFileText(joinPath(compEtcDir(Comp::Postgresql), L"postgresql.conf.append"));
     if (tpl.empty()) tpl = DEFAULT_PG_APPEND;
     std::map<std::wstring, std::wstring> kv;
@@ -1299,7 +1299,9 @@ bool redisTestConfig(const std::wstring& ver, std::wstring& out) {
 
 // ============================ nodejs / pm2 ============================
 
-static std::vector<PM2App> parsePm2List(const std::wstring& json) {
+// Parse `pm2 jlist` output (array of objects) into PM2App records. Pure text
+// parsing (no process / IO) — kept non-static so unit tests can cover it.
+std::vector<PM2App> parsePm2List(const std::wstring& json) {
     std::vector<PM2App> apps;
     // jlist returns array of objects; split by top-level objects
     size_t pos = 0;

@@ -1750,9 +1750,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     HWND portCtl = GetDlgItem(hwnd, IDC_NG_ADD_PORT);
                     wchar_t pbuf[32];
                     GetWindowTextW(portCtl, pbuf, 32);
-                    std::wstring cur = pbuf;
-                    if (on && cur == L"80") SetWindowTextW(portCtl, L"443");
-                    else if (!on && cur == L"443") SetWindowTextW(portCtl, L"80");
+                    std::wstring portText = pbuf;
+                    if (on && portText == L"80") SetWindowTextW(portCtl, L"443");
+                    else if (!on && portText == L"443") SetWindowTextW(portCtl, L"80");
                     for (int ctl : { IDC_NG_LABEL_CERT, IDC_NG_CERT, IDC_NG_BTN_CERT,
                                      IDC_NG_LABEL_KEY, IDC_NG_KEY, IDC_NG_BTN_KEY }) {
                         HWND c = GetDlgItem(hwnd, ctl);
@@ -1812,9 +1812,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     if (sel < 0) { logAppend(Comp::Nodejs, L"请先选中要删除的项目"); break; }
                     wchar_t idBuf[64];
                     ListView_GetItemText(lv, sel, 0, idBuf, 64);
-                    int id = _wtoi(idBuf);
-                    runAsync(Comp::Nodejs, L"删除 PM2 项目 #" + std::to_wstring(id), [id](std::wstring& err) {
-                        return nodePm2Delete(id, err);
+                    int pm2Id = _wtoi(idBuf);
+                    runAsync(Comp::Nodejs, L"删除 PM2 项目 #" + std::to_wstring(pm2Id), [pm2Id](std::wstring& err) {
+                        return nodePm2Delete(pm2Id, err);
                     });
                     break;
                 }

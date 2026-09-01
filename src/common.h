@@ -71,6 +71,10 @@ bool iniDelete(const std::wstring& key);
 // reading the on-disk file from outside the cache.
 void iniFlushIfDue();
 void iniFlushNow();
+// Pure text helpers (no IO, no global state) — parse/serialize "k=v" lines;
+// keys are lowercased and trimmed on parse, comment/blank lines are skipped.
+std::map<std::wstring,std::wstring> parseIniText(const std::wstring& content);
+std::wstring serializeIni(const std::map<std::wstring,std::wstring>& m);
 
 // ---- Config paths ----
 std::wstring settingsIniPath();
