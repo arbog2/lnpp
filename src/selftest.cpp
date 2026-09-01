@@ -57,16 +57,23 @@ int wmain() {
 
     wprintf(L"\n=== PostgreSQL ===\n");
     {
-        bool init = pgDataInitialized(L"17");
-        if (!init) check(L"init 17", pgInit(Comp::Postgresql, L"17", L"postgres", L"postgres", L"5432", err), err);
-        if (!compIsRunning(Comp::Postgresql)) check(L"start", compStart(Comp::Postgresql, err), err);
-        Sleep(2000);
-        check(L"running", compIsRunning(Comp::Postgresql));
-        std::wstring backupFile;
-        check(L"backup", pgBackup(Comp::Postgresql, backupFile, err) && fileExists(backupFile), err);
-        check(L"stop", compStop(Comp::Postgresql, err), err);
-        Sleep(1200);
-        check(L"stopped", !compIsRunning(Comp::Postgresql));
+        std::vector<std::wstring> vers = compVersions(Comp::Postgresql);
+        if (vers.empty()) {
+            wprintf(L"  未安装 PostgreSQL，跳过\n");
+        } else {
+            std::wstring ver = vers[0];   // compVersions 降序：最新在前
+            bool init = pgDataInitialized(ver);
+            if (!init) check((L"init " + ver).c_str(),
+                             pgInit(Comp::Postgresql, ver, L"postgres", L"postgres", L"5432", err), err);
+            if (!compIsRunning(Comp::Postgresql)) check(L"start", compStart(Comp::Postgresql, err), err);
+            Sleep(2000);
+            check(L"running", compIsRunning(Comp::Postgresql));
+            std::wstring backupFile;
+            check(L"backup", pgBackup(Comp::Postgresql, backupFile, err) && fileExists(backupFile), err);
+            check(L"stop", compStop(Comp::Postgresql, err), err);
+            Sleep(1200);
+            check(L"stopped", !compIsRunning(Comp::Postgresql));
+        }
     }
 
     wprintf(L"\n=== Node.js / pm2 ===\n");

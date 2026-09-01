@@ -7,7 +7,7 @@ rem   all    - build then run
 rem
 rem NOTE: test exes must live in the project root (next to bin\ etc\) because
 rem all paths are derived from the exe location.
-setlocal
+setlocal enabledelayedexpansion
 
 set MODE=%~1
 if "%MODE%"=="" set MODE=all
@@ -32,16 +32,20 @@ set LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib wi
 set FAILED=0
 
 if not "%MODE%"=="run" (
+    echo [BUILD] unittests.exe
+    cl /nologo /O2 /EHsc /std:c++17 /W4 /permissive- /utf-8 /MT /Fo"build\\" /Fe"unittests.exe" ^
+        src\unittests.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
+    if errorlevel 1 set FAILED=1
     echo [BUILD] selftest.exe
-    cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"selftest.exe" ^
+    cl /nologo /O2 /EHsc /std:c++17 /W4 /permissive- /utf-8 /MT /Fo"build\\" /Fe"selftest.exe" ^
         src\selftest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
     echo [BUILD] proctest.exe
-    cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"proctest.exe" ^
+    cl /nologo /O2 /EHsc /std:c++17 /W4 /permissive- /utf-8 /MT /Fo"build\\" /Fe"proctest.exe" ^
         src\proctest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
     echo [BUILD] migtest.exe
-    cl /nologo /O2 /EHsc /std:c++17 /W3 /utf-8 /Fo"build\\" /Fe"migtest.exe" ^
+    cl /nologo /O2 /EHsc /std:c++17 /W4 /permissive- /utf-8 /MT /Fo"build\\" /Fe"migtest.exe" ^
         src\migtest.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp /link %LIBS%
     if errorlevel 1 set FAILED=1
 )
@@ -52,12 +56,14 @@ if "%MODE%"=="build" (
     exit /b 0
 )
 
-if not exist selftest.exe (
-    echo [ERROR] selftest.exe missing - run "test.bat build" first
+if not exist unittests.exe (
+    echo [ERROR] unittests.exe missing - run "test.bat build" first
     exit /b 1
 )
 
-for %%T in (selftest proctest migtest) do (
+rem unittests runs first: pure logic, fast, no side effects. If it fails we
+rem stop before touching real services.
+for %%T in (unittests selftest proctest migtest) do (
     echo.
     echo ===== RUN %%T =====
     "%~dp0%%T.exe"
