@@ -14,7 +14,7 @@ enum {
     // common per-page controls
     IDC_DOT = 200, IDC_STATUS_TXT = 201, IDC_VER_COMBO = 202,
     IDC_BTN_SWITCH = 203, IDC_BTN_START = 204, IDC_BTN_STOP = 205,
-    IDC_BTN_CFG = 206, IDC_BTN_DATA = 207, IDC_LOG = 208,
+    IDC_BTN_CFG = 206, IDC_BTN_DATA = 207, IDC_LOG = 208, IDC_BTN_CLEAR_LOG = 209,
     // nginx page
     IDC_NG_VHOST_LIST = 300, IDC_NG_ADD_NAME = 301, IDC_NG_ADD_DOMAIN = 302,
     IDC_NG_ADD_PORT = 303, IDC_NG_BTN_ADD = 304, IDC_NG_BTN_DEL = 305, IDC_NG_BTN_RELOAD = 306,
@@ -38,7 +38,7 @@ enum {
     IDC_OV_BTN_ALL_STOP = 703, IDC_OV_RESULT = 704, IDC_OV_BOOT_START = 705,
     IDC_OV_BTN_PATH_ADD = 706, IDC_OV_BTN_PATH_DEL = 707,
     IDC_OV_BTN_DL = 708, IDC_OV_VER_TXT = 709, IDC_OV_ABOUT_LINK = 714,
-    IDC_OV_LOG = 715,
+    IDC_OV_LOG = 715, IDC_OV_BTN_CLEAR_LOG = 716,
     IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
@@ -1001,6 +1001,8 @@ static void initOverviewPage(HWND parent) {
     SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
     ov.logEdit = log;
     ov.controls.push_back(log);
+    HWND bClearLog = makeCtl(IDC_OV_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 494, 90, 24, parent);
+    ov.controls.push_back(bClearLog);
 
     // bottom-right: version text + "关于" link
     std::wstring verTxt = L"v" + appVersion();
@@ -1149,6 +1151,7 @@ static void initCommonControls(HWND parent, Comp c) {
     HWND bStop = makeCtl(IDC_BTN_STOP, L"BUTTON", L"停止", BS_PUSHBUTTON, 490, 38, 70, 24, parent);
     HWND bCfg = makeCtl(IDC_BTN_CFG, L"BUTTON", L"配置", BS_PUSHBUTTON, 570, 38, 70, 24, parent);
     HWND bData = makeCtl(IDC_BTN_DATA, L"BUTTON", L"数据目录", BS_PUSHBUTTON, 645, 38, 80, 24, parent);
+    HWND bClearLog = makeCtl(IDC_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 455, 90, 24, parent);
     HWND log = makeCtl(IDC_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
                        ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 170, parent);
     SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
@@ -1165,6 +1168,7 @@ static void initCommonControls(HWND parent, Comp c) {
     ui.pageControls.push_back(bStop);
     ui.pageControls.push_back(bCfg);
     ui.pageControls.push_back(bData);
+    ui.pageControls.push_back(bClearLog);
     ui.pageControls.push_back(log);
 }
 
@@ -1711,6 +1715,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     }
                     break;
                 }
+                case IDC_BTN_CLEAR_LOG: {
+                    if (cur < TAB_COMP_BASE) break;
+                    HWND log = g_ui[(int)tabToComp(cur)].logEdit;
+                    if (log) SetWindowTextW(log, L"");
+                    break;
+                }
+                case IDC_OV_BTN_CLEAR_LOG:
+                    if (g_ov.logEdit) SetWindowTextW(g_ov.logEdit, L"");
+                    break;
                 case IDC_NG_BTN_ADD: {
                     wchar_t name[256], domain[256], port[256], cert[1024], key[1024], root[1024];
                     GetDlgItemTextW(hwnd, IDC_NG_ADD_NAME, name, 256);

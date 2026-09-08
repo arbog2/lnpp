@@ -142,6 +142,21 @@ static DWORD readPid(const std::wstring& file) {
     try { return (DWORD)_wtoi(s.c_str()); } catch (...) { return 0; }
 }
 
+// True only when `pid`'s executable image is exactly exePath. Checking the
+// image before trusting a pidfile prevents a stale PID (reused by an
+// unrelated process) from making the manager refuse to start, or worse from
+// making Stop terminate the wrong process.
+static bool processImageIs(DWORD pid, const std::wstring& exePath) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
+    CloseHandle(h);
+    if (!ok) return false;
+    return lowerStr(toForward(path)) == lowerStr(toForward(exePath));
+}
+
 // True when `pid` is an nginx.exe whose image lives under our own
 // bin\nginx\<ver> directory. Matching by process name alone (the old code)
 // made the manager "adopt" any nginx.exe on the system — its master pid then
@@ -158,9 +173,11 @@ static bool isOurNginx(DWORD pid, const std::wstring& ver) {
     std::wstring exeDir = toForward(dirOf(path));
     std::wstring ours = toForward(compBinDirVer(Comp::Nginx, ver));
     std::wstring e = lowerStr(exeDir), o = lowerStr(ours);
-    // dirOf gives e.g. ...\bin\nginx\1.30; must sit directly under ours
-    // (trailing separator check keeps bin\nginx\1.30x from matching 1.30)
-    if (e.size() < o.size() + 1) return false;
+    // Exact dir means nginx.exe lives in bin\nginx\<ver>. Also accept a
+    // subdirectory under that version dir, while the separator check keeps
+    // e.g. bin\nginx\1.30x from matching version 1.30.
+    if (e.size() < o.size()) return false;
+    if (e == o) return true;
     return e.compare(0, o.size(), o) == 0 && e[o.size()] == L'/';
 }
 
@@ -208,6 +225,83 @@ static DWORD nginxMasterPid(const std::wstring& ver) {
     return pids.empty() ? 0 : pids[0];
 }
 
+// Image lives anywhere under our own bin\nginx\ tree (any version).
+// Used to spot stray masters (e.g. started by double-click with the bin
+// dir as prefix, or left behind by a previous version) that keep holding
+// the listen ports and would otherwise wedge the next start / switch.
+static bool isAnyOurNginx(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
+    CloseHandle(h);
+    if (!ok) return false;
+    std::wstring exeDir = toForward(dirOf(path));
+    std::wstring ours = toForward(compBinDir(Comp::Nginx));
+    std::wstring e = lowerStr(exeDir), o = lowerStr(ours);
+    if (e.size() < o.size() + 1) return false;
+    return e.compare(0, o.size(), o) == 0 && e[o.size()] == L'/';
+}
+
+static std::vector<DWORD> ourNginxPidsVer(const std::wstring& ver) {
+    std::vector<DWORD> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0 && isOurNginx(pe.th32ProcessID, ver))
+                out.push_back(pe.th32ProcessID);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return out;
+}
+
+static std::vector<DWORD> allOurNginxPids() {
+    std::vector<DWORD> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"nginx.exe") == 0 && isAnyOurNginx(pe.th32ProcessID))
+                out.push_back(pe.th32ProcessID);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return out;
+}
+
+// Graceful-quit every installed nginx version via both its data prefix
+// (manager-started) and its bin prefix (stray: double-click / script),
+// then force-kill leftovers. Runs before (re)start so a leftover master
+// holding the listen ports cannot wedge the new instance.
+static void stopOurNginxAll() {
+    if (allOurNginxPids().empty()) return;
+    for (auto& ver : compVersions(Comp::Nginx)) {
+        if (!compVersionUsable(Comp::Nginx, ver)) continue;
+        std::wstring exe;
+        if (!findExe(Comp::Nginx, ver, L"nginx.exe", exe)) continue;
+        std::wstring dataPrefix = compDataVerDir(Comp::Nginx, ver);
+        std::wstring binPrefix = compBinDirVer(Comp::Nginx, ver);
+        runProcessCapture(exe, L"-s quit -p \"" + toForward(dataPrefix) + L"\"", dataPrefix, 3000);
+        runProcessCapture(exe, L"-s quit -p \"" + toForward(binPrefix) + L"\"", binPrefix, 3000);
+    }
+    for (int i = 0; i < 30; ++i) {
+        if (allOurNginxPids().empty()) return;
+        Sleep(100);
+    }
+    for (DWORD pid : allOurNginxPids()) killProcessByPid(pid);
+    for (int i = 0; i < 30; ++i) {
+        if (allOurNginxPids().empty()) return;
+        Sleep(100);
+    }
+}
+
 static bool nginxRunningVer(const std::wstring& ver) {
     DWORD pid = readPid(nginxPidFile(ver));
     if (pid && isPidAlive(pid) && isOurNginx(pid, ver)) return true;
@@ -220,6 +314,20 @@ static bool nginxRunningVer(const std::wstring& ver) {
     return true;
 }
 
+// A nginx that was started from bin\nginx\<ver> (double-click or a manual
+// command) runs with the stock prefix and ignores the manager's data-prefix
+// configuration. It writes its own bin-side pidfile, and nginxRunningVer may
+// already have mirrored that PID into the data pidfile. Treat it as a stray
+// so Start can clean it up instead of reporting "已在运行".
+static bool nginxStrayRunning(const std::wstring& ver) {
+    DWORD dataPid = readPid(nginxPidFile(ver));
+    std::wstring binPidPath =
+        joinPath(joinPath(compBinDirVer(Comp::Nginx, ver), L"logs"), L"nginx.pid");
+    DWORD binPid = readPid(binPidPath);
+    if (!binPid || !isPidAlive(binPid) || !isOurNginx(binPid, ver)) return false;
+    return dataPid == 0 || dataPid == binPid;
+}
+
 // ---- postgresql ----
 static std::wstring pgDataDir(Comp c, const std::wstring& ver) {
     return compDataVerDir(c, ver);
@@ -228,7 +336,8 @@ static std::wstring pgDataDir(Comp c, const std::wstring& ver) {
 static bool pgRunningVer(Comp c, const std::wstring& ver) {
     std::wstring pidFile = joinPath(pgDataDir(c, ver), L"postmaster.pid");
     DWORD pid = readPid(pidFile);
-    return isPidAlive(pid);
+    return pid && isPidAlive(pid) &&
+           processImageIs(pid, compExe(Comp::Postgresql, ver, L"postgres.exe"));
 }
 
 // ---- redis ----
@@ -245,7 +354,8 @@ static bool redisRunningVer(const std::wstring& ver) {
     // clean shutdown while the kernel reclaims the socket — both cases
     // made the UI flicker "running → stopped" right after Stop.
     DWORD pid = readPid(redisPidFile(ver));
-    return isPidAlive(pid);
+    return pid && isPidAlive(pid) &&
+           processImageIs(pid, compExe(Comp::Redis, ver, L"redis-server.exe"));
 }
 
 // ---- nodejs / pm2 ----
@@ -357,7 +467,11 @@ bool compRunningQuick(Comp c) {
 bool compStart(Comp c, std::wstring& err) {
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装（bin 下无版本目录）"; return false; }
-    if (st.running) { err = L"已在运行"; return false; }
+    if (st.running &&
+        (c != Comp::Nginx || !nginxStrayRunning(st.currentVersion))) {
+        err = L"已在运行";
+        return false;
+    }
     std::wstring ver = st.currentVersion;
 
     switch (c) {
@@ -373,6 +487,10 @@ bool compStart(Comp c, std::wstring& err) {
                 err = L"nginx -t 校验失败:\n" + tOut;
                 return false;
             }
+            // Clear leftover masters (other version / stray prefix) still
+            // holding the listen ports; otherwise the new master exits on
+            // bind conflict and start fails with "no process detected".
+            stopOurNginxAll();
             std::wstring prefix = compDataVerDir(Comp::Nginx, ver);
             ProcInfo pi;
             if (!startProcessDetached(exe, L"-p \"" + toForward(prefix) + L"\"", prefix, pi)) {
@@ -460,13 +578,19 @@ bool compStop(Comp c, std::wstring& err) {
             // graceful shutdown never actually happened. Poll up to 3s first.
             runProcessCapture(exe, L"-s quit -p \"" + toForward(prefix) + L"\"",
                               prefix, 10000);
+            // Strays started with the bin dir as prefix (double-click etc.)
+            // ignore signals sent to the data prefix; try that prefix too.
+            std::wstring binPrefix = compBinDirVer(Comp::Nginx, ver);
+            runProcessCapture(exe, L"-s quit -p \"" + toForward(binPrefix) + L"\"",
+                              binPrefix, 5000);
             for (int i = 0; i < 30; ++i) {
                 if (!nginxRunningVer(ver)) return true;
                 Sleep(100);
             }
-            // grace period exhausted: force kill by pidfile
-            DWORD pid = readPid(nginxPidFile(ver));
-            if (isPidAlive(pid)) killProcessByPid(pid);
+            // grace period exhausted: force kill every process of this
+            // version (the pidfile alone misses twin masters started
+            // outside the manager - exactly how the ports stay wedged)
+            for (DWORD pid : ourNginxPidsVer(ver)) killProcessByPid(pid);
             for (int i = 0; i < 30; ++i) {
                 if (!nginxRunningVer(ver)) return true;
                 Sleep(100);
@@ -487,7 +611,8 @@ bool compStop(Comp c, std::wstring& err) {
                 // force kill postmaster pid
                 std::wstring pidFile = joinPath(dataDir, L"postmaster.pid");
                 DWORD pid = readPid(pidFile);
-                if (isPidAlive(pid)) killProcessByPid(pid);
+                if (processImageIs(pid, compExe(Comp::Postgresql, ver, L"postgres.exe")))
+                    killProcessByPid(pid);
             }
             return !pgRunningVer(c, ver);
         }
@@ -499,7 +624,8 @@ bool compStop(Comp c, std::wstring& err) {
                                   compBinDirVer(c, ver), 5000);
             }
             DWORD pid = readPid(redisPidFile(ver));
-            if (isPidAlive(pid)) killProcessByPid(pid);
+            if (processImageIs(pid, compExe(Comp::Redis, ver, L"redis-server.exe")))
+                killProcessByPid(pid);
             for (int i = 0; i < 30; ++i) {
                 if (!redisRunningVer(ver)) return true;
                 Sleep(100);
@@ -532,6 +658,12 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
     if (st.currentVersion == ver) { err = L"已是当前版本"; return false; }
     // verify new version dir exists
     if (!compVersionUsable(c, ver)) { err = L"版本不可用或目录不存在: " + ver; return false; }
+
+    // Clear stray masters of any version before selecting the target. Without
+    // this, a bin-prefix process of the target version is reported as
+    // "already running" and the switch keeps its stale config instead of
+    // restarting under the managed data prefix.
+    if (c == Comp::Nginx) stopOurNginxAll();
 
     // Stop current
     if (st.running) {
@@ -590,50 +722,92 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
 
         // if target data dir already exists (from earlier migration), move it aside
         // so initdb sees a fresh dir; the old copy is preserved as safety
+        bool newDataMoved = false;
+        std::wstring oldNewData;
         if (dirExists(newData)) {
-            std::wstring oldDir = newData + L".old-" + nowStamp();
-            if (!MoveFileW(newData.c_str(), oldDir.c_str())) {
+            oldNewData = newData + L".old-" + nowStamp();
+            if (!MoveFileW(newData.c_str(), oldNewData.c_str())) {
                 err = L"无法移动旧数据目录（可能被占用）: " + newData;
                 return false;
             }
+            newDataMoved = true;
         }
+
+        // Any failure after this point must put the previous version back.
+        auto rollbackAfterFailure = [&](const std::wstring& reason,
+                                        const std::wstring& backupHint,
+                                        std::wstring& errOut) {
+            std::wstring detail;
+            if (pgRunningVer(c, ver)) {
+                std::wstring serr;
+                if (!compStop(c, serr))
+                    detail += L"停止新版本失败: " + serr + L"；";
+            }
+            if (dirExists(newData)) {
+                std::wstring failedDir = newData + L".failed-" + nowStamp();
+                if (!MoveFileW(newData.c_str(), failedDir.c_str()))
+                    detail += L"保留失败数据目录失败: " + failedDir + L"；";
+            }
+            if (newDataMoved && dirExists(oldNewData)) {
+                if (MoveFileW(oldNewData.c_str(), newData.c_str()))
+                    newDataMoved = false;
+                else
+                    detail += L"恢复原数据目录失败: " + oldNewData + L"；";
+            }
+            iniSet(std::wstring(L"ver.postgresql"), oldVer);
+            if (oldWasRunning && !pgRunningVer(c, oldVer)) {
+                std::wstring serr;
+                if (!compStart(c, serr))
+                    detail += L"重新启动旧版本失败: " + serr + L"；";
+            }
+            errOut = reason;
+            if (!backupHint.empty()) errOut += L"（" + backupHint + L"）";
+            if (!detail.empty()) errOut += L"；回滚提示: " + detail;
+        };
 
         // init target with fresh dir
         // (set version first so subsequent compStart targets the new version)
         iniSet(std::wstring(L"ver.postgresql"), ver);
         std::wstring berr;
         if (!pgInit(c, ver, pgUser(), pgPassword(), pgPort(), berr)) {
-            err = L"初始化新版本失败: " + berr;
+            rollbackAfterFailure(L"初始化新版本失败: " + berr, L"", err);
             return false;
         }
 
         // restore backup into new
         if (!backupFile.empty()) {
             if (!compStart(c, berr)) {
-                err = L"启动新版本以恢复失败: " + berr;
+                rollbackAfterFailure(L"启动新版本以恢复失败: " + berr, L"", err);
                 return false;
             }
             for (int i = 0; i < 60 && !pgRunningVer(c, ver); ++i) Sleep(200);
             if (!pgRunningVer(c, ver)) {
-                err = L"新版本启动后未就绪: " + ver;
+                rollbackAfterFailure(L"新版本启动后未就绪: " + ver, L"", err);
                 return false;
             }
             std::wstring psql;
             if (!findExe(Comp::Postgresql, ver, L"psql.exe", psql)) {
-                err = L"未找到 psql.exe"; return false;
+                rollbackAfterFailure(L"未找到 psql.exe", L"", err);
+                return false;
             }
             // port/user come from settings.ini and land on the command line
             std::wstring port = pgPort();
             std::wstring user = pgUser();
-            if (!pgValidPort(port)) { err = L"端口号无效: " + port; return false; }
-            if (!pgValidIdent(user)) { err = L"用户名含非法字符: " + user; return false; }
+            if (!pgValidPort(port)) {
+                rollbackAfterFailure(L"端口号无效: " + port, L"", err);
+                return false;
+            }
+            if (!pgValidIdent(user)) {
+                rollbackAfterFailure(L"用户名含非法字符: " + user, L"", err);
+                return false;
+            }
             std::wstring cmd = L"-h 127.0.0.1 -p " + port + L" -U " + user +
                                L" -d postgres -f \"" + backupFile + L"\"";
             RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 120000,
                                             {{L"PGPASSWORD", pgPassword()}});
             if (!r.ok) {
-                // point the user at the dump so a failed restore isn't data loss
-                err = L"恢复备份失败: " + r.output + L"（备份文件: " + backupFile + L"）";
+                rollbackAfterFailure(L"恢复备份失败: " + r.output,
+                                     L"备份文件: " + backupFile, err);
                 return false;
             }
         }
@@ -713,7 +887,7 @@ static const wchar_t* DEFAULT_VHOST =
     L"server {\r\n"
     L"    listen {{PORT}};\r\n"
     L"    server_name {{DOMAIN}};\r\n"
-    L"    root {{ROOT}};\r\n"
+    L"    root \"{{ROOT}}\";\r\n"
     L"    index index.html index.htm;\r\n"
     L"    location / {\r\n"
     L"        try_files $uri $uri/ @nodejs;\r\n"
@@ -731,10 +905,10 @@ static const wchar_t* DEFAULT_VHOST_HTTPS =
     L"server {\r\n"
     L"    listen {{PORT}} ssl;\r\n"
     L"    server_name {{DOMAIN}};\r\n"
-    L"    root {{ROOT}};\r\n"
+    L"    root \"{{ROOT}}\";\r\n"
     L"    index index.html index.htm;\r\n"
-    L"    ssl_certificate     {{CERT}};\r\n"
-    L"    ssl_certificate_key {{KEY}};\r\n"
+    L"    ssl_certificate     \"{{CERT}}\";\r\n"
+    L"    ssl_certificate_key \"{{KEY}}\";\r\n"
     L"    ssl_protocols TLSv1.2 TLSv1.3;\r\n"
     L"    location / {\r\n"
     L"        try_files $uri $uri/ @nodejs;\r\n"
@@ -787,7 +961,7 @@ bool genNginxConfig(const std::wstring& ver) {
         DeleteFileW(joinPath(vhostDir, f).c_str());
     }
     for (auto& f : listFiles(srcVhost, L"conf")) {
-        if (!f.empty() && f[0] == L'_') continue;
+        if (f == L"_template.conf" || f == L"_template_https.conf") continue;
         copyFileW2(joinPath(srcVhost, f), joinPath(vhostDir, f));
     }
     return true;
@@ -897,7 +1071,7 @@ std::vector<VHost> nginxListVHosts() {
     std::vector<VHost> result;
     std::wstring dir = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
     for (auto& f : listFiles(dir, L"conf")) {
-        if (!f.empty() && f[0] == L'_') continue;
+        if (f == L"_template.conf" || f == L"_template_https.conf") continue;
         VHost v;
         v.name = f.substr(0, f.size() - 5); // strip .conf
         std::wstring content = readFileText(joinPath(dir, f));
@@ -925,6 +1099,8 @@ std::vector<VHost> nginxListVHosts() {
             size_t e = content.find(L";", p1);
             if (b != std::wstring::npos && e != std::wstring::npos && b < e)
                 v.root = trimStr(content.substr(b + 1, e - b - 1));
+            if (v.root.size() >= 2 && v.root.front() == L'"' && v.root.back() == L'"')
+                v.root = v.root.substr(1, v.root.size() - 2);
         }
         result.push_back(v);
     }
@@ -936,9 +1112,29 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
                      const std::wstring& certPath, const std::wstring& keyPath,
                      const std::wstring& root, std::wstring& err) {
     if (name.empty() || domain.empty()) { err = L"站点名和域名不能为空"; return false; }
+    // _template* files are reserved for config templates, so a site name must
+    // not collide with that convention (previously _foo was written but never
+    // copied into the runtime vhost dir, i.e. silently disabled).
+    if (name[0] == L'_') {
+        err = L"站点名不能以下划线开头";
+        return false;
+    }
     // validate name (no path chars)
     if (name.find_first_of(L"\\/:. *?\"<>|") != std::wstring::npos) {
         err = L"站点名含非法字符"; return false;
+    }
+    if (domain.size() > 253) {
+        err = L"域名过长";
+        return false;
+    }
+    for (wchar_t c : domain) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') || c == L'.' || c == L'-' ||
+                  c == L'_' || c == L'*';
+        if (!ok) {
+            err = L"域名含非法字符（只允许字母、数字、. - _ *）";
+            return false;
+        }
     }
     if (ssl) {
         if (certPath.empty() || keyPath.empty()) { err = L"HTTPS 站点需要提供证书和 key 文件"; return false; }
@@ -1078,6 +1274,18 @@ static std::wstring pgEscapeIdent(const std::wstring& s) {
     return out;
 }
 
+// Ask Windows for a brand-new empty temp file instead of deriving one from
+// seconds + PID. The old scheme let two concurrent PG operations in the same
+// second (e.g. the user-list refresh plus a password change) collide on the
+// same .sql/.tmp path.
+static bool makeTempFile(const std::wstring& prefix, std::wstring& path) {
+    wchar_t tmpDir[MAX_PATH], name[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tmpDir)) return false;
+    if (!GetTempFileNameW(tmpDir, prefix.c_str(), 0, name)) return false;
+    path = name;
+    return true;
+}
+
 // Run `sql` against the running server through a temp file. extraArgs are
 // inserted verbatim before -f (caller-owned literals such as "-t -A").
 // On failure returns false with out.output holding the reason.
@@ -1100,15 +1308,17 @@ static bool pgRunSql(Comp c, const std::wstring& ver, const std::wstring& extraA
         return false;
     }
 
-    wchar_t tmpDir[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmpDir);
-    std::wstring sqlFile = joinPath(tmpDir, L"lnpp_sql_" + nowStamp() + L"_" +
-                                    std::to_wstring(GetCurrentProcessId()) + L".sql");
+    std::wstring sqlFile;
+    if (!makeTempFile(L"lnp", sqlFile)) {
+        out.output = L"无法创建临时 SQL 文件";
+        return false;
+    }
     // Pin the encoding: writeFileText emits UTF-8, but psql would otherwise
     // decode the file with the OS ANSI code page and mangle non-ASCII names.
     std::wstring content = L"\\encoding UTF8\r\n" + sql + L"\r\n";
     if (!writeFileText(sqlFile, content)) {
         out.output = L"无法写入临时 SQL 文件: " + sqlFile;
+        DeleteFileW(sqlFile.c_str());
         return false;
     }
 
@@ -1156,12 +1366,14 @@ bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
     // write temp pw file to system temp (outside data dir so initdb sees empty dir).
     // Random-ish name: a fixed name like lnpp_pwfile.tmp could collide with a
     // stale/foreign file of the same name and feed initdb the wrong password.
-    wchar_t tmpDir[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmpDir);
-    std::wstring pwFile = joinPath(tmpDir, L"lnpp_pw_" + nowStamp() + L"_" +
-                                  std::to_wstring(GetCurrentProcessId()) + L".tmp");
+    std::wstring pwFile;
+    if (!makeTempFile(L"lnp", pwFile)) {
+        err = L"无法创建临时密码文件";
+        return false;
+    }
     if (!writeFileText(pwFile, password)) {
         err = L"无法写入临时密码文件: " + pwFile;
+        DeleteFileW(pwFile.c_str());
         return false;
     }
 
