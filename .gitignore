@@ -20,11 +20,9 @@ packages.conf
 etc/nginx/vhosts/*.conf
 !etc/nginx/vhosts/_template*.conf
 
-# test-generated www sites (keep the dir via www/.gitkeep)
-www/final1/
-www/s1/
-www/site1/
-www/test1/
+# test-generated / user-created www sites (keep the dir via www/.gitkeep)
+www/*/
+!www/.gitkeep
 
 # misc
 Thumbs.db

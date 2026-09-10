@@ -45,6 +45,8 @@ cl %CL_FLAGS% /Fo"build\\" /Fe"%OUT_EXE%" ^
 
 if errorlevel 1 (
     echo [ERROR] Build failed
+    echo         If the error above is LNK1104 about %OUT_EXE%, the program is
+    echo         still running - exit it from the tray icon first.
     exit /b 1
 )
 echo [OK] %OUT_EXE%

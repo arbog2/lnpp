@@ -1,4 +1,4 @@
-#include "process.h"
+#include "proc.h"
 
 static DWORD g_uiThreadId = 0;
 
@@ -136,16 +136,44 @@ RunResult runProcessCapture(const std::wstring& exe,
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return result;
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si;
+    // bInheritHandles=TRUE without a handle list hands *every* inheritable
+    // handle this process owns to the child. When two runProcessCapture() calls
+    // overlap, the child spawned while another call has its pipe write end open
+    // (the window between that call's CreatePipe and CreateProcess) gets a copy
+    // of that other pipe. The other call's reader thread then never sees EOF
+    // until this child exits — e.g. a 3s pm2 jlist poll could hold a 120s
+    // pg_dumpall capture open, or vice versa. Restrict inheritance to exactly
+    // this call's write handle.
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<BYTE> attrBuf(attrSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs =
+        attrSize ? (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuf.data() : nullptr;
+    bool inheritList = attrs != nullptr &&
+                       InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) != FALSE;
+    HANDLE inheritHandles[1] = { hWritePipe };
+    if (inheritList)
+        inheritList = UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                inheritHandles, sizeof(inheritHandles),
+                                                nullptr, nullptr) != FALSE;
+    if (!inheritList && attrs) {
+        DeleteProcThreadAttributeList(attrs);
+        attrs = nullptr;   // fall back to plain inheritance rather than failing
+    }
+
+    STARTUPINFOEXW si;
     ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
+    // cbSize must be the STARTUPINFOEX size when EXTENDED_STARTUPINFO_PRESENT
+    // is used; the plain size otherwise.
+    si.StartupInfo.cb = attrs ? sizeof(si) : sizeof(STARTUPINFO);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.StartupInfo.hStdOutput = hWritePipe;
+    si.StartupInfo.hStdError = hWritePipe;
     // GUI subsystem: this process has no console stdin. Leave it NULL so a
     // child that reads stdin gets immediate EOF instead of an invalid handle.
-    si.hStdInput = nullptr;
-    si.wShowWindow = SW_HIDE;
+    si.StartupInfo.hStdInput = nullptr;
+    si.StartupInfo.wShowWindow = SW_HIDE;
+    si.lpAttributeList = attrs;
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
@@ -171,10 +199,13 @@ RunResult runProcessCapture(const std::wstring& exe,
 
     std::wstring wd = workDir.empty() ? exeDir() : workDir;
 
-    BOOL created = CreateProcessW(exe.c_str(), &cmdBuf[0], nullptr, nullptr, TRUE,
-                                  CREATE_NO_WINDOW | (envBlock ? CREATE_UNICODE_ENVIRONMENT : 0),
-                                  envBlock, wd.c_str(), &si, &pi);
+    DWORD flags = CREATE_NO_WINDOW | (envBlock ? CREATE_UNICODE_ENVIRONMENT : 0);
+    if (attrs) flags |= EXTENDED_STARTUPINFO_PRESENT;
 
+    BOOL created = CreateProcessW(exe.c_str(), &cmdBuf[0], nullptr, nullptr, TRUE,
+                                  flags, envBlock, wd.c_str(), &si.StartupInfo, &pi);
+
+    if (attrs) DeleteProcThreadAttributeList(attrs);
     delete[] envBlock;
     CloseHandle(hWritePipe); // child holds its own copy
 
@@ -230,18 +261,4 @@ RunResult runProcessCapture(const std::wstring& exe,
         }
     }
     return result;
-}
-
-int runWait(const std::wstring& exe, const std::wstring& args, const std::wstring& workDir, int timeoutMs) {
-    ProcInfo pi;
-    if (!startProcessDetached(exe, args, workDir, pi, true)) return -1;
-    DWORD r = WaitForSingleObject(pi.hProcess, timeoutMs > 0 ? timeoutMs : INFINITE);
-    if (r == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        return -2;
-    }
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    return (int)code;
 }

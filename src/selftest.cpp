@@ -1,5 +1,5 @@
 #include "common.h"
-#include "process.h"
+#include "proc.h"
 #include "manager.h"
 
 static int g_fail = 0;
@@ -8,16 +8,9 @@ static void check(const wchar_t* name, bool ok, const std::wstring& detail = L""
     if (!ok) ++g_fail;
 }
 
-static bool queryVer(const std::wstring& ver, const std::wstring& db, const std::wstring& sql, std::wstring& out) {
-    std::wstring psql = joinPath(joinPath(compBinDirVer(Comp::Postgresql, ver), L"bin"), L"psql.exe");
-    RunResult r = runProcessCapture(psql,
-        L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
-        L" -d " + db + L" -t -c \"" + sql + L"\"",
-        compBinDirVer(Comp::Postgresql, ver), 15000, {{L"PGPASSWORD", pgPassword()}});
-    out = r.output;
-    return r.ok;
-}
-
+// NOTE: no queryVer() helper here on purpose — selftest never runs SQL (that is
+// migtest's job), and keeping an unused static function only produced a C4505
+// warning in the /W4 build.
 int wmain() {
     std::wstring err, out;
 

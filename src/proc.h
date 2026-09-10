@@ -1,6 +1,9 @@
+// Process helpers. NOTE: this file used to be named process.h, which shadowed
+// the CRT's <process.h> (an /I pointing at src\ then broke <thread> with
+// "_beginthreadex: not a member"). Keep the name distinct from any CRT header.
 #pragma once
-#ifndef LNPP_PROCESS_H
-#define LNPP_PROCESS_H
+#ifndef LNPP_PROC_H
+#define LNPP_PROC_H
 
 #include "common.h"
 
@@ -41,8 +44,5 @@ bool killProcessByPid(DWORD pid);
 
 // Check whether a PID is alive.
 bool isPidAlive(DWORD pid);
-
-// Run and wait; returns exit code (or -1 on failure).
-int runWait(const std::wstring& exe, const std::wstring& args, const std::wstring& workDir, int timeoutMs);
 
 #endif

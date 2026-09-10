@@ -2,13 +2,18 @@
 #include <wincrypt.h>   // CryptProtectData / CryptStringToBinary (DPAPI)
 
 std::wstring exeDir() {
-    static std::wstring cached;
-    if (!cached.empty()) return cached;
-    wchar_t buf[MAX_PATH * 4];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 4);
-    std::wstring path(buf, n);
-    size_t pos = path.find_last_of(L"\\/");
-    cached = (pos == std::wstring::npos) ? L"." : path.substr(0, pos);
+    // Function-local static: C++11 guarantees a single, thread-safe
+    // initialisation. The previous manual `if (cached.empty())` guard raced
+    // whenever a worker thread (runProcessCapture -> exeDir) and the UI thread
+    // initialised it at the same moment — a concurrent std::wstring assignment.
+    static const std::wstring cached = []() {
+        wchar_t buf[MAX_PATH * 4];
+        DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 4);
+        if (n == 0) return std::wstring(L".");
+        std::wstring path(buf, n);
+        size_t pos = path.find_last_of(L"\\/");
+        return (pos == std::wstring::npos) ? std::wstring(L".") : path.substr(0, pos);
+    }();
     return cached;
 }
 
@@ -382,26 +387,44 @@ std::wstring dpProtect(const std::wstring& plain) {
     DATA_BLOB out = {0, nullptr};
     if (!CryptProtectData(&in, L"LNPP settings", nullptr, nullptr, nullptr, 0, &out))
         return L"";
-    // base64 without CR/LF so the ciphertext survives the INI format
+    // base64 without CR/LF so the ciphertext survives the INI format.
+    // CryptBinaryToString returns the required size *including* the terminating
+    // NUL, and writes that NUL into the buffer: keeping it put a 0x00 byte
+    // inside settings.ini and made every read depend on the base64 parser
+    // tolerating the stray character.
     DWORD len = 0;
-    CryptBinaryToStringW(out.pbData, out.cbData,
-                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &len);
+    if (!CryptBinaryToStringW(out.pbData, out.cbData,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &len) ||
+        len == 0) {
+        LocalFree(out.pbData);
+        return L"";
+    }
     std::wstring r(len, L'\0');
-    if (len > 0)
-        CryptBinaryToStringW(out.pbData, out.cbData,
-                             CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &r[0], &len);
+    if (!CryptBinaryToStringW(out.pbData, out.cbData,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &r[0], &len)) {
+        LocalFree(out.pbData);
+        return L"";   // never return a NUL-filled "ciphertext"
+    }
     LocalFree(out.pbData);
+    while (!r.empty() && r.back() == L'\0') r.pop_back();
     return r;
 }
 
 std::wstring dpUnprotect(const std::wstring& enc) {
     if (enc.empty()) return L"";
+    // Ciphertexts written before the trailing-NUL fix above are still on disk
+    // (settings.ini values ending in 0x00): strip the NULs so both generations
+    // decrypt, otherwise a legacy value would look corrupt exactly when the
+    // plaintext key has already been migrated away.
+    std::wstring s = enc;
+    while (!s.empty() && s.back() == L'\0') s.pop_back();
+    if (s.empty()) return L"";
     DWORD len = 0;
-    if (!CryptStringToBinaryW(enc.c_str(), (DWORD)enc.size(), CRYPT_STRING_BASE64,
+    if (!CryptStringToBinaryW(s.c_str(), (DWORD)s.size(), CRYPT_STRING_BASE64,
                               nullptr, &len, nullptr, nullptr))
         return L"";
     std::vector<BYTE> bytes(len);
-    if (!CryptStringToBinaryW(enc.c_str(), (DWORD)enc.size(), CRYPT_STRING_BASE64,
+    if (!CryptStringToBinaryW(s.c_str(), (DWORD)s.size(), CRYPT_STRING_BASE64,
                               bytes.data(), &len, nullptr, nullptr))
         return L"";
     DATA_BLOB in = {len, bytes.data()};
@@ -414,17 +437,41 @@ std::wstring dpUnprotect(const std::wstring& enc) {
 }
 
 // ---- Log ----
+// A tray-resident manager can run for weeks without being restarted, so
+// lnpp.log is capped: once it passes LOG_MAX_BYTES it is moved aside to
+// lnpp.log.1 (replacing the previous one) and a fresh file is started on the
+// next write. Without this the log grew without bound.
 std::mutex g_logMtx;
 HANDLE g_logFile = INVALID_HANDLE_VALUE;
+ULONGLONG g_logBytes = 0;
+constexpr ULONGLONG LOG_MAX_BYTES = 4ull * 1024 * 1024;
+
+static std::wstring logFilePath() { return joinPath(logsDir(), L"lnpp.log"); }
+
+// Caller holds g_logMtx.
+static void logOpenLocked() {
+    makeDirs(logsDir());
+    g_logFile = CreateFileW(logFilePath().c_str(), FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    g_logBytes = 0;
+    LARGE_INTEGER size = {};
+    if (g_logFile != INVALID_HANDLE_VALUE && GetFileSizeEx(g_logFile, &size))
+        g_logBytes = (ULONGLONG)size.QuadPart;
+}
+
+// Caller holds g_logMtx. The file is reopened lazily on the next write.
+static void logRotateLocked() {
+    CloseHandle(g_logFile);
+    g_logFile = INVALID_HANDLE_VALUE;
+    std::wstring path = logFilePath();
+    MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING);
+    g_logBytes = 0;
+}
 
 void logMsg(const std::wstring& tag, const std::wstring& msg) {
     std::lock_guard<std::mutex> lock(g_logMtx);
-    if (g_logFile == INVALID_HANDLE_VALUE) {
-        makeDirs(logsDir());
-        g_logFile = CreateFileW(joinPath(logsDir(), L"lnpp.log").c_str(),
-                                FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    }
+    if (g_logFile == INVALID_HANDLE_VALUE) logOpenLocked();
     std::wstring line = nowText() + L" [" + tag + L"] " + msg + L"\r\n";
     int len = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(), nullptr, 0, nullptr, nullptr);
     std::string bytes(len, '\0');
@@ -432,5 +479,7 @@ void logMsg(const std::wstring& tag, const std::wstring& msg) {
     if (g_logFile != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
         WriteFile(g_logFile, bytes.c_str(), (DWORD)bytes.size(), &written, nullptr);
+        g_logBytes += bytes.size();
+        if (g_logBytes > LOG_MAX_BYTES) logRotateLocked();
     }
 }

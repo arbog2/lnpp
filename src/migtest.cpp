@@ -1,5 +1,5 @@
 #include "common.h"
-#include "process.h"
+#include "proc.h"
 #include "manager.h"
 
 static int g_fail = 0;

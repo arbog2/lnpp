@@ -1,6 +1,6 @@
 #include "downloader.h"
 #include "manager.h"
-#include "process.h"
+#include "proc.h"
 #include <winhttp.h>
 #include <shellapi.h>
 

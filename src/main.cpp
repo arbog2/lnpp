@@ -1,9 +1,11 @@
 #include "common.h"
-#include "process.h"
+#include "proc.h"
 #include "manager.h"
 #include "downloader.h"
 #include <commdlg.h>
 #include <shlobj.h>
+#include <memory>
+#include <cstdlib>
 
 // App icon resource (see app.rc)
 #define IDI_APP 101
@@ -87,6 +89,9 @@ static std::vector<PM2App> g_snapPm2;
 static std::atomic<bool> g_statusWorkerBusy{false};
 static std::atomic<bool> g_pm2WorkerBusy{false};
 static std::atomic<bool> g_appClosing{false};
+// Set by the first shutdown path that starts stopping components, so WM_DESTROY
+// does not run the (slow, redundant) stop sequence a second time.
+static std::atomic<bool> g_shutdownStarted{false};
 static std::atomic<int> g_curTab{0};
 static bool g_pendingVhostClear = false;   // clear nginx add form after a successful add
 static std::vector<std::wstring> g_pgUsers;   // pg user list for the user combo
@@ -514,6 +519,13 @@ static void ovAllOp(AllOp op) {
         for (int i = 0; i < (int)Comp::Count; ++i) {
             if (g_appClosing) break;
             Comp c = (Comp)i;
+            // A per-component operation may already be in flight (startup
+            // autostart, or a button the user pressed just before this one):
+            // running both would race on the same port / data directory.
+            if (g_ui[i].busy) {
+                ovLogAppend(L"- " + std::wstring(compDisplay(c)) + L": 跳过 (正在执行其他操作)");
+                continue;
+            }
             std::wstring e;
             bool ok = true;
             switch (op) {
@@ -734,7 +746,11 @@ static void trayBalloon(const wchar_t* title, const wchar_t* msg) {
 }
 
 // Stop every component and verify it is really down (retry a few times).
+// Runs on a worker thread only: a full stop cycle can take tens of seconds
+// (pg_ctl -w, nginx grace period, pm2 kill), which must never happen on the UI
+// thread. Sets g_shutdownStarted so WM_DESTROY knows the stack is being handled.
 static void shutdownAllComponents() {
+    g_shutdownStarted = true;
     for (int i = 0; i < (int)Comp::Count; ++i) {
         if (g_appClosing) break;
         Comp c = (Comp)i;
@@ -1464,16 +1480,41 @@ static void dlStart(HWND hwnd) {
     std::shared_ptr<std::atomic<bool>> cancelSp = st->cancel;
     std::thread([hwnd, copy, cancelSp]() {
         std::wstring err;
-        auto prog = [hwnd](const std::wstring& stage, DWORD done, DWORD total) {
-            wchar_t* s = _wcsdup(stage.c_str());
-            if (!IsWindow(hwnd)) { free(s); return; }   // dialog gone: drop progress
-            PostMessageW(hwnd, WM_DL_STAGE, 0, (LPARAM)s);
+        // pkgsInstall reports progress once per received chunk — tens of
+        // thousands of calls for a ~300 MB PostgreSQL zip. Posting two messages
+        // and re-setting the status text per chunk floods the UI queue, so the
+        // stage string is only allocated when the stage actually changes and
+        // the progress line is throttled to a whole percent / 200 ms.
+        struct ProgressState {
+            std::wstring stage;
+            int pct = -1;
+            DWORD tick = 0;
+            bool first = true;
+        };
+        auto pst = std::make_shared<ProgressState>();
+        auto prog = [hwnd, pst](const std::wstring& stage, DWORD done, DWORD total) {
+            int pct = total > 0 ? (int)((__int64)done * 100 / total) : -1;
+            DWORD now = GetTickCount();
+            bool stageChanged = (stage != pst->stage);
+            if (!stageChanged && !pst->first) {
+                if (pct >= 0 && pct == pst->pct) return;        // same percent
+                if (now - pst->tick < 200) return;              // too soon
+            }
+            pst->stage = stage;
+            pst->pct = pct;
+            pst->tick = now;
+            pst->first = false;
+            if (!IsWindow(hwnd)) return;   // dialog gone: drop the update
+            if (stageChanged) {
+                wchar_t* s = _wcsdup(stage.c_str());
+                if (!PostMessageW(hwnd, WM_DL_STAGE, 0, (LPARAM)s)) free(s);
+            }
             PostMessageW(hwnd, WM_DL_PROGRESS, (WPARAM)done, (LPARAM)total);
         };
         bool ok = pkgsInstall(copy, prog, cancelSp.get(), err);
+        if (!IsWindow(hwnd)) return;   // dialog gone: nothing to report
         wchar_t* e = _wcsdup(err.c_str());
-        if (IsWindow(hwnd)) PostMessageW(hwnd, WM_DL_DONE, ok ? 1 : 0, (LPARAM)e);
-        else free(e);
+        if (!PostMessageW(hwnd, WM_DL_DONE, ok ? 1 : 0, (LPARAM)e)) free(e);
     }).detach();
 }
 
@@ -1618,6 +1659,22 @@ static void showDownloaderDialog(HWND owner) {
     DestroyWindow(dlg);
 }
 
+// The four component pages are built by initCommonControls() with the *same*
+// control IDs (IDC_BTN_START / IDC_LOG / ...) under the same parent window, so
+// GetDlgItem(g_main, ...) only ever finds the nginx copy. Resolve a WM_COMMAND
+// sender back to its component instead of trusting the active tab: the tab
+// happens to match today because the other pages are hidden, but any keyboard
+// or programmatic notification would then act on the wrong component.
+static Comp compFromControl(HWND ctl) {
+    if (!ctl) return Comp::Count;
+    for (int i = 0; i < (int)Comp::Count; ++i) {
+        for (HWND h : g_ui[i].pageControls) {
+            if (h == ctl) return (Comp)i;
+        }
+    }
+    return Comp::Count;
+}
+
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1657,6 +1714,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             int cur = TabCtrl_GetCurSel(g_tab);
+            // Component for the shared per-page controls: the sending control
+            // wins, the active tab is only the fallback (see compFromControl).
+            Comp sender = compFromControl((HWND)lParam);
+            if (sender == Comp::Count && cur >= TAB_COMP_BASE) sender = tabToComp(cur);
             switch (id) {
                 case IDC_OV_AUTOSTART_ALL: ovAutoAll((HWND)lParam); break;
                 case IDC_OV_BOOT_START: {
@@ -1690,34 +1751,32 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_COMP_AUTO_BASE + 2: ovAutoComp(Comp::Redis, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 3: ovAutoComp(Comp::Nodejs, (HWND)lParam); break;
                 case IDC_BTN_START:
-                    if (cur >= TAB_COMP_BASE) actStart(tabToComp(cur));
+                    if (sender != Comp::Count) actStart(sender);
                     break;
                 case IDC_BTN_STOP:
-                    if (cur >= TAB_COMP_BASE) actStop(tabToComp(cur));
+                    if (sender != Comp::Count) actStop(sender);
                     break;
                 case IDC_BTN_SWITCH:
-                    if (cur >= TAB_COMP_BASE) actSwitch(tabToComp(cur));
+                    if (sender != Comp::Count) actSwitch(sender);
                     break;
                 case IDC_BTN_CFG: {
-                    if (cur < TAB_COMP_BASE) break;
-                    Comp c = tabToComp(cur);
-                    ShellExecuteW(hwnd, L"open", compEtcDir(c).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    if (sender == Comp::Count) break;
+                    ShellExecuteW(hwnd, L"open", compEtcDir(sender).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     break;
                 }
                 case IDC_BTN_DATA: {
-                    if (cur < TAB_COMP_BASE) break;
-                    Comp c = tabToComp(cur);
-                    ComponentStatus st = compStatus(c);
+                    if (sender == Comp::Count) break;
+                    ComponentStatus st = compStatus(sender);
                     if (st.installed) {
-                        std::wstring dir = compDataVerDir(c, st.currentVersion);
+                        std::wstring dir = compDataVerDir(sender, st.currentVersion);
                         makeDirs(dir);
                         ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     }
                     break;
                 }
                 case IDC_BTN_CLEAR_LOG: {
-                    if (cur < TAB_COMP_BASE) break;
-                    HWND log = g_ui[(int)tabToComp(cur)].logEdit;
+                    if (sender == Comp::Count) break;
+                    HWND log = g_ui[(int)sender].logEdit;
                     if (log) SetWindowTextW(log, L"");
                     break;
                 }
@@ -1951,14 +2010,24 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_DESTROY:
             g_appClosing = true;
             trayRemove();
-            // stop all components
-            for (int i = 0; i < (int)Comp::Count; ++i) {
-                std::wstring err;
-                compStop((Comp)i, err);
-            }
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
             KillTimer(hwnd, 3);
+            // Stopping the stack is the tray Exit path's job (shutdownAllComponents
+            // on a worker thread, then WM_REAL_EXIT). Reaching WM_DESTROY from
+            // anywhere else - Windows logoff, or a future DestroyWindow caller -
+            // must still not leave servers running, but it must not block this
+            // thread for a full stop cycle either: skip components that are
+            // already down and skip the whole sequence when the exit path has
+            // taken over (g_shutdownStarted).
+            if (!g_shutdownStarted.exchange(true)) {
+                for (int i = 0; i < (int)Comp::Count; ++i) {
+                    Comp c = (Comp)i;
+                    if (!compRunningQuick(c)) continue;   // nothing to stop
+                    std::wstring err;
+                    compStop(c, err);
+                }
+            }
             // flush any pending ini writes before we exit; without this
             // the last 200ms of toggles would be lost.
             iniFlushNow();

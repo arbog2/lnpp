@@ -37,7 +37,9 @@ std::wstring compBinDirVer(Comp c, const std::wstring& ver) {
 // postgresql section, but the version-switch migration code above it also
 // builds a psql command line and needs them first.
 static bool pgValidIdent(const std::wstring& s);
-static bool pgValidPort(const std::wstring& s);
+// Port whitelist shared by every command line and config value we build
+// (psql / pg_dumpall / redis-cli / the nginx listen directive).
+static bool validPort(const std::wstring& s);
 
 // ============================ Component discovery ============================
 
@@ -302,15 +304,21 @@ static void stopOurNginxAll() {
     }
 }
 
-static bool nginxRunningVer(const std::wstring& ver) {
+// `repairPidFile` lets the caller opt into rewriting a stale pidfile. The
+// background status pollers must pass false: they run every 2-3s on two
+// different threads, and a status *query* that writes the pidfile makes those
+// threads race on the same nginx.pid.tmp (one MoveFileEx then fails).
+static bool nginxRunningVer(const std::wstring& ver, bool repairPidFile) {
     DWORD pid = readPid(nginxPidFile(ver));
     if (pid && isPidAlive(pid) && isOurNginx(pid, ver)) return true;
     if (!anyNginxRunning(ver)) return false;
-    // stale pidfile (e.g. nginx started outside the manager or the pidfile
-    // was wiped): repoint it at the live master so `-s reload` / `-s quit`
-    // address the right process
-    DWORD mp = nginxMasterPid(ver);
-    if (mp) writeFileText(nginxPidFile(ver), std::to_wstring(mp));
+    if (repairPidFile) {
+        // stale pidfile (e.g. nginx started outside the manager or the pidfile
+        // was wiped): repoint it at the live master so `-s reload` / `-s quit`
+        // address the right process
+        DWORD mp = nginxMasterPid(ver);
+        if (mp) writeFileText(nginxPidFile(ver), std::to_wstring(mp));
+    }
     return true;
 }
 
@@ -437,7 +445,7 @@ bool compIsRunning(Comp c) {
     if (st.currentVersion.empty()) return false;
     if (!compVersionUsable(c, st.currentVersion)) return false;
     switch (c) {
-        case Comp::Nginx:      return nginxRunningVer(st.currentVersion);
+        case Comp::Nginx:      return nginxRunningVer(st.currentVersion, /*repairPidFile=*/true);
         case Comp::Postgresql: return pgRunningVer(c, st.currentVersion);
         case Comp::Redis:      return redisRunningVer(st.currentVersion);
         case Comp::Nodejs:
@@ -447,13 +455,15 @@ bool compIsRunning(Comp c) {
 }
 
 // Lightweight liveness probe for background polling: identical to
-// compIsRunning except Redis uses the pidfile only (no redis-cli spawn).
+// compIsRunning except nginx never rewrites the pidfile and Redis checks the
+// pidfile only (no redis-cli spawn). Both pollers run on worker threads at the
+// same time, so this path must stay free of side effects.
 bool compRunningQuick(Comp c) {
     std::wstring ver = iniGet(std::wstring(L"ver.") + compName(c), L"");
     if (ver.empty()) return false;
     if (!dirExists(compBinDirVer(c, ver))) return false;
     switch (c) {
-        case Comp::Nginx:      return nginxRunningVer(ver);
+        case Comp::Nginx:      return nginxRunningVer(ver, /*repairPidFile=*/false);
         case Comp::Postgresql: return pgRunningVer(c, ver);
         case Comp::Redis: {
             DWORD pid = readPid(redisPidFile(ver));
@@ -461,6 +471,60 @@ bool compRunningQuick(Comp c) {
         }
         case Comp::Nodejs:     return nodeDaemonRunning();
         default: return false;
+    }
+}
+
+// ---- Component log rotation ----
+// nginx / redis / postgresql append to their log files for as long as they run,
+// so a portable stack that is used daily accumulates logs without bound.
+// Rotation can only happen while the component is *down*: on Windows a file a
+// running server holds open cannot be renamed or deleted (the servers do not
+// open their logs with FILE_SHARE_DELETE), and truncating a live log would just
+// leave the writer appending at its old offset. compStart() therefore calls
+// this right before spawning.
+static const ULONGLONG COMP_LOG_MAX_BYTES = 8ull * 1024 * 1024;
+static const int COMP_LOG_KEEP = 2;   // keep x.log.1 .. x.log.N
+
+static void rotateOneLog(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;   // missing, or still held by a server
+    LARGE_INTEGER size = {};
+    BOOL gotSize = GetFileSizeEx(h, &size);
+    CloseHandle(h);
+    if (!gotSize || (ULONGLONG)size.QuadPart <= COMP_LOG_MAX_BYTES) return;
+
+    DeleteFileW((path + L"." + std::to_wstring(COMP_LOG_KEEP)).c_str());
+    for (int i = COMP_LOG_KEEP - 1; i >= 1; --i) {
+        MoveFileExW((path + L"." + std::to_wstring(i)).c_str(),
+                    (path + L"." + std::to_wstring(i + 1)).c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
+    }
+    if (MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        logMsg(L"log", L"日志已轮转: " + path);
+    }
+}
+
+// See the note above: the caller guarantees the component is not running.
+void rotateCompLogs(Comp c, const std::wstring& ver) {
+    if (ver.empty()) return;
+    switch (c) {
+        case Comp::Nginx: {
+            std::wstring dir = joinPath(compDataVerDir(Comp::Nginx, ver), L"logs");
+            rotateOneLog(joinPath(dir, L"access.log"));
+            rotateOneLog(joinPath(dir, L"error.log"));
+            return;
+        }
+        case Comp::Postgresql:
+            rotateOneLog(joinPath(logsDir(), L"postgresql-" + ver + L".log"));
+            return;
+        case Comp::Redis:
+            rotateOneLog(joinPath(logsDir(), L"redis-" + ver + L".log"));
+            return;
+        default:
+            // nodejs: pm2 keeps its own logs under %USERPROFILE%\.pm2\logs
+            return;
     }
 }
 
@@ -473,6 +537,9 @@ bool compStart(Comp c, std::wstring& err) {
         return false;
     }
     std::wstring ver = st.currentVersion;
+    // We are down here, which is the only window in which the component's logs
+    // can be rotated on Windows (see rotateCompLogs).
+    rotateCompLogs(c, ver);
 
     switch (c) {
         case Comp::Nginx: {
@@ -497,12 +564,17 @@ bool compStart(Comp c, std::wstring& err) {
                 err = L"启动 nginx 失败"; return false;
             }
             // Give it a moment to write pid file
-            for (int i = 0; i < 20; ++i) {
-                if (nginxRunningVer(ver)) return true;
-                Sleep(100);
+            bool up = false;
+            for (int i = 0; i < 20 && !up; ++i) {
+                if (nginxRunningVer(ver, /*repairPidFile=*/true)) up = true;
+                else Sleep(100);
             }
-            err = L"nginx 启动后未检测到进程";
-            return false;
+            // startProcessDetached() hands the caller the process handle; not
+            // closing it leaked one handle per start (a tray-resident manager
+            // that is started/stopped all day would creep towards the limit).
+            CloseHandle(pi.hProcess);
+            if (!up) { err = L"nginx 启动后未检测到进程"; return false; }
+            return true;
         }
         case Comp::Postgresql: {
             std::wstring dataDir = pgDataDir(c, ver);
@@ -522,6 +594,7 @@ bool compStart(Comp c, std::wstring& err) {
             }
             // wait for it
             WaitForSingleObject(pi.hProcess, 30000);
+            CloseHandle(pi.hProcess);
             if (!pgRunningVer(c, ver)) {
                 err = L"PostgreSQL 启动失败，请查看日志 " + logFile;
                 return false;
@@ -539,12 +612,14 @@ bool compStart(Comp c, std::wstring& err) {
             if (!startProcessDetached(exe, L"\"" + conf + L"\"", compBinDirVer(c, ver), pi)) {
                 err = L"启动 Redis 失败"; return false;
             }
-            for (int i = 0; i < 20; ++i) {
-                if (redisRunningVer(ver)) return true;
-                Sleep(100);
+            bool up = false;
+            for (int i = 0; i < 20 && !up; ++i) {
+                if (redisRunningVer(ver)) up = true;
+                else Sleep(100);
             }
-            err = L"Redis 启动后未检测到进程";
-            return false;
+            CloseHandle(pi.hProcess);
+            if (!up) { err = L"Redis 启动后未检测到进程"; return false; }
+            return true;
         }
         case Comp::Nodejs: {
             // pm2 resurrect restores previously saved processes
@@ -584,7 +659,7 @@ bool compStop(Comp c, std::wstring& err) {
             runProcessCapture(exe, L"-s quit -p \"" + toForward(binPrefix) + L"\"",
                               binPrefix, 5000);
             for (int i = 0; i < 30; ++i) {
-                if (!nginxRunningVer(ver)) return true;
+                if (!nginxRunningVer(ver, /*repairPidFile=*/true)) return true;
                 Sleep(100);
             }
             // grace period exhausted: force kill every process of this
@@ -592,7 +667,7 @@ bool compStop(Comp c, std::wstring& err) {
             // outside the manager - exactly how the ports stay wedged)
             for (DWORD pid : ourNginxPidsVer(ver)) killProcessByPid(pid);
             for (int i = 0; i < 30; ++i) {
-                if (!nginxRunningVer(ver)) return true;
+                if (!nginxRunningVer(ver, /*repairPidFile=*/true)) return true;
                 Sleep(100);
             }
             err = L"nginx 无法停止";
@@ -614,7 +689,13 @@ bool compStop(Comp c, std::wstring& err) {
                 if (processImageIs(pid, compExe(Comp::Postgresql, ver, L"postgres.exe")))
                     killProcessByPid(pid);
             }
-            return !pgRunningVer(c, ver);
+            if (pgRunningVer(c, ver)) {
+                // Never return false with an empty err: callers prefix it
+                // ("停止数据库失败: " + err) and an empty reason is useless.
+                err = r.output.empty() ? L"pg_ctl stop 未能停止 postmaster" : r.output;
+                return false;
+            }
+            return true;
         }
         case Comp::Redis: {
             // try shutdown via redis-cli
@@ -793,7 +874,7 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
             // port/user come from settings.ini and land on the command line
             std::wstring port = pgPort();
             std::wstring user = pgUser();
-            if (!pgValidPort(port)) {
+            if (!validPort(port)) {
                 rollbackAfterFailure(L"端口号无效: " + port, L"", err);
                 return false;
             }
@@ -1002,17 +1083,7 @@ bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir) {
 // ============================ Pg connection settings ============================
 
 std::wstring pgUser()     { return iniGet(L"pg.user", L"postgres"); }
-// Password is stored DPAPI-encrypted (pg.password.enc) since the "DPAPI" fix;
-// pg.password remains as a plaintext fallback for installs created before
-// that change, and is removed as soon as the secret is re-stored encrypted.
-std::wstring pgPassword() {
-    std::wstring enc = iniGet(L"pg.password.enc", L"");
-    if (!enc.empty()) {
-        std::wstring p = dpUnprotect(enc);
-        if (!p.empty()) return p;
-    }
-    return iniGet(L"pg.password", L"postgres");
-}
+
 // Store the password encrypted and drop any plaintext copy. If DPAPI fails
 // (rare), keep the plaintext path so the manager still works.
 static void pgStorePassword(const std::wstring& password) {
@@ -1023,6 +1094,26 @@ static void pgStorePassword(const std::wstring& password) {
     } else {
         iniSet(L"pg.password", password);
     }
+}
+
+// Password is stored DPAPI-encrypted under pg.password.enc. pg.password is the
+// legacy plaintext key: it is still read for installs created before the
+// encryption change, but is migrated to the encrypted key on first read — the
+// old code only migrated when the user re-initialised the cluster or changed
+// the password, so an existing settings.ini kept the secret in cleartext
+// forever.
+std::wstring pgPassword() {
+    std::wstring enc = iniGet(L"pg.password.enc", L"");
+    if (!enc.empty()) {
+        std::wstring p = dpUnprotect(enc);
+        if (!p.empty()) return p;
+    }
+    std::wstring plain = iniGet(L"pg.password", L"");
+    if (!plain.empty()) {
+        pgStorePassword(plain);   // writes .enc and deletes the plaintext key
+        return plain;
+    }
+    return L"postgres";
 }
 std::wstring pgPort()     { return iniGet(L"pg.port", L"5432"); }
 std::wstring nginxPort()  { return iniGet(L"nginx.port", L"80"); }
@@ -1051,7 +1142,7 @@ bool nginxTestConfig(const std::wstring& ver, std::wstring& out) {
 bool nginxReload(std::wstring& err) {
     ComponentStatus st = compStatus(Comp::Nginx);
     if (!st.installed) { err = L"nginx 未安装"; return false; }
-    if (!nginxRunningVer(st.currentVersion)) {
+    if (!nginxRunningVer(st.currentVersion, /*repairPidFile=*/true)) {
         // not running - just regenerate config
         if (!genNginxConfig(st.currentVersion)) { err = L"生成配置失败"; return false; }
         std::wstring tOut;
@@ -1141,12 +1232,21 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
         if (!fileExists(certPath)) { err = L"证书文件不存在: " + certPath; return false; }
         if (!fileExists(keyPath)) { err = L"key 文件不存在: " + keyPath; return false; }
     }
+    // Validate the listen port before it lands in the generated config. It used
+    // to be written verbatim into "listen <port>;", so a stray character made
+    // nginx -t fail *after* the file was already on disk (see the rollback
+    // below).
+    std::wstring effPort = port.empty() ? nginxPort() : port;
+    if (!validPort(effPort)) {
+        err = L"端口号无效（应为 1-65535 的数字）: " + port;
+        return false;
+    }
     // port conflict check
     ComponentStatus st = compStatus(Comp::Nginx);
     if (st.installed) {
         for (auto& v : nginxListVHosts()) {
-            if (v.port == port && v.name != name) {
-                err = L"端口 " + port + L" 已被站点 " + v.name + L" 占用";
+            if (v.port == effPort && v.name != name) {
+                err = L"端口 " + effPort + L" 已被站点 " + v.name + L" 占用";
                 return false;
             }
         }
@@ -1162,7 +1262,7 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
     if (!appManaged && !dirExists(siteRoot)) { err = L"根目录不存在: " + siteRoot; return false; }
 
     std::map<std::wstring, std::wstring> kv;
-    kv[L"PORT"] = port.empty() ? nginxPort() : port;
+    kv[L"PORT"] = effPort;
     kv[L"DOMAIN"] = domain;
     // app-managed roots use a relative path (portable); user-picked roots stay absolute
     kv[L"ROOT"] = appManaged ? (L"../../../www/" + name) : toForward(siteRoot);
@@ -1180,17 +1280,43 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
     std::wstring file = joinPath(vhostDir, name + L".conf");
     if (!writeFileText(file, conf)) { err = L"写入站点配置失败"; return false; }
 
+    bool createdSiteRoot = false;
+    bool createdIndex = false;
     if (appManaged) {
         // app-managed site: create default page + ssl folder for certificates
+        createdSiteRoot = !dirExists(siteRoot);
         makeDirs(siteRoot);
         makeDirs(joinPath(siteRoot, L"ssl"));
         std::wstring idx = joinPath(siteRoot, L"index.html");
         if (!fileExists(idx)) {
-            writeFileText(idx, L"<html><head><title>" + name + L"</title></head><body><h1>" + name + L"</h1></body></html>");
+            createdIndex = writeFileText(idx, L"<html><head><title>" + name + L"</title></head><body><h1>" + name + L"</h1></body></html>");
         }
     }
 
-    if (!nginxReload(err)) return false;
+    // A failure from here on must not leave the site config behind:
+    // genNginxConfig() copies every etc\nginx\vhosts\*.conf into the runtime
+    // prefix on each start, so one file that fails "nginx -t" would make every
+    // later start / reload / version switch fail too, with no hint about which
+    // site is broken.
+    if (!nginxReload(err)) {
+        std::wstring reason = err;
+        DeleteFileW(file.c_str());
+        // Undo the site directory as well — but only the pieces this call
+        // created, and only if they are empty: RemoveDirectoryW refuses a
+        // non-empty directory, so a www\<name> that already holds the user's
+        // files is never touched.
+        if (appManaged) {
+            if (createdIndex) DeleteFileW(joinPath(siteRoot, L"index.html").c_str());
+            if (createdSiteRoot) {
+                RemoveDirectoryW(joinPath(siteRoot, L"ssl").c_str());
+                RemoveDirectoryW(siteRoot.c_str());
+            }
+        }
+        ComponentStatus now = compStatus(Comp::Nginx);
+        if (now.installed) genNginxConfig(now.currentVersion);   // drop it from the runtime prefix
+        err = L"站点配置未通过 nginx 校验，已回滚: " + reason;
+        return false;
+    }
     return true;
 }
 
@@ -1201,6 +1327,11 @@ bool nginxAddVHost(const std::wstring& name, const std::wstring& domain,
 
 bool nginxRemoveVHost(const std::wstring& name, std::wstring& err) {
     if (name.empty()) { err = L"站点名为空"; return false; }
+    // Same name rules as add: reject path characters so a crafted name can
+    // never point the delete outside etc\nginx\vhosts.
+    if (name[0] == L'_' || name.find_first_of(L"\\/:. *?\"<>|") != std::wstring::npos) {
+        err = L"站点名含非法字符"; return false;
+    }
     std::wstring file = joinPath(joinPath(compEtcDir(Comp::Nginx), L"vhosts"), name + L".conf");
     if (!fileExists(file)) { err = L"站点不存在: " + name; return false; }
     if (!DeleteFileW(file.c_str())) { err = L"删除文件失败"; return false; }
@@ -1238,7 +1369,7 @@ static bool pgValidIdent(const std::wstring& s) {
     return true;
 }
 
-static bool pgValidPort(const std::wstring& s) {
+static bool validPort(const std::wstring& s) {
     if (s.empty() || s.size() > 5) return false;
     long v = 0;
     for (wchar_t c : s) {
@@ -1297,7 +1428,7 @@ static bool pgRunSql(Comp c, const std::wstring& ver, const std::wstring& extraA
 
     std::wstring port = pgPort();
     std::wstring user = pgUser();
-    if (!pgValidPort(port)) { out.output = L"端口号无效: " + port; return false; }
+    if (!validPort(port)) { out.output = L"端口号无效: " + port; return false; }
     if (!pgValidIdent(user)) {
         out.output = L"用户名含非法字符（只允许字母、数字、下划线）: " + user;
         return false;
@@ -1352,7 +1483,14 @@ bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
         return false;
     }
     std::wstring effPort = port.empty() ? L"5432" : port;
-    if (!pgValidPort(effPort)) { err = L"端口号无效（应为 1-65535）: " + port; return false; }
+    if (!validPort(effPort)) { err = L"端口号无效（应为 1-65535）: " + port; return false; }
+    // initdb --pwfile consumes the *first line* only: a password containing a
+    // line break would be truncated on the server while we store the full
+    // string, and every later psql connection would fail authentication.
+    if (password.find_first_of(L"\r\n") != std::wstring::npos) {
+        err = L"密码不能包含换行符";
+        return false;
+    }
 
     std::wstring dataDir = pgDataDir(c, ver);
     if (pgDataInitialized(ver)) { err = L"数据库已初始化"; return false; }
@@ -1470,7 +1608,7 @@ bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err) {
     // port/user come from settings.ini and land on the command line
     std::wstring port = pgPort();
     std::wstring user = pgUser();
-    if (!pgValidPort(port)) { err = L"端口号无效: " + port; return false; }
+    if (!validPort(port)) { err = L"端口号无效: " + port; return false; }
     if (!pgValidIdent(user)) { err = L"用户名含非法字符: " + user; return false; }
     std::wstring cmd = L"-h 127.0.0.1 -p " + port + L" -U " + user +
                        L" -f \"" + backupFile + L"\"";
@@ -1481,32 +1619,6 @@ bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err) {
         return false;
     }
     return true;
-}
-
-// ============================ redis ============================
-
-bool redisTestConfig(const std::wstring& ver, std::wstring& out) {
-    // redis-server --test-memory is overkill; just verify config parses by launching briefly
-    std::wstring exe;
-    if (!findExe(Comp::Redis, ver, L"redis-server.exe", exe)) { out = L"未找到 redis-server.exe"; return false; }
-    std::wstring conf = joinPath(compDataVerDir(Comp::Redis, ver), L"redis.conf");
-    ProcInfo pi;
-    if (!startProcessDetached(exe, L"\"" + conf + L"\"", compBinDirVer(Comp::Redis, ver), pi)) {
-        out = L"启动失败";
-        return false;
-    }
-    // A config error makes redis exit quickly; surviving the window means the
-    // config parsed. Either way, shut the test instance down — the old code
-    // just closed the handle and left a live redis-server running forever.
-    WaitForSingleObject(pi.hProcess, 2000);
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
-    if (code == STILL_ACTIVE) {
-        killProcessByPid(pi.pid);
-        WaitForSingleObject(pi.hProcess, 2000);
-    }
-    CloseHandle(pi.hProcess);
-    return code == STILL_ACTIVE;
 }
 
 // ============================ nodejs / pm2 ============================

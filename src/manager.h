@@ -3,7 +3,7 @@
 #define LNPP_MANAGER_H
 
 #include "common.h"
-#include "process.h"
+#include "proc.h"
 
 enum class Comp {
     Nginx = 0,
@@ -85,9 +85,6 @@ bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err);
 bool pgDataInitialized(const std::wstring& ver);
 bool pgListUsers(std::vector<std::wstring>& users, std::wstring& err);
 
-// redis
-bool redisTestConfig(const std::wstring& ver, std::wstring& out);
-
 // nodejs / pm2
 bool nodePm2Installed();
 std::vector<PM2App> nodePm2List();
@@ -103,6 +100,13 @@ bool nodePm2Resurrect(std::wstring& err);
 bool genNginxConfig(const std::wstring& ver);
 bool genRedisConfig(const std::wstring& ver);
 bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir);
+
+// ---- Log rotation ----
+// Rotate the component's log file(s) if they passed 8 MB, keeping 2 generations
+// (x.log.1 / x.log.2). MUST only be called while the component is down: Windows
+// refuses to rename a log file a running server still holds open. compStart()
+// calls it automatically before spawning.
+void rotateCompLogs(Comp c, const std::wstring& ver);
 
 // ---- Pg connection settings ----
 std::wstring pgUser();
