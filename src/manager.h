@@ -27,6 +27,12 @@ struct PM2App {
     std::wstring status;
     std::wstring interpreter;
     int restarts = 0;
+    // OS pid of the running child (0 when pm2 reports none). pm2 marks an app
+    // "online" from its own bookkeeping, so a row whose pid is gone is stale.
+    DWORD pid = 0;
+    // True when pm2 says online but that pid is not alive: the app died without
+    // pm2 noticing (OOM kill, hard crash). Filled in by nodePm2List().
+    bool stale = false;
 };
 
 struct VHost {

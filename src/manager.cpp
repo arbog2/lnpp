@@ -633,8 +633,16 @@ void rotateCompLogs(Comp c, const std::wstring& ver) {
 bool compStart(Comp c, std::wstring& err) {
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装（bin 下无版本目录）"; return false; }
-    if (st.running &&
-        (c != Comp::Nginx || !nginxStrayRunning(st.currentVersion))) {
+    bool alreadyRunning =
+        st.running && (c != Comp::Nginx || !nginxStrayRunning(st.currentVersion));
+    // A live pm2 daemon with an empty app list is NOT "already running": the
+    // apps are simply gone (pm2 kill, a crash, or a resurrect that never ran).
+    // Returning 已在运行 here is what left the Node page permanently empty while
+    // the daemon happily answered every poll.
+    if (alreadyRunning && c == Comp::Nodejs && nodePm2List().empty()) {
+        alreadyRunning = false;
+    }
+    if (alreadyRunning) {
         err = L"已在运行";
         return false;
     }
@@ -724,6 +732,18 @@ bool compStart(Comp c, std::wstring& err) {
             return true;
         }
         case Comp::Nodejs: {
+            // pm2 apps commonly depend on Redis (a refused 6379 connection makes
+            // them exit right after start, which pm2 then reports as a crashed
+            // app). Bring Redis up first unless the user is starting it itself.
+            ComponentStatus rs = compStatus(Comp::Redis);
+            if (rs.installed && !rs.running) {
+                std::wstring rerr;
+                if (!compStart(Comp::Redis, rerr)) {
+                    // Not fatal: the app may not need Redis at all. Say what
+                    // happened and let pm2 try anyway.
+                    logMsg(L"pm2", L"启动 Node.js 前自动启动 Redis 失败: " + rerr);
+                }
+            }
             // pm2 resurrect restores previously saved processes
             std::wstring e;
             if (!nodePm2Resurrect(e)) {
@@ -1782,6 +1802,17 @@ std::vector<PM2App> parsePm2List(const std::wstring& json) {
             if (q1 != std::wstring::npos && q2 != std::wstring::npos)
                 app.status = obj.substr(q1 + 1, q2 - q1 - 1);
         }
+        // real OS pid of the forked app. pm2 reports "online" from its own
+        // bookkeeping; when the child died without pm2 noticing (OOM kill, hard
+        // crash) this pid is the only way to tell the row is stale.
+        k = obj.find(L"\"pid\"");
+        if (k != std::wstring::npos) {
+            size_t colon = obj.find(L':', k);
+            size_t s = obj.find_first_of(L"0123456789", colon);
+            size_t e2 = s;
+            while (e2 < obj.size() && iswdigit(obj[e2])) e2++;
+            app.pid = (s != std::wstring::npos) ? _wtoi(obj.substr(s, e2 - s).c_str()) : 0;
+        }
         // exec_interpreter (nested under pm2_env)
         k = obj.find(L"\"exec_interpreter\"");
         if (k != std::wstring::npos) {
@@ -1792,8 +1823,7 @@ std::vector<PM2App> parsePm2List(const std::wstring& json) {
                 app.interpreter = obj.substr(q1 + 1, q2 - q1 - 1);
         }
         // restarts (the first find is the only one needed: same search)
-        k = obj.find(L"\"restart_time\"");
-        if (k != std::wstring::npos) {
+        k = obj.find(L"\"restart_time\"");        if (k != std::wstring::npos) {
             size_t colon = obj.find(L':', k);
             size_t s = obj.find_first_of(L"0123456789", colon);
             size_t e2 = s;
@@ -1812,7 +1842,16 @@ std::vector<PM2App> nodePm2List() {
     if (!nodeDaemonRunning()) return {};
     RunResult r = runPm2({L"jlist"});
     if (!r.ok) return {};
-    return parsePm2List(r.output);
+    std::vector<PM2App> apps = parsePm2List(r.output);
+    // pm2 keeps reporting "online" for a child that died without it noticing
+    // (OOM kill, hard crash). The UI used to show those rows as running with
+    // 0 memory, which is exactly how a dead app looks healthy. Mark any row
+    // whose pid is not a live node process so the list says what is really there.
+    for (auto& a : apps) {
+        if (a.status != L"online") continue;
+        a.stale = !(a.pid != 0 && isPidAlive(a.pid) && processImageNameIs(a.pid, L"node.exe"));
+    }
+    return apps;
 }
 
 bool nodePm2Restart(int id, std::wstring& err) {

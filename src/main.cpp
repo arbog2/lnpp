@@ -413,7 +413,16 @@ static void refreshPm2List() {
         item.pszText = (LPWSTR)id.c_str();
         ListView_InsertItem(lv, &item);
         ListView_SetItemText(lv, item.iItem, 1, (LPWSTR)a.name.c_str());
-        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)a.status.c_str());
+        // A row pm2 calls "online" whose pid is gone is a dead app; say so
+        // instead of repeating pm2's stale status (that is how an app with
+        // 0 memory looked perfectly healthy).
+        std::wstring statusText = a.status;
+        if (a.stale) {
+            statusText = a.status + L"（僵死：进程已不存在）";
+        } else if (a.status == L"online" && a.pid == 0) {
+            statusText = a.status + L"（无 pid）";
+        }
+        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)statusText.c_str());
         ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)std::to_wstring(a.restarts).c_str());
         if (a.id == selPmId) selNew = item.iItem;
     }
