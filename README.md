@@ -1,4 +1,4 @@
-# LNPP 组件管理器 v1.4
+# LNPP 组件管理器 v1.5
 
 Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis 的启动、停止、版本切换、配置。
 
@@ -39,6 +39,7 @@ lnpp.exe
 - nginx：可视化添加/删除虚拟站点（写 etc\nginx\vhosts\），支持 HTTPS（证书 + key），www\ 下自动建目录
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）
 - Node.js：pm2 进程列表实时监控，支持重启/停止；一键将当前 Node 版本加入/移除用户 PATH
+- pm2 守护进程加固：所有 pm2 操作先校验守护进程存活（校验 `pm2.pid` 的进程镜像，避免 PID 复用误判），只读命令在守护进程不在时不调用 pm2；写入命令遇到 `rpc.sock` 握手失败（`EPERM`/`EPIPE`，通常由守护进程被强制结束、`pm2.pid` 残留引起）会自动等待并重试一次，仍失败时给出可操作提示而不是原始堆栈
 - 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `packages.conf`（仓库提供 `packages.conf.example`，复制改名后按需增删），下载完成后自动解压到 bin\<组件>\<版本>
 - 常驻托盘：关闭按钮只最小化到托盘（组件继续运行），退出请用托盘右键菜单「退出」
 - 随管理器自动启动（总开关 + 每组件勾选）、随 Windows 开机启动（`--hidden` 直接最小化到托盘）

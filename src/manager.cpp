@@ -368,22 +368,52 @@ static bool redisRunningVer(const std::wstring& ver) {
 
 // ---- nodejs / pm2 ----
 
+static std::wstring pm2HomeDir() {
+    wchar_t home[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"PM2_HOME", home, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        n = GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) return L"";
+        return joinPath(home, L".pm2");
+    }
+    return home;
+}
+
+// True when the process image's file name matches exeName, whatever directory
+// it lives in. Needed for the pm2 daemon: PM2_HOME is shared per user
+// (C:\Users\<user>\.pm2), so a perfectly live daemon may have been started by a
+// different node.exe — a system-wide install or another tool. Demanding *our*
+// bundled node here reported "not running" for a daemon that was up.
+// Matching just the image name still blocks the real hazard, a stale pm2.pid
+// whose PID was reused by an unrelated program.
+static bool processImageNameIs(DWORD pid, const std::wstring& exeName) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
+    CloseHandle(h);
+    if (!ok) return false;
+    std::wstring name = path;
+    size_t pos = name.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) name = name.substr(pos + 1);
+    return lowerStr(name) == lowerStr(exeName);
+}
+
 // True iff the pm2 God daemon process is alive. Detected via the daemon pid
 // file ($PM2_HOME\pm2.pid); we must NOT probe with `pm2 ping` / `pm2 pid`,
 // because those silently re-spawn the daemon when it is stopped.
+//
+// The image check matters: a *stale* pm2.pid whose PID has since been reused by
+// an unrelated process used to look "alive", so every pm2 command was issued
+// against a daemon that does not exist (the CLI then spawns one itself) and the
+// poller showed pid=N/A entries.
 static bool nodeDaemonRunning() {
-    wchar_t home[MAX_PATH];
-    DWORD n = GetEnvironmentVariableW(L"PM2_HOME", home, MAX_PATH);
-    std::wstring homeDir;
-    if (n == 0 || n >= MAX_PATH) {
-        n = GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) return false;
-        homeDir = joinPath(home, L".pm2");
-    } else {
-        homeDir = home;
-    }
+    std::wstring homeDir = pm2HomeDir();
+    if (homeDir.empty()) return false;
     DWORD pid = readPid(joinPath(homeDir, L"pm2.pid"));
-    return isPidAlive(pid);
+    if (pid == 0 || !isPidAlive(pid)) return false;
+    return processImageNameIs(pid, L"node.exe");
 }
 
 static bool nodePm2Cmd(const std::wstring& ver, std::wstring& out) {
@@ -414,6 +444,40 @@ bool nodePm2Installed() {
     return nodePm2Cmd(st.currentVersion, pm2);
 }
 
+// pm2's Windows daemon talks over the named pipe \\.\pipe\rpc.sock. When the
+// daemon dies (or was force-killed, leaving pm2.pid behind) the CLI spawns a
+// fresh daemon and tries to connect in the same breath; Windows answers that
+// connect with EPERM instead of ENOENT, and the user gets a 30-line stack:
+//     Error: connect EPERM \\.\pipe\rpc.sock
+//     [PM2] Spawning PM2 daemon with pm2_home=...
+// Recognize it so callers can retry once and report something actionable.
+static bool pm2DaemonHandshakeError(const std::wstring& output) {
+    return output.find(L"EPERM") != std::wstring::npos ||
+           output.find(L"EPIPE") != std::wstring::npos ||
+           output.find(L"rpc.sock") != std::wstring::npos ||
+           output.find(L"Spawning PM2 daemon") != std::wstring::npos;
+}
+
+// Commands that only read state must never be the reason a daemon gets spawned:
+// if the daemon is down they have nothing to report anyway.
+static bool pm2CmdIsReadOnly(const std::vector<std::wstring>& args) {
+    if (args.empty()) return false;
+    const std::wstring& a = args[0];
+    return a == L"jlist" || a == L"list" || a == L"ls" || a == L"status" ||
+           a == L"ping" || a == L"pid";
+}
+
+// Wait for a freshly spawned daemon to accept connections. The daemon writes
+// pm2.pid once its RPC socket is listening, so polling that file is enough and
+// never re-spawns anything by itself.
+static bool waitForPm2Daemon(int timeoutMs) {
+    for (int waited = 0; waited <= timeoutMs; waited += 250) {
+        if (nodeDaemonRunning()) return true;
+        Sleep(250);
+    }
+    return nodeDaemonRunning();
+}
+
 static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 15000) {
     std::wstring ver = iniGet(L"ver.nodejs", L"");
     if (ver.empty()) return {};
@@ -432,7 +496,45 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
         wchar_t pathBuf[32768];
         DWORD n = GetEnvironmentVariableW(L"PATH", pathBuf, 32768);
         std::wstring path = wd + L";" + (n > 0 ? std::wstring(pathBuf, n) : L"");
-        return runProcessCapture(pm2, cmdArgs, wd, timeoutMs, {{L"PATH", path}});
+        std::map<std::wstring, std::wstring> env = {{L"PATH", path}};
+
+        // Gate every command on the daemon actually being alive. Without this,
+        // restart/stop/delete were issued blind and made the CLI spawn a daemon
+        // into the same race that produces the EPERM handshake failure.
+        bool daemonUp = nodeDaemonRunning();
+        if (!daemonUp) {
+            if (pm2CmdIsReadOnly(args)) return empty;   // nothing to read
+            // A write command needs a daemon. The CLI will spawn one; give it a
+            // moment to publish pm2.pid before the command is issued, otherwise
+            // the connect races the socket creation.
+            RunResult warm = runProcessCapture(pm2, L"ping", wd, 20000, env);
+            (void)warm;
+            waitForPm2Daemon(5000);
+        }
+
+        RunResult r = runProcessCapture(pm2, cmdArgs, wd, timeoutMs, env);
+
+        // EPERM/EPIPE on the daemon pipe is transient: the daemon that owned the
+        // socket is gone and the one the CLI just spawned is not listening yet.
+        // Retry exactly once after letting pm2.pid settle.
+        if (!r.ok && pm2DaemonHandshakeError(r.output)) {
+            logMsg(L"pm2", L"守护进程握手失败，准备重试: " + args[0]);
+            waitForPm2Daemon(5000);
+            RunResult retry = runProcessCapture(pm2, cmdArgs, wd, timeoutMs, env);
+            if (retry.ok) {
+                logMsg(L"pm2", L"重试成功: " + args[0]);
+                return retry;
+            }
+            logMsg(L"pm2", L"重试仍失败: " + retry.output);
+            // Lead with something the user can act on; keep pm2's own output
+            // below it for anyone who needs the raw detail.
+            retry.output = L"pm2 守护进程状态异常（连接 \\\\.\\pipe\\rpc.sock 被拒绝，"
+                           L"通常是守护进程被强制结束后 pm2.pid 残留）。已自动重试一次仍失败，"
+                           L"请执行「停止 Node.js」再「启动」以重建守护进程。\r\n"
+                           L"--- pm2 输出 ---\r\n" + retry.output;
+            return retry;
+        }
+        return r;
     }
     return empty;
 }
@@ -1747,10 +1849,17 @@ bool nodePm2Resurrect(std::wstring& err) {
     }
     // ensure every restored app runs on the bundled node (a bare "node"
     // interpreter resolves via pm2's own lookup, which ignores PATH and can
-    // point at a removed system install -> apps start but never listen)
+    // point at a removed system install -> apps start but never listen).
+    // resurrect spawns the daemon, so wait for it to publish pm2.pid first:
+    // listing too early returned an empty app list and silently skipped every
+    // interpreter fix-up.
     std::wstring ver = iniGet(L"ver.nodejs", L"");
     std::wstring node = joinPath(compBinDirVer(Comp::Nodejs, ver), L"node.exe");
     if (!node.empty() && fileExists(node)) {
+        if (!waitForPm2Daemon(5000)) {
+            logMsg(L"pm2", L"resurrect 后守护进程未就绪，跳过 interpreter 修正");
+            return true;   // apps may still come up; do not fail the whole op
+        }
         std::wstring ln = lowerStr(node);
         for (auto& app : nodePm2List()) {
             if (!app.interpreter.empty() && lowerStr(app.interpreter) != ln) {

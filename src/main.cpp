@@ -311,6 +311,9 @@ static void pm2Worker() {
         g_snapCurrent[(int)Comp::Nodejs] = st.currentVersion;
         g_snapVersions[(int)Comp::Nodejs] = st.versions;
     }
+    // nodePm2List() -> runPm2() refuses to touch pm2 while the daemon is down,
+    // so a stale pm2.pid can no longer make this poll spawn a daemon (the path
+    // that produced the rpc.sock EPERM storm).
     if (g_curTab == compToTab(Comp::Nodejs)) {
         std::vector<PM2App> apps = nodePm2List();
         std::lock_guard<std::mutex> lk(g_snapMtx);
@@ -326,6 +329,9 @@ static void kickStatusPoll() {
 }
 
 static void kickPm2Poll() {
+    // Cheap gate on the caller's side: do not even start a worker thread (nor
+    // let it reach pm2) while the daemon is down or pm2.pid is stale.
+    if (!compRunningQuick(Comp::Nodejs)) return;
     if (g_pm2WorkerBusy.exchange(true)) return;
     std::thread(pm2Worker).detach();
 }
