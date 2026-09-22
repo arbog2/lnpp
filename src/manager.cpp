@@ -400,20 +400,58 @@ static bool processImageNameIs(DWORD pid, const std::wstring& exeName) {
     return lowerStr(name) == lowerStr(exeName);
 }
 
-// True iff the pm2 God daemon process is alive. Detected via the daemon pid
-// file ($PM2_HOME\pm2.pid); we must NOT probe with `pm2 ping` / `pm2 pid`,
-// because those silently re-spawn the daemon when it is stopped.
+// The daemon's RPC endpoint. pm2 for Windows uses a fixed pipe name (its own
+// daemon log prints "RPC socket file: \\.\pipe\rpc.sock"), independent of
+// PM2_HOME.
+static const wchar_t* PM2_RPC_PIPE = L"\\\\.\\pipe\\rpc.sock";
+
+// True when the daemon's RPC endpoint actually accepts connections.
 //
-// The image check matters: a *stale* pm2.pid whose PID has since been reused by
-// an unrelated process used to look "alive", so every pm2 command was issued
-// against a daemon that does not exist (the CLI then spawns one itself) and the
-// poller showed pid=N/A entries.
+// This — not pm2.pid — is what decides whether a pm2 command may run. A stale
+// pm2.pid can point at a live node.exe while no pipe exists, and every command
+// issued in that state makes the CLI spawn another daemon; that is exactly how
+// a storm of hundreds of daemons built up on this machine (each spawn also
+// failed, because the endpoint the new daemon tried to create never became
+// connectable).
+//
+// Opening and immediately closing the pipe is a plain connect/disconnect, which
+// the daemon already handles for every CLI that exits, so probing is safe.
+static bool pm2PipeReachable() {
+    HANDLE h = CreateFileW(PM2_RPC_PIPE, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+// Circuit breaker. When the daemon cannot be brought up, hammering it on every
+// poll is what turns a broken daemon into a spawn storm: each failed command
+// starts another daemon. After a failure the manager stops touching pm2 for a
+// while instead.
+static const DWORD PM2_COOLDOWN_MS = 30000;
+static DWORD g_pm2DownUntil = 0;
+
+static bool pm2InCooldown() {
+    // Wrap-safe comparison: true while now is still before the deadline.
+    return g_pm2DownUntil != 0 && (long)(GetTickCount() - g_pm2DownUntil) < 0;
+}
+
+static void pm2MarkDown() {
+    g_pm2DownUntil = GetTickCount() + PM2_COOLDOWN_MS;
+}
+
+// True iff the pm2 God daemon is actually usable: its pidfile points at a live
+// node process AND its RPC endpoint answers. Checked without invoking the CLI,
+// because `pm2 ping` / `pm2 pid` / `pm2 jlist` all re-spawn the daemon when it
+// is stopped.
 static bool nodeDaemonRunning() {
     std::wstring homeDir = pm2HomeDir();
     if (homeDir.empty()) return false;
     DWORD pid = readPid(joinPath(homeDir, L"pm2.pid"));
     if (pid == 0 || !isPidAlive(pid)) return false;
-    return processImageNameIs(pid, L"node.exe");
+    if (!processImageNameIs(pid, L"node.exe")) return false;   // stale pid, reused
+    if (!pm2PipeReachable()) return false;                     // endpoint gone
+    return true;
 }
 
 static bool nodePm2Cmd(const std::wstring& ver, std::wstring& out) {
@@ -467,9 +505,8 @@ static bool pm2CmdIsReadOnly(const std::vector<std::wstring>& args) {
            a == L"ping" || a == L"pid";
 }
 
-// Wait for a freshly spawned daemon to accept connections. The daemon writes
-// pm2.pid once its RPC socket is listening, so polling that file is enough and
-// never re-spawns anything by itself.
+// Wait for a daemon to become reachable. Polls the pipe (never the CLI), so
+// waiting cannot itself spawn anything.
 static bool waitForPm2Daemon(int timeoutMs) {
     for (int waited = 0; waited <= timeoutMs; waited += 250) {
         if (nodeDaemonRunning()) return true;
@@ -483,6 +520,12 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
     if (ver.empty()) return {};
     RunResult empty;
     if (!dirExists(compBinDirVer(Comp::Nodejs, ver))) return empty;
+
+    // Circuit breaker: while the daemon is known-broken, do not touch pm2 at
+    // all. Every failed pm2 command spawns another daemon, so retrying on a
+    // broken install is what escalates a single failure into a storm.
+    if (pm2InCooldown()) return empty;
+
     std::wstring pm2;
     if (nodePm2Cmd(ver, pm2)) {
         std::wstring cmdArgs;
@@ -498,41 +541,40 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
         std::wstring path = wd + L";" + (n > 0 ? std::wstring(pathBuf, n) : L"");
         std::map<std::wstring, std::wstring> env = {{L"PATH", path}};
 
-        // Gate every command on the daemon actually being alive. Without this,
-        // restart/stop/delete were issued blind and made the CLI spawn a daemon
-        // into the same race that produces the EPERM handshake failure.
-        bool daemonUp = nodeDaemonRunning();
-        if (!daemonUp) {
-            if (pm2CmdIsReadOnly(args)) return empty;   // nothing to read
-            // A write command needs a daemon. The CLI will spawn one; give it a
-            // moment to publish pm2.pid before the command is issued, otherwise
-            // the connect races the socket creation.
-            RunResult warm = runProcessCapture(pm2, L"ping", wd, 20000, env);
-            (void)warm;
-            waitForPm2Daemon(5000);
+        // Only run a command when the daemon's RPC endpoint is reachable. A
+        // read-only command has nothing to report otherwise, and a write command
+        // must not be what spawns a daemon: that spawn races the socket and is
+        // the documented source of the rpc.sock EPERM failure.
+        if (!nodeDaemonRunning()) {
+            if (pm2CmdIsReadOnly(args)) return empty;
+            // Give an operator-requested start exactly one chance to bring the
+            // daemon up, then require the endpoint to actually answer.
+            runProcessCapture(pm2, L"ping", wd, 20000, env);
+            if (!waitForPm2Daemon(5000)) {
+                logMsg(L"pm2", L"守护进程无法启动，进入 30s 冷却: " + args[0]);
+                pm2MarkDown();
+                empty.output = L"pm2 守护进程不可用（\\\\.\\pipe\\rpc.sock 不存在）。"
+                               L"已暂停 30 秒内的后续调用以避免反复拉起守护进程，"
+                               L"请稍后重试或在任务管理器结束残留的 pm2 守护进程。";
+                return empty;
+            }
         }
 
         RunResult r = runProcessCapture(pm2, cmdArgs, wd, timeoutMs, env);
 
-        // EPERM/EPIPE on the daemon pipe is transient: the daemon that owned the
-        // socket is gone and the one the CLI just spawned is not listening yet.
-        // Retry exactly once after letting pm2.pid settle.
+        // A working command proves the daemon is healthy again: clear any
+        // cooldown so normal polling resumes immediately.
+        if (r.ok) g_pm2DownUntil = 0;
+
+        // A handshake failure means the endpoint died under us. Do NOT retry:
+        // the retry is what doubled the spawn rate during the storm. Cool down
+        // and tell the caller what happened.
         if (!r.ok && pm2DaemonHandshakeError(r.output)) {
-            logMsg(L"pm2", L"守护进程握手失败，准备重试: " + args[0]);
-            waitForPm2Daemon(5000);
-            RunResult retry = runProcessCapture(pm2, cmdArgs, wd, timeoutMs, env);
-            if (retry.ok) {
-                logMsg(L"pm2", L"重试成功: " + args[0]);
-                return retry;
-            }
-            logMsg(L"pm2", L"重试仍失败: " + retry.output);
-            // Lead with something the user can act on; keep pm2's own output
-            // below it for anyone who needs the raw detail.
-            retry.output = L"pm2 守护进程状态异常（连接 \\\\.\\pipe\\rpc.sock 被拒绝，"
-                           L"通常是守护进程被强制结束后 pm2.pid 残留）。已自动重试一次仍失败，"
-                           L"请执行「停止 Node.js」再「启动」以重建守护进程。\r\n"
-                           L"--- pm2 输出 ---\r\n" + retry.output;
-            return retry;
+            logMsg(L"pm2", L"守护进程握手失败，进入 30s 冷却: " + args[0] + L" / " + r.output);
+            pm2MarkDown();
+            r.output = L"pm2 守护进程状态异常（连接 \\\\.\\pipe\\rpc.sock 失败）。"
+                       L"已在 30 秒内停止后续 pm2 调用，避免不断拉起新的守护进程；"
+                       L"请稍后重试。\r\n--- pm2 输出 ---\r\n" + r.output;
         }
         return r;
     }

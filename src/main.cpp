@@ -413,17 +413,18 @@ static void refreshPm2List() {
         item.pszText = (LPWSTR)id.c_str();
         ListView_InsertItem(lv, &item);
         ListView_SetItemText(lv, item.iItem, 1, (LPWSTR)a.name.c_str());
-        // A row pm2 calls "online" whose pid is gone is a dead app; say so
-        // instead of repeating pm2's stale status (that is how an app with
-        // 0 memory looked perfectly healthy).
-        std::wstring statusText = a.status;
-        if (a.stale) {
-            statusText = a.status + L"（僵死：进程已不存在）";
-        } else if (a.status == L"online" && a.pid == 0) {
-            statusText = a.status + L"（无 pid）";
-        }
-        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)statusText.c_str());
-        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)std::to_wstring(a.restarts).c_str());
+        ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)a.status.c_str());
+        // pid / alive / stale are separate columns now, so an app pm2 still calls
+        // "online" while its process is gone is visible at a glance instead of
+        // being hidden behind pm2's own bookkeeping. ListView_SetItemText copies
+        // the text during the call, so these temporaries are safe.
+        std::wstring pidText = a.pid ? std::to_wstring(a.pid) : std::wstring(L"-");
+        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)pidText.c_str());
+        bool alive = a.pid != 0 && isPidAlive(a.pid);
+        ListView_SetItemText(lv, item.iItem, 4, (LPWSTR)(alive ? L"是" : L"否"));
+        ListView_SetItemText(lv, item.iItem, 5, (LPWSTR)(a.stale ? L"是" : L"否"));
+        std::wstring restartText = std::to_wstring(a.restarts);
+        ListView_SetItemText(lv, item.iItem, 6, (LPWSTR)restartText.c_str());
         if (a.id == selPmId) selNew = item.iItem;
     }
     if (selNew >= 0) {
@@ -1156,10 +1157,13 @@ static void initNodePage(HWND parent) {
     ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     LVCOLUMNW col = {0};
     col.mask = LVCF_TEXT | LVCF_WIDTH;
-    col.cx = 60;  col.pszText = (LPWSTR)L"ID"; ListView_InsertColumn(lv, 0, &col);
-    col.cx = 220; col.pszText = (LPWSTR)L"名称"; ListView_InsertColumn(lv, 1, &col);
-    col.cx = 100; col.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(lv, 2, &col);
-    col.cx = 80;  col.pszText = (LPWSTR)L"重启次数"; ListView_InsertColumn(lv, 3, &col);
+    col.cx = 45;  col.pszText = (LPWSTR)L"ID"; ListView_InsertColumn(lv, 0, &col);
+    col.cx = 150; col.pszText = (LPWSTR)L"名称"; ListView_InsertColumn(lv, 1, &col);
+    col.cx = 200; col.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(lv, 2, &col);
+    col.cx = 70;  col.pszText = (LPWSTR)L"PID"; ListView_InsertColumn(lv, 3, &col);
+    col.cx = 60;  col.pszText = (LPWSTR)L"存活"; ListView_InsertColumn(lv, 4, &col);
+    col.cx = 60;  col.pszText = (LPWSTR)L"僵死"; ListView_InsertColumn(lv, 5, &col);
+    col.cx = 75;  col.pszText = (LPWSTR)L"重启次数"; ListView_InsertColumn(lv, 6, &col);
     HWND bRefresh = makeCtl(IDC_NODE_BTN_REFRESH, L"BUTTON", L"刷新", BS_PUSHBUTTON, 20, 216, 100, 26, parent);
     HWND bRestartAll = makeCtl(IDC_NODE_BTN_RESTART_ALL, L"BUTTON", L"全部重启", BS_PUSHBUTTON, 130, 216, 100, 26, parent);
     HWND bDelete = makeCtl(IDC_NODE_BTN_DELETE, L"BUTTON", L"删除选中", BS_PUSHBUTTON, 240, 216, 100, 26, parent);
