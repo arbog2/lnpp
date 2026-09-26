@@ -3,6 +3,7 @@ build/
 *.exe
 *.obj
 *.res
+*.pdb
 *.user
 
 # third-party component binaries (hundreds of MB, manually copied)

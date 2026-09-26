@@ -1,7 +1,19 @@
 # LNPP 组件管理器设计文档
 
 日期：2026-08-19
-状态：已确认
+状态：已实现（细节已与代码漂移，见下方说明）
+
+> **以 README 为准。** 本文是最初的设计稿，有三处描述与现在的实现不一致：
+>
+> - §5「停止：优先 `GenerateConsoleCtrlEvent`」—— 代码没有用控制台事件，一律
+>   `TerminateProcess`（PG 走 `pg_ctl stop -m fast`，nginx 先 `-s quit` 再轮询，超时才强杀）。
+> - §6「`pg_dump -Fc` 全量导出 → `pg_restore`」—— 实际是 `pg_dumpall`（纯 SQL）+
+>   `psql -f`，备份文件是 `.sql` 不是 `.dump`。
+> - §2/§9「软件不负责下载」—— 已有组件下载器，设计见
+>   [2026-08-22-about-and-downloader-design.md](2026-08-22-about-and-downloader-design.md)。
+>
+> 另外 PG 迁移现在会在成功后把旧的 `data\postgresql\<版本>.old-*` 副本移入回收站
+> （默认保留最近 2 份），§6 第 6 步「旧 data 目录保留」已不再无限保留。
 
 ## 1. 目标
 

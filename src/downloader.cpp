@@ -9,8 +9,35 @@
 static std::wstring pkgsConfPath() { return joinPath(rootDir(), L"packages.conf"); }
 
 std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
+    return pkgsParseConfText(readFileText(pkgsConfPath()), err);
+}
+
+// A version becomes a directory name (bin\<comp>\<ver>) and the entry name
+// becomes a temp file name, so both must be plain tokens. "nginx-../../evil"
+// used to parse cleanly and resolved to bin\nginx\..\..\evil — the download
+// landed in %TEMP%\evil.zip and the extracted payload was copied outside the
+// runtime root. Nothing downstream is allowed to trust a conf file's values.
+static bool validVersionToken(const std::wstring& s) {
+    if (s.empty() || s.size() > 64) return false;
+    if (s == L"." || s == L"..") return false;
+    for (wchar_t c : s) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') ||
+                  c == L'.' || c == L'_' || c == L'-' || c == L'+';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool validEntryName(const std::wstring& s) {
+    if (s.empty() || s.size() > 80) return false;
+    if (s.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) return false;
+    if (s.back() == L'.' || s.back() == L' ') return false;
+    return s != L"." && s != L"..";
+}
+
+std::vector<PkgSection> pkgsParseConfText(const std::wstring& text, std::wstring& err) {
     std::vector<PkgSection> sections;
-    std::wstring text = readFileText(pkgsConfPath());
     if (text.empty()) { err = L"未找到 packages.conf"; return sections; }
 
     // Each section: ["# title" ] then "---" delimiter, then name=url entries, then
@@ -26,17 +53,23 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
     std::map<std::wstring, std::wstring> shaMap;
     bool fresh = true;   // true right after a "---" or at file start
     auto flush = [&]() {
-        // Bind the pending title to the section even if it has no items
-        // (a section like "# Deprecated\n# https://...\n---" would
-        // otherwise lose its title and confuse the user).
-        if (!cur.items.empty() || !pendingTitle.empty()) {
-            if (cur.title.empty()) cur.title = pendingTitle;
-            for (auto& it : cur.items) {
-                auto s = shaMap.find(it.name);
-                if (s != shaMap.end()) it.sha256 = s->second;
-            }
-            sections.push_back(cur);
+        // Only sections that actually carry items are emitted. The old code also
+        // pushed a section for a title that appeared *before* its "---" and had
+        // no entries yet, which meant every real section lost its title (the
+        // documented layout is "# Web Servers" then "---" then the packages) and
+        // the dialog grew a phantom header with no rows.
+        if (cur.items.empty()) {
+            cur = PkgSection();
+            shaMap.clear();
+            fresh = true;
+            return;   // keep pendingTitle: it still belongs to what follows
         }
+        if (cur.title.empty()) cur.title = pendingTitle;
+        for (auto& it : cur.items) {
+            auto s = shaMap.find(it.name);
+            if (s != shaMap.end()) it.sha256 = s->second;
+        }
+        sections.push_back(cur);
         cur = PkgSection();
         pendingTitle.clear();
         shaMap.clear();
@@ -65,6 +98,7 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
         item.name = trimStr(line.substr(0, eq));
         item.url  = trimStr(line.substr(eq + 1));
         if (item.name.empty() || item.url.empty()) continue;
+        if (!validEntryName(item.name)) continue;
         // Digest companion entries MUST be recognized before the generic
         // component parse: pkgsNameToCompVer would otherwise happily accept
         // "Nginx-1.30.4.sha256" as a package with version "1.30.4.sha256".
@@ -89,10 +123,11 @@ std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
 bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstring& ver) {
     size_t dash = name.find(L'-');
     if (dash == std::wstring::npos || dash == 0) return false;
+    if (!validEntryName(name)) return false;
     comp = lowerStr(name.substr(0, dash));
     ver = name.substr(dash + 1);
     if (comp == L"node") comp = L"nodejs";   // alias: dir is bin\nodejs
-    if (ver.empty()) return false;
+    if (!validVersionToken(ver)) return false;
     return comp == L"nginx" || comp == L"nodejs" || comp == L"postgresql" || comp == L"redis";
 }
 
@@ -136,10 +171,16 @@ static bool shDeleteTree(const std::wstring& path) {
     return SHFileOperationW(&op) == 0;
 }
 
+// One working directory per install run. The old fixed %TEMP%\lnpp_dl was
+// wiped at the start of every run, so two concurrent installs (two lnpp
+// instances, or a test binary next to the manager) destroyed each other's
+// download; a predictable path is also the easy target for a local junction.
 static std::wstring tempWorkRoot() {
+    static std::atomic<unsigned> g_seq{0};
     wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    return joinPath(tmp, L"lnpp_dl");
+    if (!GetTempPathW(MAX_PATH, tmp)) tmp[0] = L'\0';
+    return joinPath(tmp, L"lnpp_dl\\" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                        std::to_wstring(g_seq.fetch_add(1)));
 }
 
 // ============================ download ============================
@@ -167,6 +208,14 @@ bool pkgsDownload(const std::wstring& url, const std::wstring& destFile,
     bool secure = false;
     if (!crackUrl(url, host, path, secure)) {
         err = L"URL 无法解析: " + url;
+        return false;
+    }
+    // Everything this downloads is an executable that is later run as the
+    // current user (nginx.exe, initdb.exe, redis-server.exe), and the optional
+    // sha256 in packages.conf may simply be absent. Plain http would make the
+    // whole download unauthenticated, so refuse it outright.
+    if (!secure) {
+        err = L"只允许 https 下载源: " + url;
         return false;
     }
 
@@ -209,6 +258,9 @@ bool pkgsDownload(const std::wstring& url, const std::wstring& destFile,
         if (hfile == INVALID_HANDLE_VALUE) { err = L"无法写入临时文件: " + destFile; goto done; }
 
         DWORD done = 0;
+        // A sane ceiling so a wrong (or hostile) Content-Length cannot fill the
+        // disk. PostgreSQL's portable zip is ~300 MB; 2 GB leaves headroom.
+        const DWORD kMaxBytes = 2ull * 1024 * 1024 * 1024;
         for (;;) {
             if (cancel && cancel->load()) {
                 CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE;
@@ -223,6 +275,10 @@ bool pkgsDownload(const std::wstring& url, const std::wstring& destFile,
             DWORD read = 0;
             if (!WinHttpReadData(req, buf.data(), avail, &read)) { err = L"读取数据失败"; goto done; }
             if (read == 0) break;
+            if (done + read > kMaxBytes) {
+                err = L"下载体积超过上限 (2 GB)，已中止";
+                goto done;
+            }
             DWORD written = 0;
             if (!WriteFile(hfile, buf.data(), read, &written, nullptr) || written != read) {
                 err = L"写入临时文件失败（磁盘空间不足？）";
@@ -295,10 +351,17 @@ bool pkgsExtractZip(const std::wstring& zipFile, const std::wstring& destDir, st
     // stdin, which runProcessCapture never does, so the first call always
     // failed and was dead code; the short command-line fallback also broke on
     // paths containing quotes. A script file avoids both problems.
+    // A Windows user name may contain ' (O'Brien), so the literal paths have
+    // to be escaped for the single-quoted PowerShell string.
+    auto psQuote = [](const std::wstring& s) {
+        std::wstring out = L"'";
+        for (wchar_t c : s) out += (c == L'\'') ? std::wstring(L"''") : std::wstring(1, c);
+        out += L"'";
+        return out;
+    };
     std::wstring psFile = zipFile + L".ps1";
-    std::wstring script = L"Expand-Archive -LiteralPath '"
-                        + zipFile + L"' -DestinationPath '"
-                        + destDir + L"' -Force";
+    std::wstring script = L"Expand-Archive -LiteralPath " + psQuote(zipFile) +
+                          L" -DestinationPath " + psQuote(destDir) + L" -Force";
     if (!writeFileText(psFile, script)) {
         err = L"无法写入临时解压脚本";
         return false;
@@ -330,7 +393,7 @@ bool pkgsInstall(const PkgItem& item,
 
     std::wstring root = tempWorkRoot();
     shDeleteTree(root);
-    if (!makeDirs(root)) { err = L"无法创建临时目录"; return false; }
+    if (!makeDirs(root)) { err = L"无法创建临时目录: " + root; return false; }
     std::wstring zipFile = joinPath(root, item.name + L".zip");
     std::wstring extractDir = joinPath(root, L"extract");
     if (!makeDirs(extractDir)) { err = L"无法创建解压目录"; return false; }

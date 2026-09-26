@@ -1,4 +1,4 @@
-# LNPP 组件管理器 v1.5.1
+# LNPP 组件管理器 v1.5.2
 
 Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis 的启动、停止、版本切换、配置。
 
@@ -60,19 +60,30 @@ lnpp.exe
 
 ```
 build.bat
+build.bat debug      # 产出 lnpp_dbg.exe（/Od /Zi /D_DEBUG），用于调试
 ```
 
 输出 `lnpp.exe` 到仓库根目录（exe 所在目录即运行时根目录）。
 
 ## 测试
 
-`test.bat` 会编译并运行四个测试：纯逻辑单元测试（`unittests`）+ 三个集成测试（`selftest` / `proctest` / `migtest`）。集成测试会实际启停组件、切换版本、做 PostgreSQL 版本间数据迁移，因此运行时请确保 80 / 5432 / 6379 端口未被其他程序占用；`unittests` 不碰进程与端口，可以先单独跑。
+测试分两类，**请先看清再跑**：
 
-```
-test.bat build    # 只编译测试程序到仓库根目录
-test.bat run      # 只运行已编译的测试程序
-test.bat all      # 编译并运行（默认）
-```
+| 命令 | 跑什么 | 是否动真实环境 |
+|---|---|---|
+| `test.bat run` / `test.bat all` | 只跑 `unittests`（纯逻辑，不碰进程和端口） | 否 |
+| `test.bat selftest` | 真实启停 nginx / PG / Redis，**切换 nginx 版本并在结束时还原** | 是 |
+| `test.bat proctest` | `pm2 resurrect` 后再 `pm2 kill`——**会把你的应用停掉** | 是 |
+| `test.bat migtest` | 对**真实数据库**做版本迁移（pg_dumpall → initdb → 恢复） | 是（不可逆） |
+| `test.bat destructive` | 上面三个全跑 | 是 |
+| `test.bat build` | 只编译四个测试程序到仓库根目录 | 否 |
+
+> ⚠️ `migtest` 会重建 `data\postgresql\<版本>`。在有真实数据的机器上跑之前请先备份。
+> 退出码：`0` 通过 / `1` 失败 / `2` 跳过——**跳过不会被算作通过**。
+
+`unittests` 覆盖 `renderTemplate`、`packages.conf` 语法、`pkgsNameToCompVer`（含路径穿越
+拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一
+文件）、DPAPI 加解密往返、文件编码。所有临时文件都在 `%TEMP%` 并自动清理。
 
 ## 说明
 
@@ -80,6 +91,16 @@ test.bat all      # 编译并运行（默认）
 - PostgreSQL 默认端口 5432，redis 6379，nginx 80；在 `data\settings.ini` 中可改
 - PostgreSQL 密码用 DPAPI（绑定当前 Windows 用户）加密后存 `data\settings.ini` 的 `pg.password.enc`；加密串换机器或换用户后无法解密，需重新填写密码
 - 日志轮转：管理器日志 `logs\lnpp.log` 超过 4MB 自动轮转为 `lnpp.log.1`；nginx 的 `access.log` / `error.log`（`data\nginx\<版本>\logs\`）与 `logs\postgresql-<版本>.log`、`logs\redis-<版本>.log` 超过 8MB 时在**组件下次启动前**轮转为 `.1`/`.2`（保留 2 份）。Windows 下运行中的服务会独占日志文件，无法改名，所以要等组件停止时才能轮转；pm2 自己的日志在 `%USERPROFILE%\.pm2\logs`，由 pm2 管理
-- 首次使用 PostgreSQL：切到对应页签点「初始化数据库」
+- 首次使用 PostgreSQL：切到对应页签点「初始化数据库」（密码不能为空）
 - 组件下载源：根目录 `packages.conf` 按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis 组件
+  - **只接受 `https://`**，明文源会被直接拒绝
+  - 名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）
 - 可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（用 `certutil -hashfile <文件> SHA256` 生成），下载后自动比对，不匹配则拒绝安装；没有该行时跳过校验
+- **PostgreSQL 版本切换会留下旧数据副本**：每次切换在 `data\postgresql\<版本>` 旁生成
+  `.old-<时间戳>`（约 120MB/份），并在 `backup\` 留一份全量 dump。管理器现在自动把它们
+  **移入回收站**（可撤销），只保留最近若干份。保留数量可在 `data\settings.ini` 调整：
+  - `keep.datacopies=2` — 保留最近 N 份旧数据目录（默认 2）
+  - `keep.backups=10` — 保留最近 N 个 `backup\*.sql`（默认 10）
+  手工清理也可以：确认新集群正常后，直接删 `data\postgresql\*.old-*` 与旧 dump。
+- Redis 默认只监听 `127.0.0.1`（`etc\redis\redis.conf.tpl` 里的 `bind`）。要跨机访问请
+  自行改模板并加 `requirepass`

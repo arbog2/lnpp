@@ -21,6 +21,10 @@ struct PkgSection {
 
 // Parse <root>\packages.conf. Unknown components (php/apache/...) are skipped.
 std::vector<PkgSection> pkgsParseConf(std::wstring& err);
+// Same parser on raw text, so the whole conf grammar is unit-testable without
+// writing a packages.conf into the runtime root (which needs admin rights and
+// would race a real download).
+std::vector<PkgSection> pkgsParseConfText(const std::wstring& text, std::wstring& err);
 
 // Map an entry name like "node-24.12" to component dir "nodejs" + version "24.12".
 bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstring& ver);

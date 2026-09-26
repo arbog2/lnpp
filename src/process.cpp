@@ -243,13 +243,15 @@ RunResult runProcessCapture(const std::wstring& exe,
     CloseHandle(hReadPipe);
     CloseHandle(pi.hProcess);
 
-    // Decode output (try UTF-8, fall back to ACP). Size the buffer from the
-    // code page actually used — the old code allocated from the UTF-8 length
-    // but wrote the ACP result into it, which can overrun when the two
-    // encodings disagree on character count.
+    // Decode output: UTF-8 first, ANSI code page when the bytes are not valid
+    // UTF-8. MB_ERR_INVALID_CHARS is what makes the fallback reachable — with
+    // flags 0 the API substitutes U+FFFD for bad sequences and never returns 0,
+    // so a GBK-codepage tool (psql under a zh-CN console, redis-cli) had its
+    // output silently mangled instead of decoded.
     if (!rawOutput.empty()) {
         UINT cp = CP_UTF8;
-        int len = MultiByteToWideChar(cp, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);
+        int len = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, rawOutput.c_str(),
+                                      (int)rawOutput.size(), nullptr, 0);
         if (len <= 0) {
             cp = CP_ACP;
             len = MultiByteToWideChar(cp, 0, rawOutput.c_str(), (int)rawOutput.size(), nullptr, 0);

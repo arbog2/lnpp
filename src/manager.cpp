@@ -41,6 +41,21 @@ static bool pgValidIdent(const std::wstring& s);
 // (psql / pg_dumpall / redis-cli / the nginx listen directive).
 static bool validPort(const std::wstring& s);
 
+// ============================ Operation locks ============================
+// One lock per component. autoStartComponents() fires compStart for all four
+// components from four parallel threads, and compStart(Nodejs) additionally
+// starts Redis as a side effect — so the same component really can be driven
+// by two threads at once (two servers fighting over one port / data dir, or
+// two config generators racing). try_lock makes the loser fail fast with a
+// readable reason instead of corrupting state; recursive because
+// compSwitchVersion holds the lock while calling compStop/compStart.
+static std::recursive_mutex g_compOpMtx[(int)Comp::Count];
+
+// Serialises config generation. Each gen*() function rewrites a file that other
+// threads read (nginx -t, redis-server, postgres) and can append to
+// postgresql.conf, so two overlapping runs are never what we want.
+static std::mutex g_genCfgMtx;
+
 // ============================ Component discovery ============================
 
 // Natural (version-aware) descending comparison: "1.30" > "1.9", "2.0" > "1.99".
@@ -429,15 +444,18 @@ static bool pm2PipeReachable() {
 // starts another daemon. After a failure the manager stops touching pm2 for a
 // while instead.
 static const DWORD PM2_COOLDOWN_MS = 30000;
-static DWORD g_pm2DownUntil = 0;
+// Touched by the pm2 poller and by whatever operation thread is calling into
+// pm2, so it has to be an atomic rather than a bare DWORD.
+static std::atomic<DWORD> g_pm2DownUntil{0};
 
 static bool pm2InCooldown() {
     // Wrap-safe comparison: true while now is still before the deadline.
-    return g_pm2DownUntil != 0 && (long)(GetTickCount() - g_pm2DownUntil) < 0;
+    DWORD until = g_pm2DownUntil.load();
+    return until != 0 && (long)(GetTickCount() - until) < 0;
 }
 
 static void pm2MarkDown() {
-    g_pm2DownUntil = GetTickCount() + PM2_COOLDOWN_MS;
+    g_pm2DownUntil.store(GetTickCount() + PM2_COOLDOWN_MS);
 }
 
 // True iff the pm2 God daemon is actually usable: its pidfile points at a live
@@ -454,11 +472,21 @@ static bool nodeDaemonRunning() {
     return true;
 }
 
-static bool nodePm2Cmd(const std::wstring& ver, std::wstring& out) {
-    out = joinPath(compBinDirVer(Comp::Nodejs, ver), L"pm2.cmd");
-    if (fileExists(out)) return true;
-    out = joinPath(compBinDirVer(Comp::Nodejs, ver), L"node_modules\\pm2\\bin\\pm2.js");
-    if (fileExists(out)) return true;
+// Locate a usable pm2 and describe how to invoke it. A pm2.cmd is run
+// directly; a pm2.js has to be handed to the bundled node.exe, because handing
+// a .js file to CreateProcess always fails with ERROR_BAD_EXE_FORMAT — that
+// fallback used to look implemented but could never run.
+static bool nodePm2Cmd(const std::wstring& ver, std::wstring& exe, std::wstring& argPrefix) {
+    std::wstring verDir = compBinDirVer(Comp::Nodejs, ver);
+    std::wstring cmd = joinPath(verDir, L"pm2.cmd");
+    if (fileExists(cmd)) { exe = cmd; argPrefix.clear(); return true; }
+    std::wstring js = joinPath(verDir, L"node_modules\\pm2\\bin\\pm2.js");
+    if (fileExists(js)) {
+        exe = joinPath(verDir, L"node.exe");
+        if (!fileExists(exe)) return false;
+        argPrefix = L"\"" + toForward(js) + L"\" ";
+        return true;
+    }
     // fall back to pm2 in system PATH (global npm install)
     wchar_t buf[4096];
     DWORD n = GetEnvironmentVariableW(L"PATH", buf, 4096);
@@ -468,18 +496,19 @@ static bool nodePm2Cmd(const std::wstring& ver, std::wstring& out) {
         std::wstring dir;
         while (std::getline(ss, dir, L';')) {
             std::wstring cand = joinPath(trimStr(dir), L"pm2.cmd");
-            if (fileExists(cand)) { out = cand; return true; }
+            if (fileExists(cand)) { exe = cand; argPrefix.clear(); return true; }
         }
     }
-    out.clear();
+    exe.clear();
+    argPrefix.clear();
     return false;
 }
 
 bool nodePm2Installed() {
     ComponentStatus st = compStatus(Comp::Nodejs);
     if (!st.installed) return false;
-    std::wstring pm2;
-    return nodePm2Cmd(st.currentVersion, pm2);
+    std::wstring pm2, prefix;
+    return nodePm2Cmd(st.currentVersion, pm2, prefix);
 }
 
 // pm2's Windows daemon talks over the named pipe \\.\pipe\rpc.sock. When the
@@ -526,11 +555,11 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
     // broken install is what escalates a single failure into a storm.
     if (pm2InCooldown()) return empty;
 
-    std::wstring pm2;
-    if (nodePm2Cmd(ver, pm2)) {
-        std::wstring cmdArgs;
+    std::wstring pm2, argPrefix;
+    if (nodePm2Cmd(ver, pm2, argPrefix)) {
+        std::wstring cmdArgs = argPrefix;
         for (auto& a : args) {
-            if (!cmdArgs.empty()) cmdArgs += L" ";
+            if (!cmdArgs.empty() && cmdArgs.back() != L' ') cmdArgs += L" ";
             cmdArgs += a;
         }
         std::wstring wd = compBinDirVer(Comp::Nodejs, ver);
@@ -549,7 +578,7 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
             if (pm2CmdIsReadOnly(args)) return empty;
             // Give an operator-requested start exactly one chance to bring the
             // daemon up, then require the endpoint to actually answer.
-            runProcessCapture(pm2, L"ping", wd, 20000, env);
+            runProcessCapture(pm2, argPrefix + L"ping", wd, 20000, env);
             if (!waitForPm2Daemon(5000)) {
                 logMsg(L"pm2", L"守护进程无法启动，进入 30s 冷却: " + args[0]);
                 pm2MarkDown();
@@ -564,7 +593,7 @@ static RunResult runPm2(const std::vector<std::wstring>& args, int timeoutMs = 1
 
         // A working command proves the daemon is healthy again: clear any
         // cooldown so normal polling resumes immediately.
-        if (r.ok) g_pm2DownUntil = 0;
+        if (r.ok) g_pm2DownUntil.store(0);
 
         // A handshake failure means the endpoint died under us. Do NOT retry:
         // the retry is what doubled the spawn rate during the storm. Cool down
@@ -672,7 +701,103 @@ void rotateCompLogs(Comp c, const std::wstring& ver) {
     }
 }
 
+// ============================ Housekeeping ============================
+// Every PostgreSQL version switch leaves two artefacts behind: a full copy of
+// the old cluster (data\postgresql\<ver>.old-<stamp>, ~120 MB) and a full
+// pg_dumpall in backup\. Nothing pruned them, so on this machine the directory
+// had reached 32 copies / 3.9 GB. Both are now trimmed, and the dropped ones go
+// to the Recycle Bin rather than straight to the void: they are the only way
+// back if a restore turns out to have been lossy.
+
+static int keepCount(const wchar_t* key, int def) {
+    std::wstring v = iniGet(key, L"");
+    if (v.empty()) return def;
+    int n = _wtoi(v.c_str());
+    return n >= 0 ? n : def;
+}
+
+static ULONGLONG treeBytes(const std::wstring& path) {
+    if (fileExists(path)) {
+        WIN32_FILE_ATTRIBUTE_DATA d;
+        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d))
+            return ((ULONGLONG)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+        return 0;
+    }
+    ULONGLONG total = 0;
+    for (auto& sub : listSubDirs(path)) total += treeBytes(joinPath(path, sub));
+    for (auto& f : listFiles(path, L"*")) total += treeBytes(joinPath(path, f));
+    return total;
+}
+
+// Recycle Bin delete, so pruning stays reversible.
+static bool recycleTree(const std::wstring& path) {
+    if (!dirExists(path) && !fileExists(path)) return true;
+    std::wstring p = path;
+    while (p.size() > 1 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    p.push_back(L'\0');
+    p.push_back(L'\0');
+    SHFILEOPSTRUCTW op = {0};
+    op.wFunc = FO_DELETE;
+    op.pFrom = p.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+}
+
+// The trailing ".old-20260922_065605" / ".failed-..." stamp sorts correctly as
+// text, so newest-first is a plain string comparison on that suffix.
+static bool stampOf(const std::wstring& name, const wchar_t* marker, std::wstring& stamp) {
+    size_t p = name.rfind(marker);
+    if (p == std::wstring::npos) return false;
+    stamp = name.substr(p + wcslen(marker));
+    return !stamp.empty();
+}
+
+static void pruneStaleDataCopies(Comp c) {
+    int keep = keepCount(L"keep.datacopies", 2);
+    std::wstring root = compDataDir(c);
+    struct Entry { std::wstring path, stamp; };
+    std::vector<Entry> stale;
+    for (auto& name : listSubDirs(root)) {
+        std::wstring stamp;
+        if (stampOf(name, L".old-", stamp) || stampOf(name, L".failed-", stamp))
+            stale.push_back({ joinPath(root, name), stamp });
+    }
+    if ((int)stale.size() <= keep) return;
+    std::sort(stale.begin(), stale.end(),
+              [](const Entry& a, const Entry& b) { return a.stamp > b.stamp; });
+    ULONGLONG freed = 0;
+    int dropped = 0;
+    for (size_t i = (size_t)keep; i < stale.size(); ++i) {
+        ULONGLONG sz = treeBytes(stale[i].path);
+        if (recycleTree(stale[i].path)) { freed += sz; ++dropped; }
+    }
+    if (dropped > 0) {
+        logMsg(L"maint", L"清理旧数据副本 " + std::to_wstring(dropped) + L" 个 (" +
+                         std::to_wstring(freed / (1024 * 1024)) + L" MB)，已移入回收站");
+    }
+}
+
+static void pruneOldBackups() {
+    int keep = keepCount(L"keep.backups", 10);
+    std::wstring dir = backupDir();
+    auto files = listFiles(dir, L"sql");
+    if ((int)files.size() <= keep) return;
+    std::sort(files.begin(), files.end(), std::greater<std::wstring>());
+    ULONGLONG freed = 0;
+    int dropped = 0;
+    for (size_t i = (size_t)keep; i < files.size(); ++i) {
+        ULONGLONG sz = treeBytes(joinPath(dir, files[i]));
+        if (recycleTree(joinPath(dir, files[i]))) { freed += sz; ++dropped; }
+    }
+    if (dropped > 0) {
+        logMsg(L"maint", L"清理旧备份 " + std::to_wstring(dropped) + L" 个 (" +
+                         std::to_wstring(freed / (1024 * 1024)) + L" MB)，已移入回收站");
+    }
+}
+
 bool compStart(Comp c, std::wstring& err) {
+    std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
+    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装（bin 下无版本目录）"; return false; }
     bool alreadyRunning =
@@ -692,6 +817,13 @@ bool compStart(Comp c, std::wstring& err) {
     // We are down here, which is the only window in which the component's logs
     // can be rotated on Windows (see rotateCompLogs).
     rotateCompLogs(c, ver);
+    // Starting a component is a natural maintenance window: the PostgreSQL
+    // version switch leaves a full copy of the old cluster behind every time,
+    // and the backup folder grows by one full dump per migration.
+    if (c == Comp::Postgresql) {
+        pruneStaleDataCopies(Comp::Postgresql);
+        pruneOldBackups();
+    }
 
     switch (c) {
         case Comp::Nginx: {
@@ -777,13 +909,16 @@ bool compStart(Comp c, std::wstring& err) {
             // pm2 apps commonly depend on Redis (a refused 6379 connection makes
             // them exit right after start, which pm2 then reports as a crashed
             // app). Bring Redis up first unless the user is starting it itself.
+            // This path does NOT hold the Redis component lock, so if the user's
+            // own Redis start is already in flight this fails fast on purpose —
+            // two servers on one port would be worse.
             ComponentStatus rs = compStatus(Comp::Redis);
             if (rs.installed && !rs.running) {
                 std::wstring rerr;
                 if (!compStart(Comp::Redis, rerr)) {
                     // Not fatal: the app may not need Redis at all. Say what
                     // happened and let pm2 try anyway.
-                    logMsg(L"pm2", L"启动 Node.js 前自动启动 Redis 失败: " + rerr);
+                    logMsg(L"pm2", L"启动 Node.js 前未自动启动 Redis: " + rerr);
                 }
             }
             // pm2 resurrect restores previously saved processes
@@ -799,6 +934,8 @@ bool compStart(Comp c, std::wstring& err) {
 }
 
 bool compStop(Comp c, std::wstring& err) {
+    std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
+    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装"; return false; }
     std::wstring ver = st.currentVersion;
@@ -864,8 +1001,10 @@ bool compStop(Comp c, std::wstring& err) {
         case Comp::Redis: {
             // try shutdown via redis-cli
             std::wstring cli;
+            std::wstring rport = redisPort();
+            if (!validPort(rport)) rport = L"6379";
             if (findExe(Comp::Redis, ver, L"redis-cli.exe", cli)) {
-                runProcessCapture(cli, L"-p " + redisPort() + L" shutdown nosave", 
+                runProcessCapture(cli, L"-p " + rport + L" shutdown nosave",
                                   compBinDirVer(c, ver), 5000);
             }
             DWORD pid = readPid(redisPidFile(ver));
@@ -898,6 +1037,9 @@ bool compStop(Comp c, std::wstring& err) {
 }
 
 bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
+    // Recursive lock: compStop/compStart below re-acquire it on this thread.
+    std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
+    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装"; return false; }
     if (st.currentVersion == ver) { err = L"已是当前版本"; return false; }
@@ -1056,6 +1198,11 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
                 return false;
             }
         }
+        // The new cluster is up and the dump was replayed: the pre-migration
+        // copies and this run's intermediate backups are now surplus. Anything
+        // dropped goes to the Recycle Bin, so a bad restore is still undoable.
+        pruneStaleDataCopies(Comp::Postgresql);
+        pruneOldBackups();
         return true;
     }
 
@@ -1113,6 +1260,10 @@ static const wchar_t* DEFAULT_NGINX_CONF =
     L"}\r\n";
 
 static const wchar_t* DEFAULT_REDIS_CONF =
+    // bind before the rest: without it Redis 5 listens on every interface, and
+    // this template ships no requirepass, which is an unauthenticated Redis
+    // exposed to the whole LAN. Keep it in sync with etc\redis\redis.conf.tpl.
+    L"bind 127.0.0.1\r\n"
     L"port {{PORT}}\r\n"
     L"daemonize no\r\n"
     L"pidfile {{PIDFILE}}\r\n"
@@ -1168,6 +1319,7 @@ static const wchar_t* DEFAULT_VHOST_HTTPS =
     L"}\r\n";
 
 bool genNginxConfig(const std::wstring& ver) {
+    std::lock_guard<std::mutex> lk(g_genCfgMtx);
     std::wstring prefix = compDataVerDir(Comp::Nginx, ver);
     if (!makeDirs(joinPath(prefix, L"conf"))) return false;
     if (!makeDirs(joinPath(prefix, L"logs"))) return false;
@@ -1213,6 +1365,7 @@ bool genNginxConfig(const std::wstring& ver) {
 }
 
 bool genRedisConfig(const std::wstring& ver) {
+    std::lock_guard<std::mutex> lk(g_genCfgMtx);
     std::wstring dir = compDataVerDir(Comp::Redis, ver);
     if (!makeDirs(dir)) return false;
     if (!makeDirs(logsDir())) return false;
@@ -1232,6 +1385,7 @@ bool genRedisConfig(const std::wstring& ver) {
 
 bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir) {
     (void)ver;   // template only needs dataDir; keep the signature uniform with genNginxConfig
+    std::lock_guard<std::mutex> lk(g_genCfgMtx);
     std::wstring tpl = readFileText(joinPath(compEtcDir(Comp::Postgresql), L"postgresql.conf.append"));
     if (tpl.empty()) tpl = DEFAULT_PG_APPEND;
     std::map<std::wstring, std::wstring> kv;
@@ -1349,6 +1503,11 @@ std::vector<VHost> nginxListVHosts() {
             }
         }
         p1 = content.find(L"root");
+        if (p1 != std::wstring::npos) {
+            // "root" also occurs inside "document_root" / "$root"; only a
+            // standalone directive counts.
+            if (p1 > 0 && !iswspace(content[p1 - 1])) p1 = content.find(L"root", p1 + 1);
+        }
         if (p1 != std::wstring::npos) {
             size_t b = content.find(L" ", p1 + 4);
             size_t e = content.find(L";", p1);
@@ -1648,6 +1807,9 @@ bool pgInit(Comp c, const std::wstring& ver, const std::wstring& user,
     }
     std::wstring effPort = port.empty() ? L"5432" : port;
     if (!validPort(effPort)) { err = L"端口号无效（应为 1-65535）: " + port; return false; }
+    // An empty password would create a passwordless superuser even under
+    // --auth scram-sha-256, so refuse instead of quietly building one.
+    if (password.empty()) { err = L"密码不能为空"; return false; }
     // initdb --pwfile consumes the *first line* only: a password containing a
     // line break would be truncated on the server while we store the full
     // string, and every later psql connection would fail authentication.

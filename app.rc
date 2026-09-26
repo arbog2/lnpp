@@ -7,10 +7,15 @@
 // Windows picks the best match per context (tray / title bar / Alt+Tab)
 IDI_APP ICON "app.ico"
 
+// RT_MANIFEST (type 24). Declares DPI awareness (without it the window is
+// bitmap-scaled and blurry on 125%/150% displays) and pulls in ComCtl32 v6 so
+// the tab / list / progress controls get the modern look instead of Win95.
+1 24 "app.manifest"
+
 // executable version info shown in Properties -> Details
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,5,1,0
- PRODUCTVERSION 1,5,1,0
+ FILEVERSION 1,5,2,0
+ PRODUCTVERSION 1,5,2,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -26,11 +31,11 @@ BEGIN
         BLOCK "080404b0"
         BEGIN
             VALUE "FileDescription", "LNPP 组件管理器"
-            VALUE "FileVersion", "1.5.1.0"
+            VALUE "FileVersion", "1.5.2.0"
             VALUE "InternalName", "lnpp"
             VALUE "OriginalFilename", "lnpp.exe"
             VALUE "ProductName", "LNPP 组件管理器"
-            VALUE "ProductVersion", "1.5.1.0"
+            VALUE "ProductVersion", "1.5.2.0"
         END
     END
     BLOCK "VarFileInfo"

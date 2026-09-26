@@ -1,6 +1,14 @@
+// DESTRUCTIVE integration test. See test.bat: compStart(Nodejs) resurrects the
+// real pm2 applications and compStop(Nodejs) runs `pm2 kill`, so the user's
+// running apps are stopped when this test finishes.
 #include "common.h"
 #include "proc.h"
 #include "manager.h"
+
+// 0 = pass, 1 = fail, 2 = skipped.
+#define RC_PASS 0
+#define RC_FAIL 1
+#define RC_SKIP 2
 
 static int g_fail = 0;
 static void check(const wchar_t* name, bool ok, const std::wstring& detail = L"") {
@@ -10,6 +18,7 @@ static void check(const wchar_t* name, bool ok, const std::wstring& detail = L""
 
 int wmain() {
     std::wstring err;
+    wprintf(L"!!! 破坏性测试：会 resurrect 并最终 pm2 kill 本机的应用\n");
 
     wprintf(L"=== Node.js version switch test ===\n");
     // start a test app under current version, then switch version and verify pm2 survives
@@ -31,8 +40,8 @@ int wmain() {
     }
     if (to.empty()) {
         wprintf(L"  only one node version installed, skipping switch\n");
-        wprintf(L"\nFAILURES: %d\n", g_fail);
-        return g_fail;
+        wprintf(L"\nSKIPPED\n");
+        return RC_SKIP;
     }
     wprintf(L"  switching %s -> %s\n", from.c_str(), to.c_str());
 
@@ -57,5 +66,5 @@ int wmain() {
     check(L"stopped", !compIsRunning(Comp::Nodejs));
 
     wprintf(L"\nFAILURES: %d\n", g_fail);
-    return g_fail;
+    return g_fail ? RC_FAIL : RC_PASS;
 }

@@ -151,8 +151,11 @@ std::wstring readFileText(const std::wstring& path) {
     // the conversion that fills it — the old code sized it from the UTF-8
     // length but wrote the ACP result into it, which can overrun on byte
     // sequences whose UTF-8 and ACP character counts differ.
+    // MB_ERR_INVALID_CHARS is what makes the fallback reachable: with flags 0 a
+    // bad sequence is replaced by U+FFFD and the call still succeeds, so a GBK
+    // config file was read as mojibake instead of decoded.
     UINT cp = CP_UTF8;
-    int len = MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    int len = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, bytes.c_str(), (int)bytes.size(), nullptr, 0);
     if (len <= 0) {
         cp = CP_ACP;
         len = MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
@@ -160,31 +163,78 @@ std::wstring readFileText(const std::wstring& path) {
     if (len <= 0) return L"";
     std::wstring w(len, L'\0');
     MultiByteToWideChar(cp, 0, bytes.c_str(), (int)bytes.size(), &w[0], len);
+    // Strip a UTF-8 BOM. Modern Notepad saves UTF-8 *with* BOM, so a
+    // hand-edited settings.ini or vhost .conf arrived with U+FEFF glued to the
+    // front of the first line — which silently renamed the first INI key and
+    // made nginx choke on the first directive.
+    if (!w.empty() && w[0] == 0xFEFF) w.erase(0, 1);
     return w;
 }
 
 bool writeFileText(const std::wstring& path, const std::wstring& content) {
+    if (path.empty()) return false;
     makeDirs(dirOf(path));
-    // Write to a sibling temp file then rename, so a crash or power loss
-    // mid-write can never leave the target half-written (settings.ini would
-    // otherwise be corrupted and every preference lost).
-    std::wstring tmp = path + L".tmp";
-    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    // Convert wide to UTF-8
-    int len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.size(), nullptr, 0, nullptr, nullptr);
-    std::string bytes(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.size(), &bytes[0], len, nullptr, nullptr);
-    DWORD written = 0;
-    bool ok = WriteFile(h, bytes.c_str(), (DWORD)bytes.size(), &written, nullptr) != FALSE;
-    CloseHandle(h);
-    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
-    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+
+    // Encode once: the payload is identical on every retry.
+    int need = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.size(),
+                                   nullptr, 0, nullptr, nullptr);
+    if (need < 0) return false;
+    std::string bytes((size_t)need, '\0');
+    if (need > 0)
+        WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.size(),
+                            bytes.data(), need, nullptr, nullptr);
+
+    // Staging file name must be unique per writer. The old fixed "<path>.tmp"
+    // combined with an exclusive open (share mode 0) meant two threads writing
+    // the same target collided: the loser got ERROR_SHARING_VIOLATION and the
+    // whole write failed. Not hypothetical - autoStartComponents() runs the four
+    // compStart calls in parallel threads and compStart(Nodejs) additionally
+    // starts Redis, so genRedisConfig() was entered twice at once and the log
+    // showed "启动 Node.js 前自动启动 Redis 失败: 生成 redis 配置失败" on three
+    // consecutive mornings.
+    static std::atomic<unsigned> g_tmpSeq{0};
+    const DWORD pid = GetCurrentProcessId();
+    const DWORD tid = GetCurrentThreadId();
+
+    DWORD lastErr = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        std::wstring tmp = path + L"." + std::to_wstring(pid) + L"-" +
+                           std::to_wstring(tid) + L"-" +
+                           std::to_wstring(g_tmpSeq.fetch_add(1)) + L".tmp";
+        // CREATE_NEW never opens an existing file, so two writers can neither
+        // share nor truncate each other's staging file.
+        HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            lastErr = GetLastError();
+            if (lastErr == ERROR_FILE_EXISTS) continue;   // name taken, take another
+            break;
+        }
+        bool ok = true;
+        if (!bytes.empty()) {
+            DWORD written = 0;
+            ok = (WriteFile(h, bytes.data(), (DWORD)bytes.size(), &written, nullptr) != FALSE) &&
+                 (written == bytes.size());
+            if (!ok) lastErr = GetLastError();
+        }
+        CloseHandle(h);
+        if (!ok) { DeleteFileW(tmp.c_str()); break; }
+
+        if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+            return true;
+        lastErr = GetLastError();
         DeleteFileW(tmp.c_str());
-        return false;
+        // A virus scanner (or another writer) can hold the target open for a few
+        // milliseconds. That is transient, so retry instead of failing outright.
+        if (lastErr != ERROR_SHARING_VIOLATION && lastErr != ERROR_ACCESS_DENIED &&
+            lastErr != ERROR_LOCK_VIOLATION)
+            break;
+        Sleep(25 * (attempt + 1));
     }
-    return true;
+    // Never swallow the reason again: an unexplained "生成 xxx 配置失败" cost
+    // days of bisecting.
+    logMsg(L"file", L"写入失败 " + path + L" (错误 " + std::to_wstring(lastErr) + L")");
+    return false;
 }
 
 std::wstring dirOf(const std::wstring& path) {
@@ -295,6 +345,9 @@ std::map<std::wstring, std::wstring> parseIniText(const std::wstring& content) {
     std::wstringstream ss(content);
     std::wstring line;
     while (std::getline(ss, line)) {
+        // A UTF-8 BOM (what Notepad writes) would otherwise become part of the
+        // first key, renaming it to "\ufeffver.nodejs" and losing the setting.
+        if (!line.empty() && line[0] == 0xFEFF) line.erase(0, 1);
         size_t eq = line.find(L'=');
         if (eq != std::wstring::npos) {
             std::wstring k = lowerStr(trimStr(line.substr(0, eq)));

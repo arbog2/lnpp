@@ -142,6 +142,18 @@ static OverviewUI g_ov;
 // UI thread only — must not be called from worker threads.
 static void logAppendRaw(HWND edit, const std::wstring& text) {
     int len = GetWindowTextLengthW(edit);
+    // Cap the buffer: a tray-resident manager can run for weeks and every
+    // operation appends, so without this the edit control grows without bound
+    // for the whole life of the process.
+    const int kMaxChars = 256 * 1024;
+    if (len > kMaxChars) {
+        // EM_SETSEL(start, end) with start > end selects nothing, so drop the
+        // oldest half by re-selecting from the trim point to the end.
+        int cut = len - kMaxChars / 2;
+        SendMessageW(edit, EM_SETSEL, cut, len);
+        SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(edit);
+    }
     SendMessageW(edit, EM_SETSEL, len, len);
     SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
     // auto scroll
@@ -251,9 +263,13 @@ static void beginOp(Comp c, const std::wstring& name) {
 
 static void endOp(Comp c, bool ok, const std::wstring& msg) {
     CompUI& ui = g_ui[(int)c];
-    ui.busy = false;
-    logMsgUi(c, ok ? (L"==> " + ui.opName + L" 完成") : (L"==> " + ui.opName + L" 失败: " + msg));
-    // refresh UI on UI thread
+    // ui.opName is a plain std::wstring written by beginOp on the UI thread.
+    // Take the snapshot BEFORE clearing busy: once busy is false the UI thread
+    // may pass runAsync's guard and start the next op, which overwrites opName
+    // while this worker is still formatting the log line.
+    std::wstring name = ui.opName;
+    logMsgUi(c, ok ? (L"==> " + name + L" 完成") : (L"==> " + name + L" 失败: " + msg));
+    // busy is cleared by the UI thread in WM_OP_DONE — it owns ui.opName.
     PostMessageW(g_main, WM_OP_DONE, (WPARAM)c, ok ? 0 : 1);
 }
 
@@ -488,10 +504,18 @@ static void actSwitch(Comp c) {
     CompUI& ui = g_ui[(int)c];
     int idx = (int)SendMessageW(ui.verCombo, CB_GETCURSEL, 0, 0);
     if (idx < 0) return;
-    wchar_t buf[128];
-    SendMessageW(ui.verCombo, CB_GETLBTEXT, idx, (LPARAM)buf);
-    std::wstring ver = buf;
-    ComponentStatus st = compStatus(c);
+    // CB_GETLBTEXT copies as much as the caller claims to have room for — the
+    // control has no idea how big `buf` is. Ask for the length first: version
+    // names come from directory names under bin\ and a long one used to smash
+    // the stack.
+    int len = (int)SendMessageW(ui.verCombo, CB_GETLBTEXTLEN, idx, 0);
+    if (len < 0) return;
+    std::vector<wchar_t> buf((size_t)len + 1, L'\0');
+    SendMessageW(ui.verCombo, CB_GETLBTEXT, idx, (LPARAM)buf.data());
+    std::wstring ver = buf.data();
+    // Quick probe on purpose: compStatus() can spawn redis-cli / pm2 and block
+    // the UI thread for seconds (see isUiThread() in proc.h).
+    ComponentStatus st = compStatusQuick(c);
     if (ver == st.currentVersion) {
         logMsgUi(c, L"已是当前版本 " + ver);
         return;
@@ -629,25 +653,33 @@ static void bootStartSet(bool on) {
 
 // ---- user PATH helpers (persist the portable node dir) ----
 
-static bool pathHasNode(std::wstring& path, bool& present) {
+enum class PathRead { Ok, Missing, Failed };
+
+// Read HKCU\Environment\Path. The three outcomes must stay distinct: treating
+// "read failed" as "empty PATH" made pathAddNode() write back a Path value
+// holding nothing but the node directory — i.e. wiping the user's PATH.
+static PathRead readUserPath(std::wstring& path, bool& present) {
     present = false;
     HKEY hk;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hk) != ERROR_SUCCESS)
-        return false;
+        return PathRead::Failed;
     DWORD type = REG_EXPAND_SZ;
-    wchar_t buf[32768] = {0};
-    DWORD size = sizeof(buf);
-    LONG r = RegQueryValueExW(hk, L"Path", nullptr, &type, (LPBYTE)buf, &size);
-    if (r != ERROR_SUCCESS) { RegCloseKey(hk); path.clear(); return true; }
-    path = buf;
+    std::vector<wchar_t> buf(32768, L'\0');
+    DWORD size = (DWORD)(buf.size() * sizeof(wchar_t));
+    LONG r = RegQueryValueExW(hk, L"Path", nullptr, &type, (LPBYTE)buf.data(), &size);
     RegCloseKey(hk);
+    if (r == ERROR_FILE_NOT_FOUND) { path.clear(); return PathRead::Missing; }
+    if (r != ERROR_SUCCESS) { path.clear(); return PathRead::Failed; }
+    size_t len = 0;
+    while (len < buf.size() && buf[len]) ++len;
+    path.assign(buf.data(), len);
     std::wstring nodeDir = lowerStr(compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L"")));
     std::wstringstream ss(path);
     std::wstring item;
     while (std::getline(ss, item, L';')) {
         if (lowerStr(trimStr(item)) == nodeDir) { present = true; break; }
     }
-    return true;
+    return PathRead::Ok;
 }
 
 static void pathAddNode() {
@@ -657,9 +689,12 @@ static void pathAddNode() {
         return;
     }
     std::wstring path;
-    bool present;
-    if (!pathHasNode(path, present)) {
-        ovLogAppend(L"读取用户 PATH 失败，未加入 Node 目录");
+    bool present = false;
+    PathRead rd = readUserPath(path, present);
+    if (rd == PathRead::Failed) {
+        // Refuse to write: a half-read PATH must never become a whole new one.
+        ovLogAppend(L"读取用户 PATH 失败，未做修改（不会覆盖现有 PATH）");
+        logMsg(L"path", L"读取用户 PATH 失败，未加入 Node 目录");
         return;
     }
     if (present) {
@@ -687,9 +722,11 @@ static void pathAddNode() {
 static void pathRemoveNode() {
     std::wstring nodeDir = lowerStr(compBinDirVer(Comp::Nodejs, iniGet(L"ver.nodejs", L"")));
     std::wstring path;
-    bool present;
-    if (!pathHasNode(path, present)) {
-        ovLogAppend(L"读取用户 PATH 失败，未移除 Node 目录");
+    bool present = false;
+    PathRead rd = readUserPath(path, present);
+    if (rd != PathRead::Ok) {
+        ovLogAppend(rd == PathRead::Missing ? L"用户 PATH 不存在，无需移除"
+                                            : L"读取用户 PATH 失败，未做修改");
         return;
     }
     if (!present) {
@@ -1221,7 +1258,9 @@ static void pgOpInit() {
     std::wstring pwd = pgEditText(IDC_PG_PWD);
     std::wstring port = pgEditText(IDC_PG_PORT);
     if (port.empty()) port = L"5432";
-    ComponentStatus st = compStatus(Comp::Postgresql);
+    // Quick probe: compStatus() may spawn helper processes (redis-cli / pm2) and
+    // this runs on the UI thread, where a synchronous capture freezes the window.
+    ComponentStatus st = compStatusQuick(Comp::Postgresql);
     runAsync(Comp::Postgresql, L"初始化数据库", [st, user, pwd, port](std::wstring& err) {
         return pgInit(Comp::Postgresql, st.currentVersion, user, pwd, port, err);
     });
@@ -1593,14 +1632,16 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     // before multiplying (postgresql zips are ~300MB)
                     int pct = (int)((__int64)done * 100 / total);
                     SendMessageW(st->progress, PBM_SETPOS, pct, 0);
-                    wchar_t buf[64];
-                    swprintf(buf, 64, L"%s  %s  %u%%", st->stage.c_str(), st->curName.c_str(), pct);
+                    wchar_t buf[96];
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s  %s  %u%%",
+                                 st->stage.c_str(), st->curName.c_str(), pct);
                     SetWindowTextW(st->statusTxt, buf);
                 } else {
                     int pct = (int)((done / 1024) % 100);
                     SendMessageW(st->progress, PBM_SETPOS, pct, 0);
-                    wchar_t buf[64];
-                    swprintf(buf, 64, L"%s  %s  %u KB", st->stage.c_str(), st->curName.c_str(), done / 1024);
+                    wchar_t buf[96];
+                    _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s  %s  %u KB",
+                                 st->stage.c_str(), st->curName.c_str(), done / 1024);
                     SetWindowTextW(st->statusTxt, buf);
                 }
             }
@@ -1619,11 +1660,14 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     SetWindowTextW(st->statusTxt, L"安装完成");
                     dlPopulate(*st);
                     ovLogAppend(L"组件下载安装完成: " + st->curName);
-                    // refresh main window version combos
-                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Nodejs, 0);
-                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Postgresql, 0);
-                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Nginx, 0);
-                    if (g_main) PostMessageW(g_main, WM_OP_DONE, (WPARAM)Comp::Redis, 0);
+                    // Refresh the version combos. This used to borrow WM_OP_DONE,
+                    // whose job is to clear a component's busy flag — posting it
+                    // here force-cleared all four components and re-enabled their
+                    // buttons while a real start/stop was still running. Just ask
+                    // the pollers for fresh data instead.
+                    refreshOverview();
+                    kickStatusPoll();
+                    kickPm2Poll();
                 } else {
                     SetWindowTextW(st->statusTxt, (L"失败: " + err).c_str());
                     ovLogAppend(L"组件下载失败: " + st->curName + L" (" + err + L")");
@@ -1785,7 +1829,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
                 case IDC_BTN_DATA: {
                     if (sender == Comp::Count) break;
-                    ComponentStatus st = compStatus(sender);
+                    // Quick probe — this is a UI-thread handler and compStatus()
+                    // can block for seconds behind a helper process.
+                    ComponentStatus st = compStatusQuick(sender);
                     if (st.installed) {
                         std::wstring dir = compDataVerDir(sender, st.currentVersion);
                         makeDirs(dir);
