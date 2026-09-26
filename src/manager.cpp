@@ -1248,14 +1248,7 @@ static const wchar_t* DEFAULT_NGINX_CONF =
     L"    access_log logs/access.log;\r\n"
     L"    error_log  logs/error.log;\r\n"
     L"\r\n"
-    L"    server {\r\n"
-    L"        listen       {{PORT}};\r\n"
-    L"        server_name  localhost;\r\n"
-    L"        location / {\r\n"
-    L"            root   {{WWW_DIR}};\r\n"
-    L"            index  index.html index.htm;\r\n"
-    L"        }\r\n"
-    L"    }\r\n"
+    L"{{DENY_UNKNOWN}}\r\n"
     L"    include vhosts/*.conf;\r\n"
     L"}\r\n";
 
@@ -1278,6 +1271,75 @@ static const wchar_t* DEFAULT_PG_APPEND =
     L"listen_addresses = '127.0.0.1'\r\n"
     L"port = {{PORT}}\r\n"
     L"max_connections = 100\r\n";
+
+// The catch-all server blocks that live where the {{DENY_UNKNOWN}} placeholder
+// is, i.e. inside http{} and before "include vhosts/*.conf".
+//
+// blockUnknown = true: every request whose Host / SNI matches no site is
+// refused, so a direct-IP visit or a typo'd domain no longer lands on whatever
+// happens to be first.
+//   - :80  -> a plain HTTP 500.
+//   - :443 -> refused during the TLS handshake (ssl_reject_handshake, nginx
+//     >= 1.19.4). This is deliberately NOT `return 500` with a certificate:
+//     a catch-all presenting a real cert only produces a certificate-mismatch
+//     warning in front of the 500, which is worse for a human than a clean
+//     handshake failure, and it would hand the block a key to protect.
+// blockUnknown = false: the previous behaviour (a localhost-only site), kept as
+// the escape hatch — nginx.block_unknown_host in settings.ini turns the whole
+// thing off with one ini edit.
+//
+// Public so the unit tests can assert both renderings.
+std::wstring nginxDenyBlock(bool blockUnknown) {
+    if (!blockUnknown) {
+        return
+            L"    # nginx.block_unknown_host = false：只保留本机 localhost 站点。\r\n"
+            L"    # 注意 :80 上第一个 server 块仍是隐式兜底，未匹配域名会命中这里。\r\n"
+            L"    server {\r\n"
+            L"        listen       80;\r\n"
+            L"        server_name  localhost;\r\n"
+            L"        location / {\r\n"
+            L"            root   ../../../www;\r\n"
+            L"            index  index.html index.htm;\r\n"
+            L"        }\r\n"
+            L"    }\r\n";
+    }
+    return
+        L"    # ---- 拒绝 IP 直连与未配置的域名（nginx.block_unknown_host=true）----\r\n"
+        L"    server {\r\n"
+        L"        listen       80 default_server;\r\n"
+        L"        server_name  _;\r\n"
+        L"        return 500;\r\n"
+        L"    }\r\n"
+        L"    server {\r\n"
+        L"        listen       443 ssl default_server;\r\n"
+        L"        server_name  _;\r\n"
+        L"        # 握手阶段就拒绝：不需要证书，也不暴露任何站点信息\r\n"
+        L"        ssl_reject_handshake on;\r\n"
+        L"    }\r\n";
+}
+
+// A site that claims default_server becomes the implicit catch-all for its
+// port, which is exactly what this feature removes. It also collides with the
+// blocks above ("a duplicate default server for 0.0.0.0:443" and nginx then
+// refuses to start). nginx -t only names the port, never the file, so name it.
+static void reportVhostDefaultServers() {
+    static const wchar_t* kMarker = L"default_server";
+    std::wstring dir = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    for (auto& f : listFiles(dir, L"conf")) {
+        if (f.rfind(L"_template", 0) == 0) continue;
+        std::wstring content = readFileText(joinPath(dir, f));
+        size_t pos = 0;
+        while ((pos = content.find(kMarker, pos)) != std::wstring::npos) {
+            size_t lineNo = 1;
+            for (size_t i = 0; i < pos && i < content.size(); ++i)
+                if (content[i] == L'\n') ++lineNo;
+            logMsg(L"nginx", L"站点配置 etc\\nginx\\vhosts\\" + f + L" 第 " +
+                             std::to_wstring(lineNo) + L" 行含 default_server：它会让 IP/未配置"
+                             L"域名命中该站点，并与兜底 server 冲突导致 nginx 启动失败，请删除该关键字");
+            pos += wcslen(kMarker);
+        }
+    }
+}
 
 static const wchar_t* DEFAULT_VHOST =
     L"server {\r\n"
@@ -1340,6 +1402,10 @@ bool genNginxConfig(const std::wstring& ver) {
     std::wstring tpl = readFileText(joinPath(compEtcDir(Comp::Nginx), L"nginx.conf.tpl"));
     if (tpl.empty()) tpl = DEFAULT_NGINX_CONF;
 
+    // Unknown domains / direct-IP access are refused unless the user turned the
+    // block off. Read the toggle the same way every other "true" flag is read.
+    bool blockUnknown = lowerStr(iniGet(L"nginx.block_unknown_host", L"true")) != L"false";
+
     std::map<std::wstring, std::wstring> kv;
     kv[L"PORT"] = nginxPort();
     // nginx runs with -p <data>\nginx\<ver>; use relative paths so the whole
@@ -1347,8 +1413,19 @@ bool genNginxConfig(const std::wstring& ver) {
     // <prefix>\conf by genNginxConfig above, so it resolves relative to prefix)
     kv[L"WWW_DIR"] = L"../../../www";
     kv[L"MIME"] = L"mime.types";
+    kv[L"DENY_UNKNOWN"] = nginxDenyBlock(blockUnknown);
 
     std::wstring conf = renderTemplate(tpl, kv);
+    // A template saved before this feature has no {{DENY_UNKNOWN}} placeholder,
+    // and the catch-all would then silently never appear — the server would stay
+    // wide open with no error anywhere. nginx -t cannot catch that, so say so.
+    if (blockUnknown && conf.find(L"default_server") == std::wstring::npos) {
+        logMsg(L"nginx", L"etc\\nginx\\nginx.conf.tpl 里没有 {{DENY_UNKNOWN}} 占位符，"
+                         L"拒绝 IP 直连/未配置域名的兜底 server 块没有生成，nginx 仍会对"
+                         L"未知域名开放。请在该模板的 http { } 内、include vhosts/*.conf 之前"
+                         L"加一行 {{DENY_UNKNOWN}}");
+    }
+    reportVhostDefaultServers();
     if (!writeFileText(joinPath(prefix, L"conf\\nginx.conf"), conf)) return false;
 
     // copy vhost configs from etc into runtime prefix (skip _template.conf)

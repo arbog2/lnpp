@@ -37,6 +37,7 @@ lnpp.exe
 - 各组件启动/停止，状态灯实时显示
 - 版本切换（自动重启 + 重新生成配置）
 - nginx：可视化添加/删除虚拟站点（写 etc\nginx\vhosts\），支持 HTTPS（证书 + key），www\ 下自动建目录
+- nginx：**拒绝 IP 直连与未配置域名**——主配置里有一对 `default_server` 兜底块（见下）
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）
 - Node.js：pm2 进程列表实时监控，支持重启/停止；一键将当前 Node 版本加入/移除用户 PATH
 - pm2 守护进程加固：所有 pm2 操作先校验守护进程存活（校验 `pm2.pid` 的进程镜像，避免 PID 复用误判），只读命令在守护进程不在时不调用 pm2；写入命令遇到 `rpc.sock` 握手失败（`EPERM`/`EPIPE`，通常由守护进程被强制结束、`pm2.pid` 残留引起）会自动等待并重试一次，仍失败时给出可操作提示而不是原始堆栈
@@ -84,6 +85,39 @@ build.bat debug      # 产出 lnpp_dbg.exe（/Od /Zi /D_DEBUG），用于调试
 `unittests` 覆盖 `renderTemplate`、`packages.conf` 语法、`pkgsNameToCompVer`（含路径穿越
 拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一
 文件）、DPAPI 加解密往返、文件编码。所有临时文件都在 `%TEMP%` 并自动清理。
+
+## 拒绝 IP 直连与未配置域名
+
+多个域名共存时，浏览器直接输 IP、或输一个没配置的域名，请求原本会落到「端口上第一个
+server 块」——也就是某个业务站点。现在由主配置里的一对兜底块接管：
+
+```nginx
+server {                                  # :80  未匹配的 Host
+    listen       80 default_server;
+    server_name  _;
+    return 500;
+}
+server {                                  # :443 未匹配的 SNI
+    listen       443 ssl default_server;
+    server_name  _;
+    ssl_reject_handshake on;              # 握手阶段拒绝，不需要证书
+}
+```
+
+- **站点永远不要写 `default_server`**。它会让未知域名命中该站点，而且和上面的兜底块
+  冲突，nginx 会直接报 `a duplicate default server for 0.0.0.0:443` 而起不来。
+  模板 `_template_https.conf` 已去掉该关键字；管理器每次生成配置时会扫描
+  `etc\nginx\vhosts\*.conf`，发现 `default_server` 就在 `logs\lnpp.log` 里点名是哪个文件第几行。
+- **443 上拿不到 HTTP 500**，这是有意的：`ssl_reject_handshake` 在 TLS 握手阶段就拒绝，
+  不需要给兜底块配证书。真给兜底块挂证书，浏览器只会先弹证书域名不匹配，点「继续」之后
+  才看到 500——比干脆利落地拒绝更糟。curl 上表现为连接失败（`%{http_code}` = 000）。
+- 兜底块固定占用 80 / 443，但这**不算端口冲突**：站点和兜底块靠 Host / SNI 区分，
+  站点照常可以放在 80 / 443 上。
+- **一键回退**：在 `data\settings.ini` 里写 `nginx.block_unknown_host=false`，重启管理器即
+  恢复成「只保留 `http://localhost/` 本机站点」的老行为。
+- 自定义过 `etc\nginx\nginx.conf.tpl` 的话，模板里必须有一行 `{{DENY_UNKNOWN}}`（放在
+  `http { }` 内、`include vhosts/*.conf;` 之前）。没有这一行兜底块不会生成，而且不会
+  报错——管理器会在 `logs\lnpp.log` 里明确提示。
 
 ## 说明
 

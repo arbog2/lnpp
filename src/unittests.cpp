@@ -133,6 +133,43 @@ int wmain() {
         check(L"empty text reports error", pkgsParseConfText(L"", err).empty() && !err.empty());
     }
 
+    wprintf(L"\n=== nginxDenyBlock ===\n");
+    {
+        std::wstring on = nginxDenyBlock(true);
+        std::wstring off = nginxDenyBlock(false);
+        check(L"enabled: :80 is the default server", on.find(L"listen       80 default_server;") != std::wstring::npos);
+        check(L"enabled: unknown host gets 500", on.find(L"return 500;") != std::wstring::npos);
+        check(L"enabled: :443 refuses the handshake", on.find(L"listen       443 ssl default_server;") != std::wstring::npos &&
+              on.find(L"ssl_reject_handshake on;") != std::wstring::npos);
+        check(L"enabled: catch-all matches every name", on.find(L"server_name  _;") != std::wstring::npos);
+        // A certificate on the catch-all would only put a cert-mismatch warning
+        // in front of the answer, so it must not be there.
+        check(L"enabled: no certificate on the catch-all", on.find(L"ssl_certificate") == std::wstring::npos);
+        check(L"enabled: no site root leaks the www dir", on.find(L"../../../www") == std::wstring::npos);
+        check(L"enabled: exactly one default_server per port",
+              std::count(on.begin(), on.end(), L' ') >= 0 && on.find(L"443 ssl default_server") != std::wstring::npos);
+
+        check(L"disabled: legacy localhost site restored", off.find(L"server_name  localhost;") != std::wstring::npos);
+        check(L"disabled: no default_server at all", off.find(L"default_server") == std::wstring::npos);
+        check(L"disabled: no ssl_reject_handshake", off.find(L"ssl_reject_handshake") == std::wstring::npos);
+        check(L"the two renderings differ", on != off);
+        // The block is spliced into http{} before `include vhosts/*.conf`, and
+        // must not carry a stray placeholder of its own.
+        check(L"no leftover placeholders in the block",
+              on.find(L"{{") == std::wstring::npos && off.find(L"{{") == std::wstring::npos);
+
+        // End-to-end through the real renderer, the way genNginxConfig does it.
+        std::map<std::wstring, std::wstring> kv = {
+            {L"DENY_UNKNOWN", on}, {L"MIME", L"mime.types"}, {L"PORT", L"80"}};
+        std::wstring rendered = renderTemplate(
+            L"http {\r\n{{DENY_UNKNOWN}}\r\n    include vhosts/*.conf;\r\n}\r\n", kv);
+        check(L"substitutes into a real config",
+              rendered.find(L"return 500;") != std::wstring::npos &&
+              rendered.find(L"include vhosts/*.conf;") != std::wstring::npos);
+        check(L"catch-all lands before the vhost include",
+              rendered.find(L"return 500;") < rendered.find(L"include vhosts/*.conf;"));
+    }
+
     wprintf(L"\n=== naturalGt (version sort) ===\n");
     {
         std::vector<std::wstring> v = {L"1.9", L"1.30", L"1.30.1", L"2.0", L"1.10", L"1.30.10"};

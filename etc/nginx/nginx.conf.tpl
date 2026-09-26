@@ -15,14 +15,7 @@ http {
     access_log logs/access.log;
     error_log  logs/error.log;
 
-    server {
-        listen       {{PORT}};
-        server_name  localhost;
-        location / {
-            root   {{WWW_DIR}};
-            index  index.html index.htm;
-        }
-    }
+{{DENY_UNKNOWN}}
 
     include vhosts/*.conf;
 }

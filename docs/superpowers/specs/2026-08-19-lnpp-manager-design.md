@@ -14,6 +14,10 @@
 >
 > 另外 PG 迁移现在会在成功后把旧的 `data\postgresql\<版本>.old-*` 副本移入回收站
 > （默认保留最近 2 份），§6 第 6 步「旧 data 目录保留」已不再无限保留。
+>
+> §4 描述的「主配置里那个 `server_name localhost` 的 www 站点」已被一对
+> `default_server` 兜底块取代（拒绝 IP 直连与未配置域名，80 返 500、443 握手拒绝），
+> 见 README「拒绝 IP 直连与未配置域名」与 `settings.ini` 的 `nginx.block_unknown_host`。
 
 ## 1. 目标
 

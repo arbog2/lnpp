@@ -104,6 +104,13 @@ bool nodePm2Resurrect(std::wstring& err);
 
 // ---- Config generation ----
 bool genNginxConfig(const std::wstring& ver);
+// The catch-all server blocks substituted into the {{DENY_UNKNOWN}} placeholder
+// of etc\nginx\nginx.conf.tpl. blockUnknown=true refuses every request whose
+// Host / SNI matches no site (:80 -> 500, :443 -> TLS handshake refusal);
+// false restores the old localhost-only site. Toggled by the
+// nginx.block_unknown_host setting so a mistake is one ini edit away from being
+// undone. Public for unit tests.
+std::wstring nginxDenyBlock(bool blockUnknown);
 bool genRedisConfig(const std::wstring& ver);
 bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir);
 
