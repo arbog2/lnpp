@@ -66,6 +66,40 @@ build.bat debug      # 产出 lnpp_dbg.exe（/Od /Zi /D_DEBUG），用于调试
 
 输出 `lnpp.exe` 到仓库根目录（exe 所在目录即运行时根目录）。
 
+## 发布打包
+
+```
+package.bat              # 编译 + 打包，版本号自动取自 app.rc 的 FILEVERSION
+package.bat 1.5.3        # 指定版本号（不改 app.rc）
+package.bat /nobuild     # 不编译，用现有 lnpp.exe
+```
+
+产出 `dist\LNPP-<版本>.zip`（约 291 KB），内含：
+
+```
+LNPP-1.5.2/
+  lnpp.exe
+  README.md
+  packages.conf.example
+  etc\nginx\nginx.conf.tpl
+  etc\nginx\vhosts\_template.conf
+  etc\nginx\vhosts\_template_https.conf
+  etc\postgresql\postgresql.conf.append
+  etc\redis\redis.conf.tpl
+  www\.gitkeep
+```
+
+**按设计不包含**：`bin\`（组件二进制，几 GB，由用户自带或用下载器装）、`data\`
+（含 DPAPI 加密的库口令）、`logs\`、`backup\`（数据库 dump）、`ssl\`（私钥）、
+`etc\nginx\vhosts\` 下的用户站点配置（内网域名、绝对路径）。
+
+打包走白名单逐个拷贝，压缩前再核验一遍暂存目录：发现上述任一项就中止报错。删除暂存
+目录前会检查目录内的 `.lnpp-stage` 标记，标记不对就拒绝删除。
+
+解压即用：`lnpp.exe` 只依赖 11 个系统 DLL（`/MT` 静态 CRT，**不需要**装 VC 运行库），
+所有路径相对 exe 推导，绿色免安装。首次启动时 `bin\` 为空会自动弹出组件下载器——
+需要把包里的 `packages.conf.example` 改名成 `packages.conf` 并填入 https 下载源。
+
 ## 测试
 
 测试分两类，**请先看清再跑**：

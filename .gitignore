@@ -1,5 +1,6 @@
 # build / runtime artifacts
 build/
+dist/
 *.exe
 *.obj
 *.res
