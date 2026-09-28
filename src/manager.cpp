@@ -1,4 +1,5 @@
 #include "manager.h"
+#include "downloader.h"
 #include <tlhelp32.h>
 
 // ============================ Path helpers ============================
@@ -55,6 +56,64 @@ static std::recursive_mutex g_compOpMtx[(int)Comp::Count];
 // threads read (nginx -t, redis-server, postgres) and can append to
 // postgresql.conf, so two overlapping runs are never what we want.
 static std::mutex g_genCfgMtx;
+
+// ============================ Runtime layout ============================
+// The layout rule: etc\ carries templates only, data\ carries everything the
+// program actually runs on. Called once from WinMain before any window exists.
+
+// v1.5.3 moved the per-site vhost files out of etc\ (which now holds templates
+// only) into data\. Migrate an existing set across so nobody silently loses
+// their sites after upgrading.
+static int migrateVhostSourceToData() {
+    std::wstring from = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    std::wstring to = nginxVhostSourceDir();
+    std::vector<std::wstring> stale;
+    for (auto& f : listFiles(from, L"conf")) {
+        if (f.rfind(L"_template", 0) == 0) continue;   // templates belong in etc
+        stale.push_back(f);
+    }
+    if (stale.empty()) return 0;
+    if (!makeDirs(to)) {
+        logMsg(L"init", L"无法创建站点配置目录: " + to);
+        return 0;
+    }
+    int moved = 0;
+    for (auto& f : stale) {
+        std::wstring src = joinPath(from, f);
+        std::wstring dst = joinPath(to, f);
+        if (fileExists(dst)) continue;                 // never clobber
+        if (!copyFileW2(src, dst)) {
+            logMsg(L"init", L"迁移站点配置失败（已保留原文件）: " + src);
+            continue;
+        }
+        // Only remove the original once the copy is confirmed byte-for-byte
+        // readable, so etc\ ends up holding templates only as promised.
+        if (readFileText(dst).empty() && !readFileText(src).empty()) {
+            logMsg(L"init", L"站点配置复制后校验失败（已保留原文件）: " + src);
+            continue;
+        }
+        DeleteFileW(src.c_str());
+        ++moved;
+    }
+    return moved;
+}
+
+void prepareRuntimeLayout() {
+    // data\ is created if missing - everything the program runs on lives there.
+    if (!makeDirs(dataDir())) {
+        logMsg(L"init", L"无法创建数据目录: " + dataDir());
+    }
+    // Download list: data\packages.conf seeded from etc\packages.conf.tpl.
+    prepareDownloadList();
+    // Site configs: move etc\nginx\vhosts\*.conf into data\nginx\vhosts\.
+    if (!makeDirs(nginxVhostSourceDir()))
+        logMsg(L"init", L"无法创建站点配置目录: " + nginxVhostSourceDir());
+    int moved = migrateVhostSourceToData();
+    if (moved > 0) {
+        logMsg(L"init", L"已把 " + std::to_wstring(moved) + L" 个站点配置从 etc\\nginx\\vhosts 迁移到 " +
+                         nginxVhostSourceDir());
+    }
+}
 
 // ============================ Component discovery ============================
 
@@ -1318,13 +1377,24 @@ std::wstring nginxDenyBlock(bool blockUnknown) {
         L"    }\r\n";
 }
 
+// ---- nginx vhost source ----
+// etc\ holds templates only. The per-site vhost files a user creates and edits
+// are runtime configuration, so their source of truth now lives under data\
+// next to the rest of nginx's state. genNginxConfig copies them into each
+// version's runtime prefix (data\nginx\<ver>\conf\vhosts) because the
+// "include vhosts/*.conf" in nginx.conf resolves relative to that prefix.
+// (Declared in manager.h because prepareRuntimeLayout() needs it early.)
+std::wstring nginxVhostSourceDir() {
+    return joinPath(compDataDir(Comp::Nginx), L"vhosts");
+}
+
 // A site that claims default_server becomes the implicit catch-all for its
 // port, which is exactly what this feature removes. It also collides with the
 // blocks above ("a duplicate default server for 0.0.0.0:443" and nginx then
 // refuses to start). nginx -t only names the port, never the file, so name it.
 static void reportVhostDefaultServers() {
     static const wchar_t* kMarker = L"default_server";
-    std::wstring dir = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    std::wstring dir = nginxVhostSourceDir();
     for (auto& f : listFiles(dir, L"conf")) {
         if (f.rfind(L"_template", 0) == 0) continue;
         std::wstring content = readFileText(joinPath(dir, f));
@@ -1333,7 +1403,7 @@ static void reportVhostDefaultServers() {
             size_t lineNo = 1;
             for (size_t i = 0; i < pos && i < content.size(); ++i)
                 if (content[i] == L'\n') ++lineNo;
-            logMsg(L"nginx", L"站点配置 etc\\nginx\\vhosts\\" + f + L" 第 " +
+            logMsg(L"nginx", L"站点配置 " + dir + L"\\" + f + L" 第 " +
                              std::to_wstring(lineNo) + L" 行含 default_server：它会让 IP/未配置"
                              L"域名命中该站点，并与兜底 server 冲突导致 nginx 启动失败，请删除该关键字");
             pos += wcslen(kMarker);
@@ -1428,15 +1498,22 @@ bool genNginxConfig(const std::wstring& ver) {
     reportVhostDefaultServers();
     if (!writeFileText(joinPath(prefix, L"conf\\nginx.conf"), conf)) return false;
 
-    // copy vhost configs from etc into runtime prefix (skip _template.conf)
-    std::wstring srcVhost = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    // copy the user's site configs into the runtime prefix. The source of truth
+    // is data\nginx\vhosts (etc\ keeps templates only); each nginx version has
+    // its own runtime prefix because "include vhosts/*.conf" resolves relative
+    // to the -p prefix.
+    std::wstring srcVhost = nginxVhostSourceDir();
+    if (!makeDirs(srcVhost)) {
+        logMsg(L"nginx", L"无法创建站点配置目录: " + srcVhost);
+    }
     // clear stale runtime vhosts first
     for (auto& f : listFiles(vhostDir, L"conf")) {
         DeleteFileW(joinPath(vhostDir, f).c_str());
     }
     for (auto& f : listFiles(srcVhost, L"conf")) {
-        if (f == L"_template.conf" || f == L"_template_https.conf") continue;
-        copyFileW2(joinPath(srcVhost, f), joinPath(vhostDir, f));
+        if (f.rfind(L"_template", 0) == 0) continue;
+        if (!copyFileW2(joinPath(srcVhost, f), joinPath(vhostDir, f)))
+            logMsg(L"nginx", L"复制站点配置失败: " + f);
     }
     return true;
 }
@@ -1555,7 +1632,7 @@ bool nginxReload(std::wstring& err) {
 
 std::vector<VHost> nginxListVHosts() {
     std::vector<VHost> result;
-    std::wstring dir = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    std::wstring dir = nginxVhostSourceDir();
     for (auto& f : listFiles(dir, L"conf")) {
         if (f == L"_template.conf" || f == L"_template_https.conf") continue;
         VHost v;
@@ -1651,7 +1728,7 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
             }
         }
     }
-    std::wstring vhostDir = joinPath(compEtcDir(Comp::Nginx), L"vhosts");
+    std::wstring vhostDir = nginxVhostSourceDir();
     if (!makeDirs(vhostDir)) { err = L"无法创建 vhosts 目录"; return false; }
 
     // site root: user-provided path, or the app-managed www\<name>
@@ -1694,7 +1771,7 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
     }
 
     // A failure from here on must not leave the site config behind:
-    // genNginxConfig() copies every etc\nginx\vhosts\*.conf into the runtime
+    // genNginxConfig() copies every data\nginx\vhosts\*.conf into the runtime
     // prefix on each start, so one file that fails "nginx -t" would make every
     // later start / reload / version switch fail too, with no hint about which
     // site is broken.
@@ -1728,11 +1805,11 @@ bool nginxAddVHost(const std::wstring& name, const std::wstring& domain,
 bool nginxRemoveVHost(const std::wstring& name, std::wstring& err) {
     if (name.empty()) { err = L"站点名为空"; return false; }
     // Same name rules as add: reject path characters so a crafted name can
-    // never point the delete outside etc\nginx\vhosts.
+    // never point the delete outside data\nginx\vhosts.
     if (name[0] == L'_' || name.find_first_of(L"\\/:. *?\"<>|") != std::wstring::npos) {
         err = L"站点名含非法字符"; return false;
     }
-    std::wstring file = joinPath(joinPath(compEtcDir(Comp::Nginx), L"vhosts"), name + L".conf");
+    std::wstring file = joinPath(nginxVhostSourceDir(), name + L".conf");
     if (!fileExists(file)) { err = L"站点不存在: " + name; return false; }
     if (!DeleteFileW(file.c_str())) { err = L"删除文件失败"; return false; }
     if (!nginxReload(err)) return false;

@@ -4,19 +4,46 @@ Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / r
 
 ## 目录结构
 
+**`etc\` 只放模板，`data\` 放一切运行时状态。** 这是本项目的硬性约定：凡是需要用户
+编辑、或由程序写出的文件，一律在 `data\`；`etc\` 里的东西随发布包分发、只读。
+
 ```
 lnpp.exe
-├── bin\              # 组件二进制（每个组件下按版本分子目录）
-│   ├── nodejs\v24\   # 手动拷贝 node.exe、npm 等
-│   ├── nginx\1.30\   # 手动拷贝 nginx.exe、conf 等
-│   ├── postgresql\17\# 手动拷贝整个 zip 解压目录（含 bin\）
-│   └── redis\5.0\    # 手动拷贝 redis-server.exe、redis-cli.exe
-├── etc\              # 配置模板（程序启动时据此生成运行时配置）
-├── data\             # 运行时数据（postgresql 数据库目录按版本分目录）
-├── backup\           # 数据库备份（pg_dumpall 输出，时间戳命名）
-├── logs\             # 运行日志
-└── www\              # nginx 站点根目录
+├── bin\                      # 组件二进制（每个组件下按版本分子目录）
+│   ├── nodejs\<版本>\         # 手动拷贝 node.exe、npm 等
+│   ├── nginx\<版本>\          # 手动拷贝 nginx.exe、conf\mime.types 等
+│   ├── postgresql\<版本>\     # 手动拷贝整个 zip 解压目录（含 bin\）
+│   └── redis\<版本>\          # 手动拷贝 redis-server.exe、redis-cli.exe
+├── etc\                      # ← 只放模板，随包分发、只读
+│   ├── nginx\nginx.conf.tpl
+│   ├── nginx\vhosts\_template.conf
+│   ├── nginx\vhosts\_template_https.conf
+│   ├── postgresql\postgresql.conf.append
+│   ├── redis\redis.conf.tpl
+│   └── packages.conf.tpl     # 组件下载源模板
+├── data\                     # ← 全部运行时状态，缺失时首次运行自动创建
+│   ├── settings.ini          # 版本选择、端口、DPAPI 加密的库口令
+│   ├── packages.conf         # 组件下载列表（首次运行由 etc 模板生成，可编辑）
+│   ├── nginx\
+│   │   ├── vhosts\*.conf     # 站点配置（用户数据；在总览/站点页增删）
+│   │   └── <版本>\           # 该版本的运行配置 conf\nginx.conf + conf\vhosts\
+│   ├── postgresql\<版本>\    # 数据目录 + postgresql.conf
+│   └── redis\<版本>\         # redis.conf + 数据
+├── backup\                   # 数据库备份（pg_dumpall 输出，时间戳命名）
+├── logs\                     # 运行日志
+├── ssl\                      # TLS 证书与私钥
+└── www\                      # nginx 站点根目录
 ```
+
+**首次运行**若 `data\` 不存在会自动创建，同时：
+
+1. 从 `etc\packages.conf.tpl` 生成 `data\packages.conf`（组件下载源列表，可直接改）；
+2. 把旧的 `etc\nginx\vhosts\*.conf` 站点配置迁到 `data\nginx\vhosts\`（v1.5.3 之前
+   站点配置和模板混在 `etc\` 里）。迁移完成后 `etc\` 只剩模板，文件内容逐字节保留。
+
+站点配置的**源目录**是 `data\nginx\vhosts\`，启动时再复制到每个版本的运行前缀
+（`data\nginx\<版本>\conf\vhosts\`）——因为 nginx 的 `include vhosts/*.conf` 是相对
+`-p` 前缀解析的。手工改配置请改 `data\nginx\vhosts\` 下的文件。
 
 ## 手动拷贝组件
 
@@ -36,12 +63,12 @@ lnpp.exe
 - 总览页：三态状态灯（灰=未安装 / 红=已停止 / 绿=运行中）、单组件启动/停止、全部启动/重启/停止
 - 各组件启动/停止，状态灯实时显示
 - 版本切换（自动重启 + 重新生成配置）
-- nginx：可视化添加/删除虚拟站点（写 etc\nginx\vhosts\），支持 HTTPS（证书 + key），www\ 下自动建目录
+- nginx：可视化添加/删除虚拟站点（写 data\nginx\vhosts\），支持 HTTPS（证书 + key），www\ 下自动建目录
 - nginx：**拒绝 IP 直连与未配置域名**——主配置里有一对 `default_server` 兜底块（见下）
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）
 - Node.js：pm2 进程列表实时监控，支持重启/停止；一键将当前 Node 版本加入/移除用户 PATH
 - pm2 守护进程加固：所有 pm2 操作先校验守护进程存活（校验 `pm2.pid` 的进程镜像，避免 PID 复用误判），只读命令在守护进程不在时不调用 pm2；写入命令遇到 `rpc.sock` 握手失败（`EPERM`/`EPIPE`，通常由守护进程被强制结束、`pm2.pid` 残留引起）会自动等待并重试一次，仍失败时给出可操作提示而不是原始堆栈
-- 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `packages.conf`（仓库提供 `packages.conf.example`，复制改名后按需增删），下载完成后自动解压到 bin\<组件>\<版本>
+- 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `data\packages.conf`（首次运行由 `etc\packages.conf.tpl` 生成，可直接改），下载完成后自动解压到 bin\<组件>\<版本>
 - 常驻托盘：关闭按钮只最小化到托盘（组件继续运行），退出请用托盘右键菜单「退出」
 - 随管理器自动启动（总开关 + 每组件勾选）、随 Windows 开机启动（`--hidden` 直接最小化到托盘）
 - 总览页右下角：版本号 + 「关于」弹窗（作者、可点击 GitHub 链接）
@@ -80,25 +107,28 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 LNPP-1.5.2/
   lnpp.exe
   README.md
-  packages.conf.example
   etc\nginx\nginx.conf.tpl
   etc\nginx\vhosts\_template.conf
   etc\nginx\vhosts\_template_https.conf
+  etc\packages.conf.tpl
   etc\postgresql\postgresql.conf.append
   etc\redis\redis.conf.tpl
   www\.gitkeep
 ```
 
+包里的 `etc\` **只有模板**——`etc\nginx\vhosts\` 里连用户的站点配置都没有，因此打包时
+不可能误带内网域名、绝对路径或证书。
+
 **按设计不包含**：`bin\`（组件二进制，几 GB，由用户自带或用下载器装）、`data\`
-（含 DPAPI 加密的库口令）、`logs\`、`backup\`（数据库 dump）、`ssl\`（私钥）、
-`etc\nginx\vhosts\` 下的用户站点配置（内网域名、绝对路径）。
+（运行配置、`settings.ini` 里的 DPAPI 加密库口令、站点配置）、`logs\`、`backup\`
+（数据库 dump）、`ssl\`（私钥）。
 
 打包走白名单逐个拷贝，压缩前再核验一遍暂存目录：发现上述任一项就中止报错。删除暂存
 目录前会检查目录内的 `.lnpp-stage` 标记，标记不对就拒绝删除。
 
 解压即用：`lnpp.exe` 只依赖 11 个系统 DLL（`/MT` 静态 CRT，**不需要**装 VC 运行库），
 所有路径相对 exe 推导，绿色免安装。首次启动时 `bin\` 为空会自动弹出组件下载器——
-需要把包里的 `packages.conf.example` 改名成 `packages.conf` 并填入 https 下载源。
+首次运行会从 `etc\packages.conf.tpl` 自动生成 `data\packages.conf`，改那里的 https 源即可。
 
 ## 测试
 
@@ -141,7 +171,7 @@ server {                                  # :443 未匹配的 SNI
 - **站点永远不要写 `default_server`**。它会让未知域名命中该站点，而且和上面的兜底块
   冲突，nginx 会直接报 `a duplicate default server for 0.0.0.0:443` 而起不来。
   模板 `_template_https.conf` 已去掉该关键字；管理器每次生成配置时会扫描
-  `etc\nginx\vhosts\*.conf`，发现 `default_server` 就在 `logs\lnpp.log` 里点名是哪个文件第几行。
+  `data\nginx\vhosts\*.conf`，发现 `default_server` 就在 `logs\lnpp.log` 里点名是哪个文件第几行。
 - **443 上拿不到 HTTP 500**，这是有意的：`ssl_reject_handshake` 在 TLS 握手阶段就拒绝，
   不需要给兜底块配证书。真给兜底块挂证书，浏览器只会先弹证书域名不匹配，点「继续」之后
   才看到 500——比干脆利落地拒绝更糟。curl 上表现为连接失败（`%{http_code}` = 000）。

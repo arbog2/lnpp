@@ -2129,6 +2129,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     // that would otherwise hang the window for 30s+.
     registerUiThread(GetCurrentThreadId());
 
+    // Layout before anything else touches a path: create data\ when missing,
+    // seed the download list from the etc\ template, and move per-site vhost
+    // files out of etc\ (templates only) into data\.
+    prepareRuntimeLayout();
+
     INITCOMMONCONTROLSEX icc = {0};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_WIN95_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;

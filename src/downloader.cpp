@@ -6,10 +6,46 @@
 
 // ============================ conf parsing ============================
 
-static std::wstring pkgsConfPath() { return joinPath(rootDir(), L"packages.conf"); }
+static std::wstring pkgsConfPath() { return pkgListPath(); }
 
 std::vector<PkgSection> pkgsParseConf(std::wstring& err) {
     return pkgsParseConfText(readFileText(pkgsConfPath()), err);
+}
+
+// First run: lay out data\ and create the working download list from the shipped
+// template. etc\ holds templates only, so data\packages.conf is what the user
+// edits; without this step the downloader opens on a fresh install with an empty
+// list and no obvious cause.
+//
+// Also picks up a pre-v1.5.3 install, where the list lived in the runtime root.
+void prepareDownloadList() {
+    if (!makeDirs(dataDir())) {
+        logMsg(L"init", L"无法创建数据目录: " + dataDir());
+        return;
+    }
+    std::wstring list = pkgListPath();
+    if (fileExists(list)) return;
+
+    std::wstring legacy = joinPath(rootDir(), L"packages.conf");
+    if (fileExists(legacy)) {
+        if (copyFileW2(legacy, list))
+            logMsg(L"init", L"已把旧的 packages.conf 迁移到 " + list);
+        return;
+    }
+    std::wstring tpl = pkgTemplatePath();
+    if (!fileExists(tpl)) {
+        logMsg(L"init", L"未找到下载列表模板 " + tpl + L"，组件下载器将不可用");
+        return;
+    }
+    std::wstring content = readFileText(tpl);
+    if (content.empty()) {
+        logMsg(L"init", L"下载列表模板为空: " + tpl);
+        return;
+    }
+    if (writeFileText(list, content))
+        logMsg(L"init", L"已由模板生成下载列表: " + list);
+    else
+        logMsg(L"init", L"生成下载列表失败: " + list);
 }
 
 // A version becomes a directory name (bin\<comp>\<ver>) and the entry name
@@ -38,7 +74,10 @@ static bool validEntryName(const std::wstring& s) {
 
 std::vector<PkgSection> pkgsParseConfText(const std::wstring& text, std::wstring& err) {
     std::vector<PkgSection> sections;
-    if (text.empty()) { err = L"未找到 packages.conf"; return sections; }
+    if (text.empty()) {
+        err = L"未找到下载列表 " + pkgsConfPath() + L"（可从 etc\\packages.conf.tpl 复制）";
+        return sections;
+    }
 
     // Each section: ["# title" ] then "---" delimiter, then name=url entries, then
     // "---". A "#" comment is the title of the section and precedes its delimiter;

@@ -133,6 +133,28 @@ int wmain() {
         check(L"empty text reports error", pkgsParseConfText(L"", err).empty() && !err.empty());
     }
 
+    wprintf(L"\n=== runtime layout: etc=templates, data=runtime ===\n");
+    {
+        // The rule this block exists to keep honest: nothing the program writes
+        // and the user edits may live under etc\. A regression here would put
+        // per-site configs and the download list back into the template tree,
+        // where they would also leak into release packages.
+        std::wstring vhosts = nginxVhostSourceDir();
+        check(L"site configs live under data", vhosts.rfind(dataDir(), 0) == 0, vhosts);
+        check(L"site configs NOT under etc", vhosts.rfind(etcDir(), 0) != 0, vhosts);
+        check(L"download list lives under data", pkgListPath().rfind(dataDir(), 0) == 0, pkgListPath());
+        check(L"download list NOT under etc", pkgListPath().rfind(etcDir(), 0) != 0);
+        check(L"download template lives under etc", pkgTemplatePath().rfind(etcDir(), 0) == 0, pkgTemplatePath());
+        check(L"download template is a .tpl",
+              lowerStr(pkgTemplatePath()).find(L".tpl") != std::wstring::npos);
+        check(L"template and working list differ", pkgTemplatePath() != pkgListPath());
+        check(L"settings.ini lives under data", settingsIniPath().rfind(dataDir(), 0) == 0);
+        // The other half of the split: templates still come from etc\.
+        for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs }) {
+            check(compName(c), compEtcDir(c).rfind(etcDir(), 0) == 0, compEtcDir(c));
+        }
+    }
+
     wprintf(L"\n=== nginxDenyBlock ===\n");
     {
         std::wstring on = nginxDenyBlock(true);

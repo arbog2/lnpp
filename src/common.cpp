@@ -43,6 +43,12 @@ std::wstring dataCompVerDir(const std::wstring& name, const std::wstring& ver) {
 
 std::wstring settingsIniPath() { return joinPath(dataDir(), L"settings.ini"); }
 
+// etc\ = templates only, data\ = everything the program runs on. The download
+// list follows the same split: template shipped under etc\, working list under
+// data\ (created from the template on first run).
+std::wstring pkgListPath()     { return joinPath(dataDir(), L"packages.conf"); }
+std::wstring pkgTemplatePath() { return joinPath(etcDir(), L"packages.conf.tpl"); }
+
 std::wstring wstrfmt(const wchar_t* fmt, ...) {
     va_list args;
     va_start(args, fmt);

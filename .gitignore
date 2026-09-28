@@ -10,15 +10,18 @@ dist/
 # third-party component binaries (hundreds of MB, manually copied)
 bin/
 
-# runtime data & sensitive files
+# runtime data & sensitive files. Since v1.5.3 everything the program runs on
+# lives here: settings.ini (DPAPI-encrypted DB password), packages.conf (the
+# download list) and the per-site nginx configs under data\nginx\vhosts\.
 data/
 backup/
 logs/
 ssl/
 
-# unrelated / user-specific files
+# etc\ holds templates only. The per-site vhost files now live in data\, so the
+# rule below is a safety net for an install that has not been migrated yet.
+# Legacy pre-v1.5.3 location of the download list, migrated into data\ on first run.
 packages.conf
-# per-site nginx configs are user data; keep only the templates tracked
 etc/nginx/vhosts/*.conf
 !etc/nginx/vhosts/_template*.conf
 

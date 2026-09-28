@@ -86,7 +86,7 @@ mkdir "%STAGE%\www" 2>nul
 
 copy /y lnpp.exe                    "%STAGE%\" >nul || goto :copyfail
 copy /y README.md                   "%STAGE%\" >nul || goto :copyfail
-copy /y packages.conf.example       "%STAGE%\" >nul || goto :copyfail
+rem packages.conf is seeded into data\ from etc\packages.conf.tpl at first run
 if exist www\.gitkeep copy /y www\.gitkeep "%STAGE%\www\" >nul
 
 rem etc: copy the five templates one by one, so a recursive copy can never
@@ -96,6 +96,7 @@ copy /y etc\nginx\vhosts\_template.conf       "%STAGE%\etc\nginx\vhosts\" >nul 2
 copy /y etc\nginx\vhosts\_template_https.conf "%STAGE%\etc\nginx\vhosts\" >nul 2>&1
 copy /y etc\postgresql\postgresql.conf.append "%STAGE%\etc\postgresql\"    >nul 2>&1
 copy /y etc\redis\redis.conf.tpl               "%STAGE%\etc\redis\"         >nul 2>&1
+copy /y etc\packages.conf.tpl               "%STAGE%\etc\"              >nul 2>&1
 
 rem ---- 3. refuse to ship anything sensitive ----
 echo [3/4] verifying contents ...
@@ -148,8 +149,8 @@ for /f "delims=" %%F in ('dir /b /s "%STAGE%"') do (
 )
 echo.
 echo deliberately excluded: bin\ data\ logs\ backup\ ssl\ site configs
-echo first run opens the component downloader; copy packages.conf.example to
-echo packages.conf and fill in https URLs to use it.
+echo first run seeds data\packages.conf from etc\packages.conf.tpl, then
+echo opens the downloader. Edit data\packages.conf to change the URLs.
 exit /b 0
 
 :copyfail

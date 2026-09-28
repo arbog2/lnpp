@@ -55,6 +55,15 @@ bool compRunningQuick(Comp c);
 const wchar_t* compName(Comp c);
 const wchar_t* compDisplay(Comp c);
 
+// ---- Runtime layout ----
+// etc\ holds templates only; data\ holds everything the program runs on.
+// prepareRuntimeLayout() creates data\ when missing, seeds data\packages.conf
+// from etc\packages.conf.tpl, and migrates per-site vhost files that used to
+// live in etc\nginx\vhosts\ into data\nginx\vhosts\. Call once at startup.
+void prepareRuntimeLayout();
+// Where the user's per-site nginx configs live (data\nginx\vhosts\).
+std::wstring nginxVhostSourceDir();
+
 // ---- Path helpers ----
 std::wstring compBinDir(Comp c);
 std::wstring compBinDirVer(Comp c, const std::wstring& ver);

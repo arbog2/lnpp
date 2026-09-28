@@ -19,12 +19,16 @@ struct PkgSection {
     std::vector<PkgItem> items;
 };
 
-// Parse <root>\packages.conf. Unknown components (php/apache/...) are skipped.
+// Parse data\packages.conf. Unknown components (php/apache/...) are skipped.
 std::vector<PkgSection> pkgsParseConf(std::wstring& err);
 // Same parser on raw text, so the whole conf grammar is unit-testable without
 // writing a packages.conf into the runtime root (which needs admin rights and
 // would race a real download).
 std::vector<PkgSection> pkgsParseConfText(const std::wstring& text, std::wstring& err);
+// First-run layout: creates data\ and seeds data\packages.conf from the
+// etc\packages.conf.tpl template. Also migrates a pre-v1.5.3 root-level
+// packages.conf into data\. Called once at startup.
+void prepareDownloadList();
 
 // Map an entry name like "node-24.12" to component dir "nodejs" + version "24.12".
 bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstring& ver);

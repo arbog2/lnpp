@@ -38,6 +38,15 @@ std::wstring etcCompDir(const std::wstring& name);
 std::wstring dataCompDir(const std::wstring& name);
 std::wstring dataCompVerDir(const std::wstring& name, const std::wstring& ver);
 
+// ---- Download list ----
+// Layout rule: etc\ carries templates only (shipped, read-only), data\ carries
+// everything the program actually runs on (created on first run). The component
+// download list follows that split — the shipped template is
+// etc\packages.conf.tpl, the working list the user edits is data\packages.conf,
+// created from the template on first run.
+std::wstring pkgListPath();      // data\packages.conf    (working list)
+std::wstring pkgTemplatePath();  // etc\packages.conf.tpl  (shipped template)
+
 // ---- String utils ----
 // Named wstrfmt, not wsprintf: windows.h defines a wsprintf macro that would
 // expand into our declaration and break it.
