@@ -1,4 +1,4 @@
-# LNPP 组件管理器 v1.5.2
+# LNPP 组件管理器 v1.5.3
 
 Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis 的启动、停止、版本切换、配置。
 
@@ -105,7 +105,7 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 产出 `dist\LNPP-<版本>.zip`（约 291 KB），内含：
 
 ```
-LNPP-1.5.2/
+LNPP-1.5.3/
   lnpp.exe
   README.md
   etc\nginx\nginx.conf.tpl
