@@ -66,6 +66,15 @@ static bool pgValidIdent(const std::wstring& s);
 static bool validPort(const std::wstring& s);
 
 // ============================ Operation locks ============================
+// The message returned when an operation is refused because another thread is
+// already driving the same component. Exposed as a predicate so callers can tell
+// "someone else is already on it" — benign, and in the Node.js path the expected
+// outcome — apart from a genuine failure, instead of reading the same string two
+// different ways in two different places.
+static const wchar_t* kCompBusyMsg = L"该组件正在执行其他操作，请稍候";
+
+bool compIsBusy(const std::wstring& err) { return err == kCompBusyMsg; }
+
 // One lock per component. autoStartComponents() fires compStart for all four
 // components from four parallel threads, and compStart(Nodejs) additionally
 // starts Redis as a side effect — so the same component really can be driven
@@ -879,7 +888,7 @@ static void pruneOldBackups() {
 
 bool compStart(Comp c, std::wstring& err) {
     std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
-    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
+    if (!lk.owns_lock()) { err = kCompBusyMsg; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装（bin 下无版本目录）"; return false; }
     bool alreadyRunning =
@@ -998,9 +1007,15 @@ bool compStart(Comp c, std::wstring& err) {
             if (rs.installed && !rs.running) {
                 std::wstring rerr;
                 if (!compStart(Comp::Redis, rerr)) {
-                    // Not fatal: the app may not need Redis at all. Say what
-                    // happened and let pm2 try anyway.
-                    logMsg(L"pm2", L"启动 Node.js 前未自动启动 Redis: " + rerr);
+                    // Not fatal either way: the app may not need Redis at all.
+                    // Distinguish "another operation already owns Redis" — the
+                    // expected outcome under autostart, which fires all four
+                    // components in parallel — from a real failure, so the log
+                    // says what happened instead of implying a fault.
+                    if (compIsBusy(rerr))
+                        logMsg(L"pm2", L"启动 Node.js 前跳过自动启动 Redis：另一个操作正在启动它");
+                    else
+                        logMsg(L"pm2", L"启动 Node.js 前自动启动 Redis 失败: " + rerr);
                 }
             }
             // pm2 resurrect restores previously saved processes
@@ -1017,7 +1032,7 @@ bool compStart(Comp c, std::wstring& err) {
 
 bool compStop(Comp c, std::wstring& err) {
     std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
-    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
+    if (!lk.owns_lock()) { err = kCompBusyMsg; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装"; return false; }
     std::wstring ver = st.currentVersion;
@@ -1121,7 +1136,7 @@ bool compStop(Comp c, std::wstring& err) {
 bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
     // Recursive lock: compStop/compStart below re-acquire it on this thread.
     std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
-    if (!lk.owns_lock()) { err = L"该组件正在执行其他操作，请稍候"; return false; }
+    if (!lk.owns_lock()) { err = kCompBusyMsg; return false; }
     ComponentStatus st = compStatus(c);
     if (!st.installed) { err = L"组件未安装"; return false; }
     if (st.currentVersion == ver) { err = L"已是当前版本"; return false; }

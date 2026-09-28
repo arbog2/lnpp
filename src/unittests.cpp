@@ -165,6 +165,23 @@ int wmain() {
               compConfigDir(Comp::Nginx));
     }
 
+    wprintf(L"\n=== compIsBusy ===\n");
+    {
+        // The contract that matters: callers must be able to tell "another
+        // operation owns this component" apart from a real failure, because under
+        // autostart compStart(Nodejs) always finds the user's own Redis start in
+        // flight and that is the expected outcome, not a fault.
+        check(L"busy message recognised", compIsBusy(L"该组件正在执行其他操作，请稍候"));
+        check(L"not-installed is not busy", !compIsBusy(L"组件未安装"));
+        check(L"already-running is not busy", !compIsBusy(L"已在运行"));
+        check(L"pg failure is not busy", !compIsBusy(L"initdb 失败: ..."));
+        check(L"empty is not busy", !compIsBusy(L""));
+        // A message that merely contains the wording must not match, otherwise a
+        // wrapped real failure would be misreported as a benign skip.
+        check(L"wrapped message is not busy",
+              !compIsBusy(L"停止数据库失败: 该组件正在执行其他操作，请稍候"));
+    }
+
     wprintf(L"\n=== nginxDenyBlock ===\n");
     {
         std::wstring on = nginxDenyBlock(true);

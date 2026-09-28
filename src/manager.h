@@ -79,6 +79,11 @@ bool compStart(Comp c, std::wstring& err);
 bool compStop(Comp c, std::wstring& err);
 bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err);
 bool compIsRunning(Comp c);
+// True when an operation was refused only because another thread is already
+// driving the same component. That is benign — under autostart, for instance,
+// compStart(Nodejs) always finds the user's own Redis start in flight — so
+// callers should report it as a skip rather than a failure.
+bool compIsBusy(const std::wstring& err);
 
 // ---- Per-component ----
 // nginx
