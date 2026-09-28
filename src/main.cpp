@@ -1147,12 +1147,16 @@ static void initNginxPage(HWND parent) {
 
 static void initPgPage(HWND parent) {
     CompUI& ui = g_ui[(int)Comp::Postgresql];
+    // 32px pitch, not the 34px used elsewhere: this column needs six rows and
+    // the log edit below starts at y=280. The last button ends at 274.
     HWND bInit = makeCtl(IDC_PG_BTN_INIT, L"BUTTON", L"初始化数据库", BS_PUSHBUTTON, 20, 88, 120, 26, parent);
-    HWND bPwd = makeCtl(IDC_PG_BTN_PWD, L"BUTTON", L"修改密码", BS_PUSHBUTTON, 20, 122, 120, 26, parent);
-    HWND bAddU = makeCtl(IDC_PG_BTN_ADDUSER, L"BUTTON", L"创建用户", BS_PUSHBUTTON, 20, 156, 120, 26, parent);
-    HWND bDelU = makeCtl(IDC_PG_BTN_DELUSER, L"BUTTON", L"删除用户", BS_PUSHBUTTON, 20, 190, 120, 26, parent);
-    HWND bBak = makeCtl(IDC_PG_BTN_BACKUP, L"BUTTON", L"备份数据库", BS_PUSHBUTTON, 20, 224, 120, 26, parent);
-    HWND bRes = makeCtl(IDC_PG_BTN_RESTORE, L"BUTTON", L"还原数据库", BS_PUSHBUTTON, 152, 224, 120, 26, parent);
+    HWND bPwd = makeCtl(IDC_PG_BTN_PWD, L"BUTTON", L"修改密码", BS_PUSHBUTTON, 20, 120, 120, 26, parent);
+    HWND bAddU = makeCtl(IDC_PG_BTN_ADDUSER, L"BUTTON", L"创建用户", BS_PUSHBUTTON, 20, 152, 120, 26, parent);
+    HWND bDelU = makeCtl(IDC_PG_BTN_DELUSER, L"BUTTON", L"删除用户", BS_PUSHBUTTON, 20, 184, 120, 26, parent);
+    HWND bBak = makeCtl(IDC_PG_BTN_BACKUP, L"BUTTON", L"备份数据库", BS_PUSHBUTTON, 20, 216, 120, 26, parent);
+    // Stacked under 备份 rather than beside it: the right column is the
+    // username/password/port form and the info text, and a button there covered them.
+    HWND bRes = makeCtl(IDC_PG_BTN_RESTORE, L"BUTTON", L"还原数据库", BS_PUSHBUTTON, 20, 248, 120, 26, parent);
     ui.pageControls.push_back(bInit);
     ui.pageControls.push_back(bPwd);
     ui.pageControls.push_back(bAddU);
@@ -1229,9 +1233,11 @@ static void initCommonControls(HWND parent, Comp c) {
     HWND bStop = makeCtl(IDC_BTN_STOP, L"BUTTON", L"停止", BS_PUSHBUTTON, 490, 38, 70, 24, parent);
     HWND bCfg = makeCtl(IDC_BTN_CFG, L"BUTTON", L"配置", BS_PUSHBUTTON, 570, 38, 70, 24, parent);
     HWND bData = makeCtl(IDC_BTN_DATA, L"BUTTON", L"数据目录", BS_PUSHBUTTON, 645, 38, 80, 24, parent);
-    HWND bClearLog = makeCtl(IDC_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 455, 90, 24, parent);
+    HWND bClearLog = makeCtl(IDC_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 436, 90, 24, parent);
+    // Shorter than it was (170 -> 150): the PostgreSQL column needs a sixth
+    // button row, and 150 rows of monospace log is plenty for this window.
     HWND log = makeCtl(IDC_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
-                       ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 170, parent);
+                       ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 150, parent);
     SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
 
     ui.dot = dot; ui.statusTxt = st; ui.verCombo = combo;
