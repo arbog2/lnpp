@@ -1824,7 +1824,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     break;
                 case IDC_BTN_CFG: {
                     if (sender == Comp::Count) break;
-                    ShellExecuteW(hwnd, L"open", compEtcDir(sender).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    // Opens the component's live configuration, not etc\:
+                    // etc holds templates that are never read at runtime.
+                    std::wstring dir = compConfigDir(sender);
+                    if (!dirExists(dir) && !makeDirs(dir)) {
+                        logAppend(sender, L"无法创建配置目录: " + dir);
+                        break;
+                    }
+                    logAppend(sender, L"打开配置目录: " + dir);
+                    if (sender == Comp::Nodejs)
+                        logAppend(sender, L"（pm2 自己的 dump / 日志 / pid 在 %USERPROFILE%\\.pm2）");
+                    // ShellExecuteW returns HINSTANCE; anything <= 32 is an error
+                    // code rather than a handle.
+                    if ((INT_PTR)ShellExecuteW(hwnd, L"open", dir.c_str(), nullptr, nullptr,
+                                               SW_SHOWNORMAL) <= 32)
+                        logAppend(sender, L"无法打开目录，请手动前往: " + dir);
                     break;
                 }
                 case IDC_BTN_DATA: {

@@ -70,6 +70,9 @@ std::wstring compBinDirVer(Comp c, const std::wstring& ver);
 std::wstring compEtcDir(Comp c);
 std::wstring compDataDir(Comp c);
 std::wstring compDataVerDir(Comp c, const std::wstring& ver);
+// Directory the "配置" button opens: the component's live, hand-editable
+// configuration, which is always under data\ (etc\ holds templates only).
+std::wstring compConfigDir(Comp c);
 
 // ---- Common lifecycle ----
 bool compStart(Comp c, std::wstring& err);

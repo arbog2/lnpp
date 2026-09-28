@@ -152,7 +152,17 @@ int wmain() {
         // The other half of the split: templates still come from etc\.
         for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs }) {
             check(compName(c), compEtcDir(c).rfind(etcDir(), 0) == 0, compEtcDir(c));
+            // The "配置" button must land on data\, never on etc\.
+            check((std::wstring(L"config dir of ") + compName(c)).c_str(),
+                  compConfigDir(c).rfind(dataDir(), 0) == 0, compConfigDir(c));
         }
+        check(L"nginx 配置目录就是站点目录",
+              compConfigDir(Comp::Nginx) == nginxVhostSourceDir());
+        // It must never be the generated per-version copy, which is rewritten
+        // from the source on every start.
+        check(L"nginx 配置目录不是每版本运行副本",
+              compConfigDir(Comp::Nginx).find(L"conf\\vhosts") == std::wstring::npos,
+              compConfigDir(Comp::Nginx));
     }
 
     wprintf(L"\n=== nginxDenyBlock ===\n");

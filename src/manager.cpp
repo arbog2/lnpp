@@ -30,6 +30,29 @@ std::wstring compDataDir(Comp c)      { return dataCompDir(compName(c)); }
 std::wstring compDataVerDir(Comp c, const std::wstring& ver) {
     return dataCompVerDir(compName(c), ver);
 }
+
+// The directory the "配置" button opens. Under the etc=templates / data=runtime
+// split, the live hand-editable configuration is always under data\, so opening
+// etc\ would show template files that are never read at runtime — and for
+// Node.js it showed a directory that does not exist at all.
+std::wstring compConfigDir(Comp c) {
+    // The version actually in use, or the component root when there is none.
+    auto liveVerDir = [&](Comp comp) {
+        std::wstring ver = iniGet(std::wstring(L"ver.") + compName(comp), L"");
+        if (!ver.empty() && compVersionUsable(comp, ver)) return compDataVerDir(comp, ver);
+        return compDataDir(comp);
+    };
+    switch (c) {
+        // Site configs are the one thing hand-written per site. They are the
+        // source of truth — do not point at the generated per-version copies
+        // under data\nginx\<ver>\conf\vhosts, which are overwritten on start.
+        case Comp::Nginx:      return nginxVhostSourceDir();
+        case Comp::Postgresql: return liveVerDir(Comp::Postgresql);
+        case Comp::Redis:      return liveVerDir(Comp::Redis);
+        case Comp::Nodejs:     return compDataDir(Comp::Nodejs);
+        default:               return compDataDir(c);
+    }
+}
 std::wstring compBinDirVer(Comp c, const std::wstring& ver) {
     return joinPath(compBinDir(c), ver);
 }
