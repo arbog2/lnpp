@@ -96,6 +96,8 @@ build.bat debug      # 产出 lnpp_dbg.exe（/Od /Zi /D_DEBUG），用于调试
 
 ## 发布打包
 
+发布说明存档在 [`docs\releases\`](docs\releases/README.md)，与 GitHub Releases 上的正文一致。
+
 ```
 package.bat              # 编译 + 打包，版本号自动取自 app.rc 的 FILEVERSION
 package.bat 1.5.3        # 指定版本号（不改 app.rc）
