@@ -1984,6 +1984,170 @@ static bool pgRunSql(Comp c, const std::wstring& ver, const std::wstring& extraA
     return true;
 }
 
+// ============================ Restore ============================
+
+std::vector<std::wstring> pgListBackups() {
+    std::vector<std::wstring> files = listFiles(backupDir(), L"sql");
+    std::sort(files.begin(), files.end(), [](const std::wstring& a, const std::wstring& b) {
+        // file mtime, not name: the keep-newest-N pruning already bounds this
+        // list, and a name sort would mix versions ("postgresql-18-..." sorts
+        // above every "postgresql-17-..." regardless of date).
+        HANDLE ha = CreateFileW(joinPath(backupDir(), a).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE hb = CreateFileW(joinPath(backupDir(), b).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        FILETIME fa = {}, fb = {};
+        if (ha) GetFileTime(ha, nullptr, nullptr, &fa);
+        if (hb) GetFileTime(hb, nullptr, nullptr, &fb);
+        if (ha) CloseHandle(ha);
+        if (hb) CloseHandle(hb);
+        if (fa.dwHighDateTime != fb.dwHighDateTime) return fa.dwHighDateTime > fb.dwHighDateTime;
+        if (fa.dwLowDateTime  != fb.dwLowDateTime)  return fa.dwLowDateTime  > fb.dwLowDateTime;
+        return a > b;
+    });
+    return files;
+}
+
+bool pgRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError) {
+    firstRealError.clear();
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(output);
+    std::wstring line;
+    while (std::getline(ss, line)) lines.push_back(trimStr(line));
+
+    // A pg_dumpall dump re-creates its roles and databases with plain CREATE,
+    // so a replay always collides with whatever already exists. The bootstrap
+    // superuser is named in the dump and exists in EVERY cluster, even one
+    // initdb just created — so the collision is expected, not a failed restore.
+    //
+    // Judge it on the SQLSTATE (duplicate_object = 42710) plus the offending
+    // statement keyword. Both are locale-independent, so this stays correct even
+    // if someone sets lc_messages to a non-English language — matching on the
+    // words "role"/"database" would silently pass everything through then.
+    auto createsRoleOrDb = [](const std::wstring& line) {
+        std::wstring u = lowerStr(line);
+        size_t pos = u.find(L"line ");
+        if (pos == std::wstring::npos) return false;
+        return u.find(L"create role") != std::wstring::npos ||
+               u.find(L"create database") != std::wstring::npos;
+    };
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].rfind(L"ERROR:", 0) != 0) continue;
+        bool tolerated = false;
+        // Primary test: the state code plus the statement that produced it. Both
+        // are locale-independent.
+        if (lines[i].find(L"42710:") != std::wstring::npos) {
+            for (size_t j = i; j < lines.size() && j <= i + 3; ++j) {
+                if (createsRoleOrDb(lines[j])) { tolerated = true; break; }
+            }
+        }
+        // Fallback for a server that does not echo the state code. A duplicate
+        // *table* must not pass here: it means the dump is being merged into a
+        // cluster that still holds that data.
+        if (!tolerated) {
+            std::wstring low = lowerStr(lines[i]);
+            if (low.find(L"already exists") != std::wstring::npos &&
+                (low.find(L"role") != std::wstring::npos ||
+                 low.find(L"database") != std::wstring::npos))
+                tolerated = true;
+        }
+        if (!tolerated && firstRealError.empty()) firstRealError = lines[i];
+    }
+    return firstRealError.empty();
+}
+
+// Put the pre-restore cluster back. The half-restored directory is moved aside
+// rather than deleted, so a failed attempt costs disk space, not data.
+static void rollbackRestore(const std::wstring& ver, const std::wstring& aside, std::wstring& err) {
+    if (aside.empty()) return;   // nothing was moved aside -> nothing to undo
+    std::wstring dataDir = pgDataDir(Comp::Postgresql, ver);
+    std::wstring e;
+    if (pgRunningVer(Comp::Postgresql, ver)) compStop(Comp::Postgresql, e);
+    if (dirExists(dataDir)) {
+        std::wstring failed = dataDir + L".failed-" + nowStamp();
+        MoveFileW(dataDir.c_str(), failed.c_str());
+    }
+    if (dirExists(aside) && MoveFileW(aside.c_str(), dataDir.c_str())) {
+        compStart(Comp::Postgresql, e);
+        err += L"；已回滚到还原前的数据目录并重新启动";
+    } else {
+        err += L"；回滚失败，原数据目录仍在 " + aside;
+    }
+}
+
+bool pgRestoreBackup(Comp c, const std::wstring& backupFile, bool reinit, std::wstring& err) {
+    std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
+    if (!lk.owns_lock()) { err = kCompBusyMsg; return false; }
+
+    if (backupFile.empty() || !fileExists(backupFile)) { err = L"备份文件不存在"; return false; }
+    std::wstring ver = iniGet(L"ver.postgresql", L"");
+    if (ver.empty()) { err = L"未选择 PostgreSQL 版本"; return false; }
+    if (!validPort(pgPort())) { err = L"端口号无效: " + pgPort(); return false; }
+    if (!pgValidIdent(pgUser())) { err = L"用户名含非法字符: " + pgUser(); return false; }
+
+    std::wstring dataDir = pgDataDir(c, ver);
+    std::wstring aside;                       // previous cluster, preserved
+    if (reinit) {
+        if (pgRunningVer(c, ver) && !compStop(c, err)) { err = L"停止数据库失败: " + err; return false; }
+        if (pgDataInitialized(ver)) {
+            aside = dataDir + L".before-restore-" + nowStamp();
+            if (!MoveFileW(dataDir.c_str(), aside.c_str())) {
+                err = L"无法移走当前数据目录（可能仍被占用）: " + dataDir;
+                return false;
+            }
+            logMsg(L"pg", L"还原前已移走原数据目录: " + aside);
+        }
+        // Why a rebuild is required rather than "just drop the databases": a
+        // pg_dumpall dump re-creates its roles with plain CREATE ROLE, and the
+        // bootstrap superuser is named in it, so replaying into a live cluster
+        // collides no matter how many databases were dropped.
+        if (!pgInit(c, ver, pgUser(), pgPassword(), pgPort(), err)) {
+            rollbackRestore(ver, aside, err);
+            return false;
+        }
+    } else if (!pgRunningVer(c, ver)) {
+        err = L"PostgreSQL 未运行。请先启动，或勾选「还原前初始化」";
+        return false;
+    }
+
+    if (!compStart(c, err)) { rollbackRestore(ver, aside, err); return false; }
+    for (int i = 0; i < 60 && !pgRunningVer(c, ver); ++i) Sleep(200);
+    if (!pgRunningVer(c, ver)) {
+        err = L"数据库启动后未就绪: " + ver;
+        rollbackRestore(ver, aside, err);
+        return false;
+    }
+
+    std::wstring psql;
+    if (!findExe(c, ver, L"psql.exe", psql)) {
+        err = L"未找到 psql.exe";
+        rollbackRestore(ver, aside, err);
+        return false;
+    }
+    // VERBOSITY=verbose makes every error carry its SQLSTATE and the failing
+    // statement — that is what pgRestoreOutputOk() judges on, and it stays correct
+    // whatever lc_messages is set to. ON_ERROR_STOP is deliberately absent: the
+    // dump trips over the bootstrap superuser, and aborting on the first
+    // statement would restore nothing.
+    std::wstring cmd = L"-h 127.0.0.1 -p " + pgPort() + L" -U " + pgUser() +
+                       L" -d postgres -v VERBOSITY=verbose -f \"" + backupFile + L"\"";
+    RunResult r = runProcessCapture(psql, cmd, compBinDirVer(c, ver), 1800000,
+                                    {{L"PGPASSWORD", pgPassword()}});
+    std::wstring realErr;
+    if (!pgRestoreOutputOk(r.output, realErr)) {
+        err = realErr.empty()
+                  ? (r.output.empty() ? L"psql 执行失败" : r.output)
+                  : (L"还原过程中出错: " + realErr);
+        rollbackRestore(ver, aside, err);
+        return false;
+    }
+    logMsg(L"pg", L"还原完成: " + backupFile);
+    err = L"还原完成";
+    if (!aside.empty())
+        err += L"；还原前的数据目录保留在 " + aside + L"，确认数据无误后可删除";
+    return true;
+}
+
 bool pgDataInitialized(const std::wstring& ver) {
     return fileExists(joinPath(pgDataDir(Comp::Postgresql, ver), L"PG_VERSION"));
 }

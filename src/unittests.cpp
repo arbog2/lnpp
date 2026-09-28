@@ -165,6 +165,63 @@ int wmain() {
               compConfigDir(Comp::Nginx));
     }
 
+    wprintf(L"\n=== pgRestoreOutputOk ===\n");
+    {
+        // The verdict for a restore comes from this classifier, because the psql
+        // replay deliberately runs WITHOUT ON_ERROR_STOP (a pg_dumpall dump always
+        // collides with the bootstrap superuser, and aborting on the first
+        // statement would restore nothing). So "did it work" has to be read off
+        // the output, and the two tolerated families must stay exactly two.
+        std::wstring bad;
+        check(L"empty output is ok", pgRestoreOutputOk(L"", bad));
+        check(L"no errors is ok", pgRestoreOutputOk(L"SET\nCREATE TABLE\nINSERT 0 10\n", bad));
+
+        check(L"role already exists tolerated",
+              pgRestoreOutputOk(L"ERROR:  role \"postgres\" already exists\n"
+                               L"ERROR:  role \"arbog\" already exists\n", bad));
+        check(L"database already exists tolerated",
+              pgRestoreOutputOk(L"ERROR:  database \"appdb\" already exists\n", bad));
+
+        // The shape psql actually emits with VERBOSITY=verbose: state code plus
+        // the offending statement. Judged on those, so a non-English
+        // lc_messages cannot make every error look tolerated.
+        check(L"verbose duplicate role tolerated",
+              pgRestoreOutputOk(L"ERROR:  42710: duplicate_object: role \"postgres\" already exists\n"
+                               L"LINE 1: CREATE ROLE postgres;\n", bad));
+        check(L"verbose duplicate database tolerated",
+              pgRestoreOutputOk(L"ERROR:  42710: duplicate_object: database \"appdb\" already exists\n"
+                               L"LINE 1: CREATE DATABASE appdb WITH TEMPLATE = template0;\n", bad));
+        check(L"verbose duplicate TABLE rejected",
+              !pgRestoreOutputOk(L"ERROR:  42710: duplicate_object: relation \"t\" already exists\n"
+                                  L"LINE 1: CREATE TABLE public.t (id int);\n", bad));
+        check(L"localized duplicate role tolerated",
+              pgRestoreOutputOk(L"ERROR:  42710: duplicate_object: 角色 \"postgres\" 已经存在\n"
+                               L"LINE 1: CREATE ROLE postgres;\n", bad));
+        check(L"localized duplicate table rejected",
+              !pgRestoreOutputOk(L"ERROR:  42710: duplicate_object: 表 \"t\" 已经存在\n"
+                                  L"LINE 1: CREATE TABLE public.t (id int);\n", bad));
+
+        check(L"other errors rejected",
+              !pgRestoreOutputOk(L"ERROR:  syntax error at or near \"CREAT\"\n", bad));
+        check(L"rejected error is reported", bad.find(L"syntax error") != std::wstring::npos, bad);
+        check(L"permission denied rejected",
+              !pgRestoreOutputOk(L"ERROR:  permission denied to create database\n", bad));
+        check(L"role in use rejected",
+              !pgRestoreOutputOk(L"ERROR:  role \"arbog\" cannot be dropped because some objects depend on it\n", bad));
+        // "already exists" on some other object is NOT tolerated: it means a
+        // table/index collision, i.e. the dump is being merged into a cluster
+        // that already holds that data.
+        check(L"table already exists rejected",
+              !pgRestoreOutputOk(L"ERROR:  relation \"t\" already exists\n", bad));
+        // A benign error must not hide a real one later in the same output.
+        check(L"benign error does not mask a real one",
+              !pgRestoreOutputOk(L"ERROR:  role \"postgres\" already exists\n"
+                                  L"ERROR:  relation \"t\" already exists\n", bad));
+        // Warnings are not errors and must not fail a restore.
+        check(L"warnings ignored",
+              pgRestoreOutputOk(L"WARNING:  no privileges were granted for \"public\"\n", bad));
+    }
+
     wprintf(L"\n=== compIsBusy ===\n");
     {
         // The contract that matters: callers must be able to tell "another

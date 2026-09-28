@@ -28,6 +28,7 @@ enum {
     // postgresql page
     IDC_PG_BTN_INIT = 400, IDC_PG_BTN_PWD = 401, IDC_PG_BTN_ADDUSER = 402,
     IDC_PG_BTN_DELUSER = 403, IDC_PG_BTN_BACKUP = 404, IDC_PG_INFO = 405,
+    IDC_PG_BTN_RESTORE = 406,
     IDC_PG_USER = 406, IDC_PG_PWD = 407, IDC_PG_PORT = 408,
     IDC_PG_LABEL_USER = 409, IDC_PG_LABEL_PWD = 410, IDC_PG_LABEL_PORT = 411,
     // redis page
@@ -870,6 +871,8 @@ static void showTrayMenu(HWND hwnd) {
 
 // ============================ Tab control ============================
 static void refreshPgUsers();   // defined later
+static void modal_loop(HWND dlg, HWND owner);   // defined later
+static void centerOn(HWND dlg, HWND owner);   // defined later
 
 static void showPage(int idx) {
     g_curTab = idx;
@@ -1149,11 +1152,14 @@ static void initPgPage(HWND parent) {
     HWND bAddU = makeCtl(IDC_PG_BTN_ADDUSER, L"BUTTON", L"创建用户", BS_PUSHBUTTON, 20, 156, 120, 26, parent);
     HWND bDelU = makeCtl(IDC_PG_BTN_DELUSER, L"BUTTON", L"删除用户", BS_PUSHBUTTON, 20, 190, 120, 26, parent);
     HWND bBak = makeCtl(IDC_PG_BTN_BACKUP, L"BUTTON", L"备份数据库", BS_PUSHBUTTON, 20, 224, 120, 26, parent);
+    HWND bRes = makeCtl(IDC_PG_BTN_RESTORE, L"BUTTON", L"还原数据库", BS_PUSHBUTTON, 152, 224, 120, 26, parent);
     ui.pageControls.push_back(bInit);
     ui.pageControls.push_back(bPwd);
     ui.pageControls.push_back(bAddU);
     ui.pageControls.push_back(bDelU);
     ui.pageControls.push_back(bBak);
+    ui.pageControls.push_back(bRes);
+    addTooltip(parent, bRes, L"用 backup\\ 下的 pg_dumpall 备份覆盖当前数据库。可选择先初始化（重建数据目录）。危险操作，会二次确认");
 
     HWND lUser = makeCtl(IDC_PG_LABEL_USER, L"STATIC", L"用户名:", SS_LEFT, 160, 90, 60, 20, parent);
     HWND eUser = makeCtl(IDC_PG_USER, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
@@ -1302,6 +1308,190 @@ static void pgOpBackup() {
         return ok;
     });
 }
+
+// ---- PostgreSQL restore dialog ----
+// The dialog only collects intent (which dump, whether to rebuild first).
+// pgOpRestore owns the confirmation prompts and runs the work off-thread — a
+// restore of a multi-hundred-MB dump takes minutes and must not block the UI.
+
+enum { IDC_PGR_FILE = 970, IDC_PGR_REINIT = 971, IDC_PGR_INFO = 972,
+       IDC_PGR_GO = 973, IDC_PGR_CANCEL = 974 };
+
+struct PgRestoreState {
+    std::vector<std::wstring> files;   // backup\*.sql, newest first
+    std::wstring file;                 // full path; empty means the user backed out
+    bool reinit = false;
+};
+
+static std::wstring fileStamp(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return L"";
+    FILETIME ft = {};
+    SYSTEMTIME st;
+    if (!d.ftLastWriteTime.dwHighDateTime && !d.ftLastWriteTime.dwLowDateTime) return L"";
+    ft.dwLowDateTime = d.ftLastWriteTime.dwLowDateTime;
+    ft.dwHighDateTime = d.ftLastWriteTime.dwHighDateTime;
+    if (!FileTimeToLocalFileTime(&ft, &ft) || !FileTimeToSystemTime(&ft, &st)) return L"";
+    return wstrfmt(L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+}
+
+static std::wstring humanSize(LONGLONG bytes) {
+    if (bytes >= 1024 * 1024 * 1024)
+        return wstrfmt(L"%.1f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    if (bytes >= 1024 * 1024)
+        return wstrfmt(L"%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    return wstrfmt(L"%lld KB", (LONGLONG)(bytes / 1024));
+}
+
+static void pgrRefreshInfo(HWND hwnd, PgRestoreState& st) {
+    HWND combo = GetDlgItem(hwnd, IDC_PGR_FILE);
+    int idx = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    HWND info = GetDlgItem(hwnd, IDC_PGR_INFO);
+    if (idx < 0 || idx >= (int)st.files.size()) {
+        SetWindowTextW(info, L"请选择要还原的备份文件");
+        return;
+    }
+    std::wstring full = joinPath(backupDir(), st.files[idx]);
+    WIN32_FILE_ATTRIBUTE_DATA d = {};
+    std::wstring size = L"";
+    if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &d))
+        size = humanSize(((LONGLONG)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+    std::wstring txt = L"文件: " + st.files[idx] + L"\r\n" +
+                       L"时间: " + fileStamp(full) + L"    大小: " + size;
+    if (SendMessageW(GetDlgItem(hwnd, IDC_PGR_REINIT), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        txt += L"\r\n\r\n⚠ 将重建数据目录：当前所有数据库与角色都会被删除，";
+        txt += L"且原数据目录会被移到一边（不删除），还原失败可自动回滚。";
+    } else {
+        txt += L"\r\n\r\n直接覆盖同名库。dump 里已存在的角色/数据库会跳过，";
+        txt += L"还原不会删除备份中不存在的库。";
+    }
+    SetWindowTextW(info, txt.c_str());
+}
+
+static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    PgRestoreState* st = (PgRestoreState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+        // The caller owns PgRestoreState and outlives the dialog, so it arrives
+        // through lpCreateParams. WM_DESTROY must not free it.
+        case WM_NCCREATE: {
+            CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+            return TRUE;
+        }
+        case WM_CREATE: {
+            if (!st) return -1;
+            st->files = pgListBackups();
+            makeCtl(1000, L"STATIC", L"备份文件:", SS_LEFT, 16, 14, 80, 20, hwnd);
+            HWND combo = makeCtl(IDC_PGR_FILE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                                 CBS_DROPDOWNLIST | WS_VSCROLL, 100, 12, 440, 240, hwnd);
+            for (auto& f : st->files) {
+                std::wstring label = fileStamp(joinPath(backupDir(), f)) + L"   " + f;
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+            }
+            if (st->files.empty()) {
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"（backup\\ 下没有 .sql 备份）");
+                EnableWindow(combo, FALSE);
+                EnableWindow(GetDlgItem(hwnd, IDC_PGR_GO), FALSE);
+            } else {
+                SendMessageW(combo, CB_SETCURSEL, 0, 0);
+            }
+            makeCtl(IDC_PGR_REINIT, L"BUTTON",
+                    L"还原前初始化（重建数据目录，清空当前所有业务库与角色）",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 16, 268, 520, 22, hwnd);
+            makeCtl(IDC_PGR_INFO, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 296, 530, 90, hwnd);
+            makeCtl(IDC_PGR_GO, L"BUTTON", L"下一步…", BS_PUSHBUTTON, 360, 396, 100, 28, hwnd);
+            makeCtl(IDC_PGR_CANCEL, L"BUTTON", L"取消", BS_PUSHBUTTON, 470, 396, 76, 28, hwnd);
+            pgrRefreshInfo(hwnd, *st);
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (!st) break;
+            int id = LOWORD(wParam);
+            if (id == IDC_PGR_CANCEL) { DestroyWindow(hwnd); return 0; }
+            if (id == IDC_PGR_REINIT) {
+                st->reinit = SendMessageW((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                pgrRefreshInfo(hwnd, *st);
+                return 0;
+            }
+            if (id == IDC_PGR_GO) {
+                int idx = (int)SendMessageW(GetDlgItem(hwnd, IDC_PGR_FILE), CB_GETCURSEL, 0, 0);
+                if (idx < 0 || idx >= (int)st->files.size()) {
+                    MessageBoxW(hwnd, L"请先选择要还原的备份文件。", L"还原数据库",
+                                MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                st->file = joinPath(backupDir(), st->files[idx]);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void pgOpRestore() {
+    if (iniGet(L"ver.postgresql", L"").empty()) {
+        logAppend(Comp::Postgresql, L"未选择 PostgreSQL 版本，无法还原");
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = PgRestoreProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"LNPPPgRestore";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    // A restore replaces the whole cluster. Say so before even opening the
+    // dialog, and again below if the rebuild option is ticked.
+    if (MessageBoxW(g_main,
+            L"「还原数据库」会用 backup\\ 下的备份覆盖当前的 PostgreSQL 数据库。\r\n\r\n"
+            L"被覆盖的数据不会留在数据库里。\r\n继续打开还原对话框？",
+            L"还原数据库", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    PgRestoreState st;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPPgRestore", L"还原数据库",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
+                               0, 0, 562, 462, g_main, nullptr, GetModuleHandleW(nullptr), &st);
+    if (!dlg) return;
+    centerOn(dlg, g_main);
+    modal_loop(dlg, g_main);
+    DestroyWindow(dlg);
+
+    if (st.file.empty()) return;   // backed out
+
+    // Second, sharper confirmation when the cluster is about to be rebuilt.
+    if (st.reinit) {
+        std::wstring msg =
+            L"即将重建数据目录并还原：\r\n\r\n"
+            L"  备份文件: " + st.file + L"\r\n"
+            L"  目标版本: " + iniGet(L"ver.postgresql", L"") + L"\r\n\r\n"
+            L"当前所有数据库与角色都会被删除。此操作不可撤销。\r\n"
+            L"（原数据目录会移到 .before-restore-<时间戳> 保留，不删除）\r\n\r\n"
+            L"确认继续？";
+        if (MessageBoxW(g_main, msg.c_str(), L"危险操作：确认重建数据目录？",
+                        MB_YESNO | MB_ICONERROR | MB_DEFBUTTON2) != IDYES)
+            return;
+    }
+
+    std::wstring file = st.file;
+    bool reinit = st.reinit;
+    std::wstring name = reinit ? L"初始化并还原数据库" : L"还原数据库";
+    runAsync(Comp::Postgresql, name, [file, reinit](std::wstring& err) {
+        return pgRestoreBackup(Comp::Postgresql, file, reinit, err);
+    });
+}
+
 
 // load the pg user list in the background, then refresh the user combo
 static void refreshPgUsers() {
@@ -1950,6 +2140,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_PG_BTN_ADDUSER: pgOpAddUser(); break;
                 case IDC_PG_BTN_DELUSER: pgOpDelUser(); break;
                 case IDC_PG_BTN_BACKUP: pgOpBackup(); break;
+                case IDC_PG_BTN_RESTORE: pgOpRestore(); break;
                 case IDC_NODE_BTN_RESTART_ALL:
                     runAsync(Comp::Nodejs, L"重启全部 PM2 应用", [](std::wstring& err) {
                         return nodePm2RestartAll(err);

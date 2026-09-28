@@ -105,6 +105,19 @@ bool pgChangePassword(Comp c, const std::wstring& user, const std::wstring& pass
 bool pgCreateUser(Comp c, const std::wstring& user, const std::wstring& password, std::wstring& err);
 bool pgDropUser(Comp c, const std::wstring& user, std::wstring& err);
 bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err);
+// Backups available to restore, newest first (backup\*.sql).
+std::vector<std::wstring> pgListBackups();
+// Replay a pg_dumpall dump. reinit=true rebuilds the cluster first — its data
+// directory is moved aside, never deleted, so a failed restore can be rolled
+// back. On success err carries a note (the location of the preserved copy).
+// This is destructive either way: the restore overwrites the databases.
+bool pgRestoreBackup(Comp c, const std::wstring& backupFile, bool reinit, std::wstring& err);
+// True when a psql replay produced no error other than "already exists" for a
+// role or a database. A pg_dumpall dump always collides with the bootstrap
+// superuser (it exists in every cluster, however fresh) and with any database
+// that survived, so those are expected; anything else means an incomplete
+// restore. firstRealError receives the first unexpected ERROR line.
+bool pgRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError);
 bool pgDataInitialized(const std::wstring& ver);
 bool pgListUsers(std::vector<std::wstring>& users, std::wstring& err);
 
