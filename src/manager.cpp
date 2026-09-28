@@ -850,7 +850,12 @@ static void pruneStaleDataCopies(Comp c) {
     std::vector<Entry> stale;
     for (auto& name : listSubDirs(root)) {
         std::wstring stamp;
-        if (stampOf(name, L".old-", stamp) || stampOf(name, L".failed-", stamp))
+        // ".before-restore-" belongs here too: pgRestoreBackup() parks the
+        // pre-restore cluster under that name, and without it every restore
+        // leaked another full copy that this cleanup could never see.
+        if (stampOf(name, L".before-restore-", stamp) ||
+            stampOf(name, L".old-", stamp) ||
+            stampOf(name, L".failed-", stamp))
             stale.push_back({ joinPath(root, name), stamp });
     }
     if ((int)stale.size() <= keep) return;
@@ -1668,6 +1673,38 @@ bool nginxReload(std::wstring& err) {
     return r.ok;
 }
 
+// Every port a vhost file listens on. An HTTPS site has two server blocks (the
+// :80 redirect plus the TLS one), so reading only the first "listen" made every
+// HTTPS site look like a plain :80 site: a real 443 collision went unnoticed,
+// while two coexisting :80 sites looked like a conflict.
+static std::vector<std::wstring> vhostPorts(const std::wstring& content) {
+    std::vector<std::wstring> ports;
+    size_t pos = 0;
+    while ((pos = content.find(L"listen", pos)) != std::wstring::npos) {
+        if (pos > 0 && (iswalnum(content[pos - 1]) || content[pos - 1] == L'_')) {
+            pos += 6;                                    // part of a longer word
+            continue;
+        }
+        size_t e = content.find(L";", pos);
+        if (e == std::wstring::npos) break;
+        // "80", "443 ssl", "80 default_server", "[::]:443" -> bare port number
+        std::wstringstream ss(trimStr(content.substr(pos + 6, e - pos - 6)));
+        std::wstring tok;
+        if (ss >> tok) {
+            size_t br = tok.rfind(L']');
+            if (br != std::wstring::npos) tok = tok.substr(br + 1);
+            size_t colon = tok.rfind(L':');
+            if (colon != std::wstring::npos) tok = tok.substr(colon + 1);
+            tok = trimStr(tok);
+            if (!tok.empty() && tok.find_first_not_of(L"0123456789") == std::wstring::npos &&
+                std::find(ports.begin(), ports.end(), tok) == ports.end())
+                ports.push_back(tok);
+        }
+        pos = e + 1;
+    }
+    return ports;
+}
+
 std::vector<VHost> nginxListVHosts() {
     std::vector<VHost> result;
     std::wstring dir = nginxVhostSourceDir();
@@ -1679,20 +1716,15 @@ std::vector<VHost> nginxListVHosts() {
         // parse server_name, listen, root
         size_t p1 = content.find(L"server_name");
         if (p1 != std::wstring::npos) {
-            size_t b = content.find(L" ", p1 + 11); 
+            size_t b = content.find(L" ", p1 + 11);
             size_t e = content.find(L";", p1);
             if (b != std::wstring::npos && e != std::wstring::npos && b < e)
                 v.domain = trimStr(content.substr(b + 1, e - b - 1));
         }
-        p1 = content.find(L"listen");
-        if (p1 != std::wstring::npos) {
-            size_t e = content.find(L";", p1);
-            if (e != std::wstring::npos) {
-                std::wstring line = trimStr(content.substr(p1 + 6, e - p1 - 6));
-                // listen may be "80;" or "80 default_server;"
-                std::wstringstream ss(line);
-                ss >> v.port;
-            }
+        v.ports = vhostPorts(content);
+        for (size_t i = 0; i < v.ports.size(); ++i) {
+            if (i) v.port += L",";
+            v.port += v.ports[i];
         }
         p1 = content.find(L"root");
         if (p1 != std::wstring::npos) {
@@ -1756,14 +1788,23 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
         err = L"端口号无效（应为 1-65535 的数字）: " + port;
         return false;
     }
-    // port conflict check
+    // Conflict check. Sharing a listen port is legal in nginx as long as the
+    // server_name differs - that is exactly the multi-domain layout the
+    // catch-all blocks exist for. Only the same domain on the same port is a
+    // real conflict; a bare shared port deserves a note, not a refusal. The old
+    // check compared one port per file, so it both missed genuine 443 clashes
+    // and rejected two :80 sites that nginx would have served happily.
     ComponentStatus st = compStatus(Comp::Nginx);
     if (st.installed) {
         for (auto& v : nginxListVHosts()) {
-            if (v.port == effPort && v.name != name) {
-                err = L"端口 " + effPort + L" 已被站点 " + v.name + L" 占用";
+            if (v.name == name) continue;
+            if (std::find(v.ports.begin(), v.ports.end(), effPort) == v.ports.end()) continue;
+            if (lowerStr(v.domain) == lowerStr(domain)) {
+                err = L"域名 " + domain + L" 与站点 " + v.name + L" 冲突：两者都监听 " + effPort;
                 return false;
             }
+            logMsg(L"nginx", L"站点 " + name + L" 与 " + v.name + L" 共用端口 " + effPort +
+                             L"（域名不同，nginx 可正常区分）");
         }
     }
     std::wstring vhostDir = nginxVhostSourceDir();
@@ -2110,12 +2151,18 @@ bool pgRestoreBackup(Comp c, const std::wstring& backupFile, bool reinit, std::w
         return false;
     }
 
-    if (!compStart(c, err)) { rollbackRestore(ver, aside, err); return false; }
-    for (int i = 0; i < 60 && !pgRunningVer(c, ver); ++i) Sleep(200);
+    // Only start what is not up yet. In the non-reinit path the server is by
+    // definition already running, and compStart() answers 已在运行 and returns
+    // false — calling it unconditionally made every plain restore fail with a
+    // message that says nothing about the restore.
     if (!pgRunningVer(c, ver)) {
-        err = L"数据库启动后未就绪: " + ver;
-        rollbackRestore(ver, aside, err);
-        return false;
+        if (!compStart(c, err)) { rollbackRestore(ver, aside, err); return false; }
+        for (int i = 0; i < 60 && !pgRunningVer(c, ver); ++i) Sleep(200);
+        if (!pgRunningVer(c, ver)) {
+            err = L"数据库启动后未就绪: " + ver;
+            rollbackRestore(ver, aside, err);
+            return false;
+        }
     }
 
     std::wstring psql;

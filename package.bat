@@ -89,14 +89,16 @@ copy /y README.md                   "%STAGE%\" >nul || goto :copyfail
 rem packages.conf is seeded into data\ from etc\packages.conf.tpl at first run
 if exist www\.gitkeep copy /y www\.gitkeep "%STAGE%\www\" >nul
 
-rem etc: copy the five templates one by one, so a recursive copy can never
-rem sweep in the user's own vhost .conf files.
-copy /y etc\nginx\nginx.conf.tpl               "%STAGE%\etc\nginx\"         >nul 2>&1
-copy /y etc\nginx\vhosts\_template.conf       "%STAGE%\etc\nginx\vhosts\" >nul 2>&1
-copy /y etc\nginx\vhosts\_template_https.conf "%STAGE%\etc\nginx\vhosts\" >nul 2>&1
-copy /y etc\postgresql\postgresql.conf.append "%STAGE%\etc\postgresql\"    >nul 2>&1
-copy /y etc\redis\redis.conf.tpl               "%STAGE%\etc\redis\"         >nul 2>&1
-copy /y etc\packages.conf.tpl               "%STAGE%\etc\"              >nul 2>&1
+rem etc: copy the six templates one by one, so a recursive copy can never
+rem sweep in the user's own vhost .conf files. A missing template is a hard
+rem failure, not a warning: the leak check below only catches files that must
+rem NOT ship, so a silently incomplete zip would still report [OK].
+copy /y etc\nginx\nginx.conf.tpl               "%STAGE%\etc\nginx\"         >nul || goto :copyfail
+copy /y etc\nginx\vhosts\_template.conf       "%STAGE%\etc\nginx\vhosts\" >nul || goto :copyfail
+copy /y etc\nginx\vhosts\_template_https.conf "%STAGE%\etc\nginx\vhosts\" >nul || goto :copyfail
+copy /y etc\postgresql\postgresql.conf.append "%STAGE%\etc\postgresql\"    >nul || goto :copyfail
+copy /y etc\redis\redis.conf.tpl               "%STAGE%\etc\redis\"         >nul || goto :copyfail
+copy /y etc\packages.conf.tpl                 "%STAGE%\etc\"              >nul || goto :copyfail
 
 rem ---- 3. refuse to ship anything sensitive ----
 echo [3/4] verifying contents ...

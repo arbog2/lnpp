@@ -78,10 +78,22 @@ lnpp.exe
 
 `etc\` 下的 `.tpl` / `.append` 文件是配置模板，支持 `{{VAR}}` 占位符：
 
-- `etc\nginx\nginx.conf.tpl` — {{PORT}} {{WWW_DIR}} {{MIME}}
-- `etc\nginx\vhosts\_template.conf` — 虚拟站点模板 {{PORT}} {{DOMAIN}} {{ROOT}}
-- `etc\redis\redis.conf.tpl` — {{PORT}} {{PIDFILE}} {{LOGFILE}} {{DIR}}
-- `etc\postgresql\postgresql.conf.append` — 追加到 postgresql.conf 的覆盖项 {{PORT}}
+| 模板 | 占位符 |
+|---|---|
+| `etc\nginx\nginx.conf.tpl` | {{PORT}} {{WWW_DIR}} {{MIME}} **{{DENY_UNKNOWN}}** |
+| `etc\nginx\vhosts\_template.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} |
+| `etc\nginx\vhosts\_template_https.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} {{CERT}} {{KEY}} |
+| `etc\redis\redis.conf.tpl` | {{PORT}} {{PIDFILE}} {{LOGFILE}} {{DIR}} |
+| `etc\postgresql\postgresql.conf.append` | {{PORT}} |
+
+> **`{{DENY_UNKNOWN}}` 漏掉会静默失效。** 它不是可选装饰：没有它，「拒绝 IP 直连与未配置
+> 域名」那对兜底块就不会生成，nginx 仍会对未知域名开放（默认落到第一个站点）。
+> 自定义过 `nginx.conf.tpl` 的话，务必在 `http { }` 内、`include vhosts/*.conf;` 之前
+> 保留这一行；管理器发现渲染结果里没有 `default_server` 时会在 `logs\lnpp.log` 告警，
+> 但不会在界面上提示。
+
+`{{NODEJS_PORT}}` 取 `data\settings.ini` 的 `nodejs.port`（默认 3000）——两个站点模板都
+用它，改这一个键即可让所有 GUI 新建的站点跟着换端口。
 
 ## 构建
 
@@ -193,7 +205,7 @@ server {                                  # :443 未匹配的 SNI
 - PostgreSQL 密码用 DPAPI（绑定当前 Windows 用户）加密后存 `data\settings.ini` 的 `pg.password.enc`；加密串换机器或换用户后无法解密，需重新填写密码
 - 日志轮转：管理器日志 `logs\lnpp.log` 超过 4MB 自动轮转为 `lnpp.log.1`；nginx 的 `access.log` / `error.log`（`data\nginx\<版本>\logs\`）与 `logs\postgresql-<版本>.log`、`logs\redis-<版本>.log` 超过 8MB 时在**组件下次启动前**轮转为 `.1`/`.2`（保留 2 份）。Windows 下运行中的服务会独占日志文件，无法改名，所以要等组件停止时才能轮转；pm2 自己的日志在 `%USERPROFILE%\.pm2\logs`，由 pm2 管理
 - 首次使用 PostgreSQL：切到对应页签点「初始化数据库」（密码不能为空）
-- 组件下载源：根目录 `packages.conf` 按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis 组件
+- 组件下载源：**`data\packages.conf`**（首次运行由 `etc\packages.conf.tpl` 自动生成，直接改这个文件），按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis 组件
   - **只接受 `https://`**，明文源会被直接拒绝
   - 名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）
 - 可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（用 `certutil -hashfile <文件> SHA256` 生成），下载后自动比对，不匹配则拒绝安装；没有该行时跳过校验

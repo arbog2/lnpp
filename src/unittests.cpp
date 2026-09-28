@@ -322,8 +322,16 @@ int wmain() {
             check(L"overwrite visible", readFileText(t.path()) == L"second");
             check(L"empty content ok", writeFileText(t.path(), L""));
             check(L"empty file reads empty", readFileText(t.path()).empty());
-            check(L"missing dir created", writeFileText(joinPath(dirOf(t.path()), L"sub\\x.txt"), L"v"));
-            check(L"nested read back", readFileText(joinPath(dirOf(t.path()), L"sub\\x.txt")) == L"v");
+            // Create a scratch subdirectory, then take it (and its file) back
+            // down. TempFile's destructor only removes the file it made, so
+            // without this the run leaves a stray directory in %TEMP%.
+            std::wstring subDir  = joinPath(dirOf(t.path()), L"sub");
+            std::wstring subFile = joinPath(subDir, L"x.txt");
+            check(L"missing dir created", writeFileText(subFile, L"v"));
+            check(L"nested read back", readFileText(subFile) == L"v");
+            check(L"scratch dir cleaned up",
+                  dirExists(subDir) && DeleteFileW(subFile.c_str()) != 0 &&
+                  RemoveDirectoryW(subDir.c_str()) != 0 && !dirExists(subDir));
 
             // The regression this file exists for: eight threads writing the
             // same target used to collide on a fixed "<path>.tmp" staging file

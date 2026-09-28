@@ -18,6 +18,10 @@
 > §4 描述的「主配置里那个 `server_name localhost` 的 www 站点」已被一对
 > `default_server` 兜底块取代（拒绝 IP 直连与未配置域名，80 返 500、443 握手拒绝），
 > 见 README「拒绝 IP 直连与未配置域名」与 `settings.ini` 的 `nginx.block_unknown_host`。
+>
+> §3 的目录树与 §7 的 nginx 行仍写着 `etc\nginx\vhosts\<域名>.conf`，这也是旧布局：
+> v1.5.3 起 `etc\` 只放模板，站点配置在 `data\nginx\vhosts\`，见 README「目录结构」。
+> §4 的 postgresql 行也少了 v1.5.2 起的「还原数据库」按钮。
 
 ## 1. 目标
 

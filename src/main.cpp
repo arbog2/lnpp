@@ -26,11 +26,16 @@ enum {
     IDC_NG_LABEL_CERT = 315, IDC_NG_LABEL_KEY = 316,
     IDC_NG_ROOT = 317, IDC_NG_BTN_ROOT = 318, IDC_NG_LABEL_ROOT = 319,
     // postgresql page
+    // Every id here must be unique across the whole main window: WM_COMMAND
+    // dispatches on LOWORD(wParam) alone, ignoring lParam, so a duplicate turns
+    // one control's notification into another control's action. IDC_PG_BTN_RESTORE
+    // used to be 406 and collided with IDC_PG_USER below — picking a database
+    // user in the combo fired CBN_SELCHANGE and opened the restore dialog.
     IDC_PG_BTN_INIT = 400, IDC_PG_BTN_PWD = 401, IDC_PG_BTN_ADDUSER = 402,
     IDC_PG_BTN_DELUSER = 403, IDC_PG_BTN_BACKUP = 404, IDC_PG_INFO = 405,
-    IDC_PG_BTN_RESTORE = 406,
     IDC_PG_USER = 406, IDC_PG_PWD = 407, IDC_PG_PORT = 408,
     IDC_PG_LABEL_USER = 409, IDC_PG_LABEL_PWD = 410, IDC_PG_LABEL_PORT = 411,
+    IDC_PG_BTN_RESTORE = 412,
     // redis page
     IDC_REDIS_INFO = 500,
     // nodejs page
@@ -46,6 +51,24 @@ enum {
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
 };
+
+// WM_COMMAND dispatches on the id alone, so a duplicate silently turns one
+// control's notification into another control's action. Catch it at compile time
+// rather than in a bug report.
+constexpr bool idsDistinct(const int* ids, int n) {
+    for (int i = 0; i < n; ++i)
+        for (int j = i + 1; j < n; ++j)
+            if (ids[i] == ids[j]) return false;
+    return true;
+}
+constexpr int kPgPageIds[] = {
+    IDC_PG_BTN_INIT, IDC_PG_BTN_PWD, IDC_PG_BTN_ADDUSER, IDC_PG_BTN_DELUSER,
+    IDC_PG_BTN_BACKUP, IDC_PG_BTN_RESTORE, IDC_PG_INFO,
+    IDC_PG_USER, IDC_PG_PWD, IDC_PG_PORT,
+    IDC_PG_LABEL_USER, IDC_PG_LABEL_PWD, IDC_PG_LABEL_PORT,
+};
+static_assert(idsDistinct(kPgPageIds, sizeof(kPgPageIds) / sizeof(kPgPageIds[0])),
+              "duplicate control id on the postgresql page - see the note above");
 
 // tray menu item ids
 enum {

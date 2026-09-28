@@ -38,7 +38,8 @@ struct PM2App {
 struct VHost {
     std::wstring name;
     std::wstring domain;
-    std::wstring port;
+    std::wstring port;                       // display: all listen ports, comma joined
+    std::vector<std::wstring> ports;         // every port this site listens on
     std::wstring root;
 };
 
