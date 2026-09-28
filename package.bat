@@ -120,8 +120,9 @@ if defined LEAK (
 )
 
 rem ---- 4. zip ----
-rem scratch tree: keep the .lnpp-stage marker until the zip is done, then
-rem remove the whole staging dir so the next run starts clean.
+rem scratch tree: the .lnpp-stage marker is dropped just before compressing so it
+rem never lands in the archive, and the whole staging dir goes away afterwards so
+rem the next run starts clean.
 echo [4/4] compressing ...
 if not exist dist mkdir dist 2>nul
 set ZIP=%CD%\dist\LNPP-!VER!.zip
@@ -133,6 +134,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem list the staging tree before removing it (via a temp file so the output
+rem keeps one entry per line)
+set LIST=%TEMP%\lnpp-manifest-!VER!.txt
+del /q "%LIST%" 2>nul
+for /f "delims=" %%F in ('dir /b /s "%STAGE%"') do (
+    set REL=%%F
+    >>"%LIST%" echo     !REL:%STAGE%\=!
+)
 rmdir /s /q "%STAGE%\" 2>nul
 for %%F in ("%ZIP%") do set ZSIZE=%%~zF
 set /a ZKB=!ZSIZE! / 1024
@@ -142,11 +151,8 @@ echo ============================================================
 echo  [OK] dist\LNPP-!VER!.zip   (!ZKB! KB)
 echo ============================================================
 echo contents:
-for /f "delims=" %%F in ('dir /b /s "%STAGE%"') do (
-    set REL=%%F
-    set REL=!REL:%STAGE%\=!
-    echo     !REL!
-)
+type "%LIST%"
+del /q "%LIST%" 2>nul
 echo.
 echo deliberately excluded: bin\ data\ logs\ backup\ ssl\ site configs
 echo first run seeds data\packages.conf from etc\packages.conf.tpl, then
