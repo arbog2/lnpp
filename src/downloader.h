@@ -8,7 +8,7 @@
 struct PkgItem {
     std::wstring name;   // raw entry name, e.g. Nginx-1.30.4
     std::wstring url;
-    std::wstring comp;   // mapped component dir: nginx/nodejs/postgresql/redis
+    std::wstring comp;   // mapped component dir: nginx/nodejs/postgresql/redis/php
     std::wstring ver;    // text after the first '-', e.g. 1.30.4
     std::wstring sha256; // optional lowercase 64-char hex; "" = not verified.
                          // Fed by a companion "Nginx-1.30.4.sha256=hex" entry.
@@ -19,7 +19,8 @@ struct PkgSection {
     std::vector<PkgItem> items;
 };
 
-// Parse data\packages.conf. Unknown components (php/apache/...) are skipped.
+// Parse data\packages.conf. Unknown components (mysql/apache/tomcat/...) are
+// skipped.
 std::vector<PkgSection> pkgsParseConf(std::wstring& err);
 // Same parser on raw text, so the whole conf grammar is unit-testable without
 // writing a packages.conf into the runtime root (which needs admin rights and
@@ -33,7 +34,7 @@ void prepareDownloadList();
 // Map an entry name like "node-24.12" to component dir "nodejs" + version "24.12".
 bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstring& ver);
 
-// True when bin\ is missing or none of the four known components has any version dir.
+// True when bin\ is missing or none of the known components has any version dir.
 bool pkgsNeedSetup();
 
 // Download url to destFile (overwrites). progress(doneBytes, totalBytes) is called

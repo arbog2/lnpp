@@ -25,6 +25,9 @@ enum {
     IDC_NG_BTN_CERT = 313, IDC_NG_BTN_KEY = 314,
     IDC_NG_LABEL_CERT = 315, IDC_NG_LABEL_KEY = 316,
     IDC_NG_ROOT = 317, IDC_NG_BTN_ROOT = 318, IDC_NG_LABEL_ROOT = 319,
+    // site kind (node / php) + the php version a php site is pinned to
+    IDC_NG_KIND = 320, IDC_NG_LABEL_KIND = 321,
+    IDC_NG_PHPVER = 322, IDC_NG_LABEL_PHPVER = 323,
     // postgresql page
     // Every id here must be unique across the whole main window: WM_COMMAND
     // dispatches on LOWORD(wParam) alone, ignoring lParam, so a duplicate turns
@@ -50,6 +53,13 @@ enum {
     IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
+    // php page
+    IDC_PHP_POOL_LIST = 800, IDC_PHP_BTN_START = 801, IDC_PHP_BTN_STOP = 802,
+    IDC_PHP_BTN_DEFAULT = 803, IDC_PHP_INFO = 804,
+    IDC_PHP_WORKERS = 805, IDC_PHP_LABEL_WORKERS = 806, IDC_PHP_BTN_EXT = 807,
+    // extension manager dialog
+    IDC_PHPX_LIST = 900, IDC_PHPX_APPLY = 901, IDC_PHPX_CLOSE = 902,
+    IDC_PHPX_INFO = 903,
 };
 
 // WM_COMMAND dispatches on the id alone, so a duplicate silently turns one
@@ -95,6 +105,15 @@ enum {
 };
 
 // ============================ Globals ============================
+// Assigned in WM_CREATE, NOT after CreateWindowExW returns: WM_CREATE is
+// dispatched from inside CreateWindowExW, and autoStartComponents() runs there.
+// Before this was set there, every worker it spawned called
+// PostMessageW(nullptr, WM_OP_DONE, ...) as it finished, which posts to the
+// CALLING THREAD's queue instead of the window's — and the main loop's
+// DispatchMessageW then silently drops a message with a null hwnd. The result
+// was g_ui[i].busy stuck true forever: the fast components (nginx / pg / redis)
+// could never be stopped or started again from the overview, while Node.js —
+// slow enough to finish after CreateWindowExW had returned — worked fine.
 static HWND g_main = nullptr;
 static HWND g_tab = nullptr;
 static HFONT g_font = nullptr;
@@ -378,6 +397,10 @@ static void kickPm2Poll() {
 
 // ============================ Refresh functions ============================
 
+// Defined with the add-site form (initNginxPage), but the vhost refresh needs
+// it too: a php site can only point at a running php-cgi.
+static void refreshPhpVerCombo(HWND parent);
+
 static void refreshNginxVHosts() {
     HWND lv = GetDlgItem(g_main, IDC_NG_VHOST_LIST);
     if (!lv) return;
@@ -391,8 +414,95 @@ static void refreshNginxVHosts() {
         ListView_InsertItem(lv, &item);
         ListView_SetItemText(lv, item.iItem, 1, (LPWSTR)v.domain.c_str());
         ListView_SetItemText(lv, item.iItem, 2, (LPWSTR)v.port.c_str());
-        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)v.root.c_str());
+        // 类型 shows which backend a site actually got. A php site also carries
+        // its FastCGI port, so a stopped php-cgi is visible from here.
+        std::wstring kind = v.kind == SiteKind::Php
+            ? (v.phpTarget.empty() ? L"PHP" : L"PHP " + v.phpTarget)
+            : L"Node";
+        ListView_SetItemText(lv, item.iItem, 3, (LPWSTR)kind.c_str());
+        ListView_SetItemText(lv, item.iItem, 4, (LPWSTR)v.root.c_str());
     }
+    // A php site can only target a running php-cgi, so the version list the add
+    // form offers has to follow the same state this list shows.
+    refreshPhpVerCombo(g_main);
+}
+
+// The PHP version pool: one php-cgi per version, each on its own FastCGI port.
+// All installed versions run at once, so this is the real status view — the
+// common one-dot-one-version chrome above cannot express it.
+static void syncWorkersEdit();
+
+static void refreshPhpPool() {
+    HWND lv = GetDlgItem(g_main, IDC_PHP_POOL_LIST);
+    if (!lv) return;
+    int prev = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    std::wstring keepSel;
+    // Row -> version is the order of phpListPool(), so the selected version is
+    // recovered by re-querying rather than by reading the control's text:
+    // LVM_GETITEMTEXT copies whatever length the caller claims (the P0-2 trap)
+    // and a version name is a directory name on disk, so it is not bounded.
+    if (prev >= 0) {
+        std::vector<PhpInstance> pool = phpListPool();
+        if (prev < (int)pool.size()) keepSel = pool[prev].version;
+    }
+    ListView_DeleteAllItems(lv);
+    int row = 0;
+    for (const PhpInstance& pi : phpListPool()) {
+        LVITEMW item = {0};
+        item.mask = LVIF_TEXT;
+        item.iItem = row;
+        item.pszText = (LPWSTR)pi.version.c_str();
+        ListView_InsertItem(lv, &item);
+        ListView_SetItemText(lv, row, 1, (LPWSTR)std::to_wstring(pi.workers).c_str());
+        std::wstring ports = pi.port;
+        if (pi.workers > 1 && !ports.empty())
+            ports += L"-" + std::to_wstring(_wtoi(pi.port.c_str()) + pi.workers - 1);
+        ListView_SetItemText(lv, row, 2, (LPWSTR)(ports.empty() ? L"未分配" : ports.c_str()));
+        ListView_SetItemText(lv, row, 3, (LPWSTR)(pi.running ? L"运行中" : L"已停止"));
+        ListView_SetItemText(lv, row, 4, (LPWSTR)(pi.isDefault ? L"★ 默认" : L""));
+        ListView_SetItemText(lv, row, 5,
+                             (LPWSTR)compDataVerDir(Comp::Php, pi.version).c_str());
+        ++row;
+    }
+    if (!keepSel.empty()) {
+        std::vector<PhpInstance> pool = phpListPool();
+        for (int i = 0; i < (int)pool.size(); ++i) {
+            if (pool[i].version == keepSel) {
+                ListView_SetItemState(lv, i, LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
+                break;
+            }
+        }
+    }
+    syncWorkersEdit();
+    refreshPhpVerCombo(g_main);
+}
+
+// Defined with the PHP pool list (below), but the vhost refresh and the
+// workers box both need it earlier in the file.
+static std::wstring phpSelectedVersion();
+
+// Keep the "进程数" box in step with the selected row, so it always shows what
+// that version is actually running rather than a stale number.
+static void syncWorkersEdit() {
+    HWND e = GetDlgItem(g_main, IDC_PHP_WORKERS);
+    if (!e) return;
+    std::wstring v = phpSelectedVersion();
+    if (v.empty()) { SetWindowTextW(e, L""); return; }
+    SetWindowTextW(e, std::to_wstring(phpWorkerCount(v)).c_str());
+}
+
+// Version string of the selected row in the PHP pool, or "" when nothing is
+// selected. Same reason as above: derived from the pool, never from the
+// control's own text.
+static std::wstring phpSelectedVersion() {
+    HWND lv = GetDlgItem(g_main, IDC_PHP_POOL_LIST);
+    if (!lv) return std::wstring();
+    int sel = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    if (sel < 0) return std::wstring();
+    std::vector<PhpInstance> pool = phpListPool();
+    if (sel >= (int)pool.size()) return std::wstring();
+    return pool[sel].version;
 }
 
 static void refreshPgInfo() {
@@ -479,6 +589,7 @@ static void refreshAll(Comp c) {
         case Comp::Postgresql: refreshPgInfo(); break;
         case Comp::Redis: refreshRedisInfo(); break;
         case Comp::Nodejs: refreshPm2List(); break;
+        case Comp::Php: refreshPhpPool(); break;
         default: break;
     }
 }
@@ -499,11 +610,17 @@ static void refreshOverview() {
         int state = installed ? (running ? 2 : 1) : 0;
         SetWindowLongPtrW(ov.dot[i], GWLP_USERDATA, state);
         InvalidateRect(ov.dot[i], nullptr, TRUE);
+        // Say "操作中" while an operation is in flight. The poller reports
+        // liveness independently, so a component can read "运行中" while its
+        // button is disabled — with no such wording the two look contradictory
+        // and the greyed button reads as a bug rather than as "wait".
+        bool busy = g_ui[i].busy;
         std::wstring txt = !installed ? L"未安装"
-                         : (running ? L"运行中 " + ver : L"已停止");
+                         : (busy ? L"操作中…"
+                                 : (running ? L"运行中 " + ver : L"已停止"));
         SetWindowTextW(ov.status[i], txt.c_str());
-        SetWindowTextW(ov.btnToggle[i], running ? L"停止" : L"启动");
-        EnableWindow(ov.btnToggle[i], !g_ui[i].busy && !allBusy);
+        SetWindowTextW(ov.btnToggle[i], busy ? L"…" : (running ? L"停止" : L"启动"));
+        EnableWindow(ov.btnToggle[i], !busy && !allBusy);
     }
     EnableWindow(ov.btnAllStart, !allBusy);
     EnableWindow(ov.btnAllRestart, !allBusy);
@@ -1058,8 +1175,19 @@ static void initOverviewPage(HWND parent) {
     ov.controls.push_back(ov.btnAllRestart);
     ov.controls.push_back(ov.btnAllStop);
 
+    // Component rows. The pitch is derived from Comp::Count instead of being
+    // hardcoded: with four components a fixed 40px stride happened to end just
+    // above the PATH button row, so the fifth row (PHP) landed at y=272 and
+    // painted straight over the buttons at y=264. Now the band between the
+    // "全部启动" row and that button row is divided by however many components
+    // exist, capped so few components do not spread out and many do not crush.
+    const int kRowTop = 102;
+    const int kRowLimit = 258;          // first y the PATH button row may use
+    int pitch = (kRowLimit - kRowTop) / (int)Comp::Count;
+    if (pitch > 40) pitch = 40;
+    if (pitch < 26) pitch = 26;         // a row is 24px tall; below this they touch
     for (int i = 0; i < (int)Comp::Count; ++i) {
-        int y = 112 + i * 40;
+        int y = kRowTop + i * pitch;
         Comp c = (Comp)i;
         HWND dot = makeCtl(0, DOT_CLASS, L"", WS_CHILD | WS_VISIBLE, 24, y + 4, 16, 16, parent);
         HWND name = makeCtl(0, L"STATIC", compDisplay(c), SS_LEFT, 48, y, 96, 20, parent);
@@ -1092,11 +1220,14 @@ static void initOverviewPage(HWND parent) {
 
     HWND log = makeCtl(IDC_OV_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-                       10, 320, 700, 170, parent);
+                       10, 320, 700, 190, parent);
     SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
     ov.logEdit = log;
     ov.controls.push_back(log);
-    HWND bClearLog = makeCtl(IDC_OV_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 494, 90, 24, parent);
+    // Ends at y=540. The client area is 553 (window 760x610 less the caption
+    // and border), so the button clears the bottom edge instead of being sliced
+    // in half by it — which is what happened at 560.
+    HWND bClearLog = makeCtl(IDC_OV_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 516, 90, 24, parent);
     ov.controls.push_back(bClearLog);
 
     // bottom-right: version text + "关于" link
@@ -1123,42 +1254,62 @@ static void initNginxPage(HWND parent) {
     ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     LVCOLUMNW col = {0};
     col.mask = LVCF_TEXT | LVCF_WIDTH;
-    col.cx = 120; col.pszText = (LPWSTR)L"站点"; ListView_InsertColumn(lv, 0, &col);
-    col.cx = 160; col.pszText = (LPWSTR)L"域名"; ListView_InsertColumn(lv, 1, &col);
-    col.cx = 60;  col.pszText = (LPWSTR)L"端口"; ListView_InsertColumn(lv, 2, &col);
-    col.cx = 80;  col.pszText = (LPWSTR)L"根目录"; ListView_InsertColumn(lv, 3, &col);
+    col.cx = 100; col.pszText = (LPWSTR)L"站点"; ListView_InsertColumn(lv, 0, &col);
+    col.cx = 130; col.pszText = (LPWSTR)L"域名"; ListView_InsertColumn(lv, 1, &col);
+    col.cx = 50;  col.pszText = (LPWSTR)L"端口"; ListView_InsertColumn(lv, 2, &col);
+    col.cx = 60;  col.pszText = (LPWSTR)L"类型"; ListView_InsertColumn(lv, 3, &col);
+    col.cx = 80;  col.pszText = (LPWSTR)L"根目录"; ListView_InsertColumn(lv, 4, &col);
 
     HWND bAdd = makeCtl(IDC_NG_BTN_ADD, L"BUTTON", L"添加站点", BS_PUSHBUTTON, 20, 248, 90, 26, parent);
     HWND bDel = makeCtl(IDC_NG_BTN_DEL, L"BUTTON", L"删除", BS_PUSHBUTTON, 120, 248, 70, 26, parent);
     HWND bReload = makeCtl(IDC_NG_BTN_RELOAD, L"BUTTON", L"重载", BS_PUSHBUTTON, 200, 248, 70, 26, parent);
 
+    // Right-hand add-site form. 21px pitch instead of 22 so the two extra rows
+    // (site kind, php version) still end above the log box at y=280.
     HWND lName = makeCtl(IDC_NG_LABEL_NAME, L"STATIC", L"站点名:", SS_LEFT, 450, 82, 60, 20, parent);
     HWND eName = makeCtl(IDC_NG_ADD_NAME, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 80, 170, 22, parent);
-    HWND lDomain = makeCtl(IDC_NG_LABEL_DOMAIN, L"STATIC", L"域名:", SS_LEFT, 450, 104, 60, 20, parent);
-    HWND eDomain = makeCtl(IDC_NG_ADD_DOMAIN, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 102, 170, 22, parent);
-    HWND lPort = makeCtl(IDC_NG_LABEL_PORT, L"STATIC", L"端口:", SS_LEFT, 450, 126, 60, 20, parent);
-    HWND ePort = makeCtl(IDC_NG_ADD_PORT, L"EDIT", L"80", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 124, 170, 22, parent);
-    HWND lRoot = makeCtl(IDC_NG_LABEL_ROOT, L"STATIC", L"根目录:", SS_LEFT, 450, 148, 60, 20, parent);
-    HWND eRoot = makeCtl(IDC_NG_ROOT, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 146, 150, 22, parent);
-    HWND bRoot = makeCtl(IDC_NG_BTN_ROOT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 146, 45, 22, parent);
-
-    HWND chkSsl = makeCtl(IDC_NG_SSL, L"BUTTON", L"HTTPS/SSL", BS_AUTOCHECKBOX, 450, 170, 120, 20, parent);
-    HWND lCert = makeCtl(IDC_NG_LABEL_CERT, L"STATIC", L"证书:", SS_LEFT, 450, 192, 60, 20, parent);
-    HWND eCert = makeCtl(IDC_NG_CERT, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 190, 150, 22, parent);
-    HWND bCert = makeCtl(IDC_NG_BTN_CERT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 190, 45, 22, parent);
-    HWND lKey = makeCtl(IDC_NG_LABEL_KEY, L"STATIC", L"Key:", SS_LEFT, 450, 214, 60, 20, parent);
-    HWND eKey = makeCtl(IDC_NG_KEY, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 212, 150, 22, parent);
-    HWND bKey = makeCtl(IDC_NG_BTN_KEY, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 212, 45, 22, parent);
+    HWND lDomain = makeCtl(IDC_NG_LABEL_DOMAIN, L"STATIC", L"域名:", SS_LEFT, 450, 103, 60, 20, parent);
+    HWND eDomain = makeCtl(IDC_NG_ADD_DOMAIN, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 101, 170, 22, parent);
+    HWND lPort = makeCtl(IDC_NG_LABEL_PORT, L"STATIC", L"端口:", SS_LEFT, 450, 124, 60, 20, parent);
+    HWND ePort = makeCtl(IDC_NG_ADD_PORT, L"EDIT", L"80", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 122, 170, 22, parent);
+    HWND lRoot = makeCtl(IDC_NG_LABEL_ROOT, L"STATIC", L"根目录:", SS_LEFT, 450, 145, 60, 20, parent);
+    HWND eRoot = makeCtl(IDC_NG_ROOT, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 510, 143, 150, 22, parent);
+    HWND bRoot = makeCtl(IDC_NG_BTN_ROOT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 143, 45, 22, parent);
+    // The kind decides which etc\ template the vhost is rendered from: node
+    // (static files first, then proxy_pass) or php (static files first, then
+    // fastcgi_pass to a php-cgi instance).
+    HWND lKind = makeCtl(IDC_NG_LABEL_KIND, L"STATIC", L"类型:", SS_LEFT, 450, 166, 60, 20, parent);
+    HWND cKind = makeCtl(IDC_NG_KIND, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                         CBS_DROPDOWNLIST | WS_VSCROLL, 510, 164, 170, 200, parent);
+    SendMessageW(cKind, CB_ADDSTRING, 0, (LPARAM)L"Node.js（静态优先）");
+    SendMessageW(cKind, CB_ADDSTRING, 0, (LPARAM)L"PHP（FastCGI）");
+    SendMessageW(cKind, CB_SETCURSEL, 0, 0);
+    // Which php-cgi this site talks to. Only meaningful for php sites, so it
+    // starts hidden, like the SSL inputs below.
+    HWND lPhpVer = makeCtl(IDC_NG_LABEL_PHPVER, L"STATIC", L"PHP 版本:", SS_LEFT, 450, 187, 60, 20, parent);
+    HWND cPhpVer = makeCtl(IDC_NG_PHPVER, WC_COMBOBOXW, L"", WS_CHILD | WS_BORDER |
+                           CBS_DROPDOWNLIST | WS_VSCROLL, 510, 185, 170, 200, parent);
+    for (HWND h : { lPhpVer, cPhpVer }) ShowWindow(h, SW_HIDE);
+    HWND chkSsl = makeCtl(IDC_NG_SSL, L"BUTTON", L"HTTPS/SSL", BS_AUTOCHECKBOX, 450, 208, 120, 20, parent);
+    HWND lCert = makeCtl(IDC_NG_LABEL_CERT, L"STATIC", L"证书:", SS_LEFT, 450, 229, 60, 20, parent);
+    HWND eCert = makeCtl(IDC_NG_CERT, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 227, 150, 22, parent);
+    HWND bCert = makeCtl(IDC_NG_BTN_CERT, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 227, 45, 22, parent);
+    HWND lKey = makeCtl(IDC_NG_LABEL_KEY, L"STATIC", L"Key:", SS_LEFT, 450, 250, 60, 20, parent);
+    HWND eKey = makeCtl(IDC_NG_KEY, L"EDIT", L"", WS_CHILD | WS_BORDER, 510, 248, 150, 22, parent);
+    HWND bKey = makeCtl(IDC_NG_BTN_KEY, L"BUTTON", L"浏览", BS_PUSHBUTTON, 665, 248, 45, 22, parent);
     // SSL inputs start hidden; the HTTPS/SSL checkbox reveals them
     for (HWND h : { lCert, eCert, bCert, lKey, eKey, bKey }) ShowWindow(h, SW_HIDE);
-    // SSL-only controls are toggled by the checkbox; keep them out of pageControls
-    // so switching tabs never forces them visible
+    // Kind / php-version / SSL controls are driven by their own combo and
+    // checkbox, not by the tab, so keep them out of pageControls — otherwise
+    // switching tabs would force them all visible.
     ui.pageControls.push_back(lName);
     ui.pageControls.push_back(lDomain);
     ui.pageControls.push_back(lPort);
     ui.pageControls.push_back(lRoot);
     ui.pageControls.push_back(eRoot);
     ui.pageControls.push_back(bRoot);
+    ui.pageControls.push_back(lKind);
+    ui.pageControls.push_back(cKind);
     ui.pageControls.push_back(chkSsl);
     ui.pageControls.push_back(eName);
     ui.pageControls.push_back(eDomain);
@@ -1166,6 +1317,57 @@ static void initNginxPage(HWND parent) {
     ui.pageControls.push_back(bAdd);
     ui.pageControls.push_back(bDel);
     ui.pageControls.push_back(bReload);
+    refreshPhpVerCombo(parent);
+}
+
+// Fill the "PHP 版本" combo of the add-site form with the versions that are
+// actually running — a php site pointing at a port nothing listens on answers
+// every request with 502, so an idle version must not be offered here.
+// Takes the parent explicitly: this runs from WM_CREATE, where g_main is still
+// null (it is only assigned once CreateWindowExW returns).
+static void refreshPhpVerCombo(HWND parent) {
+    HWND c = GetDlgItem(parent, IDC_NG_PHPVER);
+    if (!c) return;
+    std::wstring keep;
+    int cur = (int)SendMessageW(c, CB_GETCURSEL, 0, 0);
+    if (cur != CB_ERR) {
+        // Ask for the length first: CB_GETLBTEXT copies what the caller claims
+        // to have and never checks (the P0-2 bug), and the version text is
+        // built from a directory name on disk, which can be arbitrarily long.
+        int len = (int)SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)cur, 0);
+        if (len >= 0 && len < 4096) {
+            std::vector<wchar_t> buf((size_t)len + 1);
+            SendMessageW(c, CB_GETLBTEXT, (WPARAM)cur, (LPARAM)buf.data());
+            keep = buf.data();
+        }
+    }
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    int n = 0;
+    for (const PhpInstance& pi : phpListPool()) {
+        if (!pi.running) continue;
+        std::wstring item = pi.version + L"（端口 " + pi.port + L"）";
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)item.c_str());
+        ++n;
+    }
+    if (n == 0) {
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"（没有正在运行的 PHP）");
+        SendMessageW(c, CB_SETCURSEL, 0, 0);
+        return;
+    }
+    if (!keep.empty()) SendMessageW(c, CB_SELECTSTRING, (WPARAM)-1, (LPARAM)keep.c_str());
+    if (SendMessageW(c, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessageW(c, CB_SETCURSEL, 0, 0);
+}
+
+// Show the PHP version row only while the kind combo says PHP, and keep it in
+// sync with what is actually running. Returns true when the site is a php site.
+static bool siteFormIsPhp(HWND hwnd) {
+    HWND c = GetDlgItem(hwnd, IDC_NG_KIND);
+    bool isPhp = c && SendMessageW(c, CB_GETCURSEL, 0, 0) == 1;
+    for (int id : { IDC_NG_LABEL_PHPVER, IDC_NG_PHPVER }) {
+        HWND h = GetDlgItem(hwnd, id);
+        if (h) ShowWindow(h, isPhp ? SW_SHOW : SW_HIDE);
+    }
+    return isPhp;
 }
 
 static void initPgPage(HWND parent) {
@@ -1242,6 +1444,55 @@ static void initNodePage(HWND parent) {
     ui.pageControls.push_back(bDelete);
 }
 
+static void initPhpPage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Php];
+    // The common chrome above (one status dot, one version combo, one 启动) can
+    // only express a single current version, which is not how PHP works here:
+    // every installed version runs at once on its own FastCGI port. The list is
+    // therefore the real view of the component, and the common 启动/停止 act on
+    // all versions while the combo only picks the default for new sites.
+    HWND lv = makeCtl(IDC_PHP_POOL_LIST, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                      LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                      20, 82, 660, 120, parent);
+    ui.pageControls.push_back(lv);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    LVCOLUMNW col = {0};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = 90;  col.pszText = (LPWSTR)L"版本"; ListView_InsertColumn(lv, 0, &col);
+    col.cx = 60;  col.pszText = (LPWSTR)L"进程数"; ListView_InsertColumn(lv, 1, &col);
+    col.cx = 110; col.pszText = (LPWSTR)L"FastCGI 端口"; ListView_InsertColumn(lv, 2, &col);
+    col.cx = 100; col.pszText = (LPWSTR)L"状态"; ListView_InsertColumn(lv, 3, &col);
+    col.cx = 100; col.pszText = (LPWSTR)L"默认版本"; ListView_InsertColumn(lv, 4, &col);
+    col.cx = 200; col.pszText = (LPWSTR)L"配置文件"; ListView_InsertColumn(lv, 5, &col);
+
+    HWND bStart = makeCtl(IDC_PHP_BTN_START, L"BUTTON", L"启动选中", BS_PUSHBUTTON, 20, 216, 90, 26, parent);
+    HWND bStop  = makeCtl(IDC_PHP_BTN_STOP,  L"BUTTON", L"停止选中", BS_PUSHBUTTON, 118, 216, 90, 26, parent);
+    HWND bDef   = makeCtl(IDC_PHP_BTN_DEFAULT, L"BUTTON", L"设为默认", BS_PUSHBUTTON, 216, 216, 90, 26, parent);
+    HWND bExt   = makeCtl(IDC_PHP_BTN_EXT,   L"BUTTON", L"扩展管理", BS_PUSHBUTTON, 314, 216, 90, 26, parent);
+    ui.pageControls.push_back(bStart);
+    ui.pageControls.push_back(bStop);
+    ui.pageControls.push_back(bDef);
+    ui.pageControls.push_back(bExt);
+    addTooltip(parent, bDef, L"只影响新建 PHP 站点默认选中哪个版本；所有已安装版本始终一起运行");
+    addTooltip(parent, bExt, L"勾选要启用的扩展，写入该版本的 php.ini 并重启它");
+
+    // Worker count. Windows has no PHP-FPM, so this number is the whole
+    // concurrency story for a version: N php-cgi processes on N consecutive
+    // ports, round-robined by an nginx upstream.
+    HWND lWorkers = makeCtl(IDC_PHP_LABEL_WORKERS, L"STATIC", L"选中版本进程数:", SS_LEFT, 420, 222, 110, 20, parent);
+    HWND eWorkers = makeCtl(IDC_PHP_WORKERS, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL, 534, 220, 50, 22, parent);
+    ui.pageControls.push_back(lWorkers);
+    ui.pageControls.push_back(eWorkers);
+    addTooltip(parent, eWorkers, L"1-32。修改后点「启动选中」按新进程数重启该版本；站点配置会自动改指向对应的 upstream");
+
+    HWND info = makeCtl(IDC_PHP_INFO, L"STATIC", L"", SS_LEFT, 20, 250, 660, 24, parent);
+    ui.pageControls.push_back(info);
+    // One honest sentence about the platform limit, so nobody reads a green
+    // status light as "this scales".
+    SetWindowTextW(info,
+        L"Windows 无 PHP-FPM：单个 php-cgi 串行处理请求。进程数 >1 时 nginx 用 upstream 轮询多个端口。");
+}
+
 static void initCommonControls(HWND parent, Comp c) {
     CompUI& ui = g_ui[(int)c];
     ui.pageControls.clear();
@@ -1256,11 +1507,11 @@ static void initCommonControls(HWND parent, Comp c) {
     HWND bStop = makeCtl(IDC_BTN_STOP, L"BUTTON", L"停止", BS_PUSHBUTTON, 490, 38, 70, 24, parent);
     HWND bCfg = makeCtl(IDC_BTN_CFG, L"BUTTON", L"配置", BS_PUSHBUTTON, 570, 38, 70, 24, parent);
     HWND bData = makeCtl(IDC_BTN_DATA, L"BUTTON", L"数据目录", BS_PUSHBUTTON, 645, 38, 80, 24, parent);
-    HWND bClearLog = makeCtl(IDC_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 436, 90, 24, parent);
-    // Shorter than it was (170 -> 150): the PostgreSQL column needs a sixth
-    // button row, and 150 rows of monospace log is plenty for this window.
+    // Log 280..470 with the clear button at 476..500, so the taller window is
+    // used instead of leaving a band of dead space under every component page.
+    HWND bClearLog = makeCtl(IDC_BTN_CLEAR_LOG, L"BUTTON", L"清空日志", BS_PUSHBUTTON, 620, 476, 90, 24, parent);
     HWND log = makeCtl(IDC_LOG, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
-                       ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 150, parent);
+                       ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 280, 700, 190, parent);
     SendMessageW(log, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
 
     ui.dot = dot; ui.statusTxt = st; ui.verCombo = combo;
@@ -1693,6 +1944,181 @@ static void showAboutDialog(HWND owner) {
     DestroyWindow(dlg);
 }
 
+// ============================ PHP extension manager ============================
+//
+// Checkbox list over one version's ext\ directory. The rows are rendered into
+// the list's text column with a [x]/[ ] prefix rather than using a state image
+// list: it keeps the dialog to one image list (the shared one the dot control
+// already creates) and the "missing dll" case is visible in the same row.
+
+struct PhpExtState {
+    std::wstring version;
+    std::vector<PhpExtension> exts;
+    std::vector<bool> want;
+    HWND list = nullptr, info = nullptr;
+    bool applied = false;
+};
+
+static std::wstring phpExtRowText(const PhpExtension& e, bool on) {
+    std::wstring s = on ? L"[x] " : L"[ ] ";
+    s += e.name;
+    if (!e.loaded) s += L"   ← 缺少 " + e.dll + L"（该版本未附带）";
+    return s;
+}
+
+static void phpExtRefresh(HWND hwnd) {
+    PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!st || !st->list) return;
+    int prev = ListView_GetNextItem(st->list, -1, LVNI_SELECTED);
+    ListView_DeleteAllItems(st->list);
+    for (size_t i = 0; i < st->exts.size(); ++i) {
+        LVITEMW item = {0};
+        item.mask = LVIF_TEXT;
+        item.iItem = (int)i;
+        std::wstring row = phpExtRowText(st->exts[i], st->want[i]);
+        item.pszText = (LPWSTR)row.c_str();
+        int idx = ListView_InsertItem(st->list, &item);
+        if (idx >= 0 && prev == (int)i)
+            ListView_SetItemState(st->list, idx, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    int onCount = 0, missing = 0;
+    for (size_t i = 0; i < st->exts.size(); ++i) {
+        if (st->want[i]) ++onCount;
+        if (!st->exts[i].loaded) ++missing;
+    }
+    std::wstring info = L"共 " + std::to_wstring(st->exts.size()) + L" 个扩展，已启用 " +
+                        std::to_wstring(onCount) + L" 个";
+    if (missing) info += L"；其中 " + std::to_wstring(missing) + L" 个缺少 dll（通常是 PECL 扩展，需自行安装）";
+    info += L"。点「应用」写入 " + st->version + L" 的 php.ini，然后重启该版本生效。";
+    SetWindowTextW(st->info, info.c_str());
+}
+
+static void phpExtToggle(HWND hwnd) {
+    PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!st || !st->list) return;
+    int sel = ListView_GetNextItem(st->list, -1, LVNI_SELECTED);
+    if (sel < 0 || sel >= (int)st->exts.size()) return;
+    st->want[sel] = !st->want[sel];
+    phpExtRefresh(hwnd);
+}
+
+static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            PhpExtState* st = (PhpExtState*)lParam;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+            RECT rc; GetClientRect(hwnd, &rc);
+            st->list = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP |
+                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                10, 10, rc.right - 20, rc.bottom - 66, hwnd,
+                (HMENU)(INT_PTR)IDC_PHPX_LIST, GetModuleHandleW(nullptr), nullptr);
+            if (st->list) {
+                ListView_SetExtendedListViewStyle(st->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+                LVCOLUMNW col = {0};
+                col.mask = LVCF_TEXT | LVCF_WIDTH;
+                col.cx = rc.right - 40; col.pszText = (LPWSTR)L"扩展（点一行切换勾选）";
+                ListView_InsertColumn(st->list, 0, &col);
+            }
+            st->info = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                10, rc.bottom - 52, rc.right - 20, 30, hwnd,
+                (HMENU)(INT_PTR)IDC_PHPX_INFO, GetModuleHandleW(nullptr), nullptr);
+            HWND bApply = CreateWindowExW(0, L"BUTTON", L"应用并重启", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                rc.right - 200, rc.bottom - 30, 90, 24, hwnd,
+                (HMENU)(INT_PTR)IDC_PHPX_APPLY, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                rc.right - 100, rc.bottom - 30, 90, 24, hwnd,
+                (HMENU)(INT_PTR)IDC_PHPX_CLOSE, GetModuleHandleW(nullptr), nullptr);
+            SetFocus(bApply);
+            phpExtRefresh(hwnd);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            if (((LPNMHDR)lParam)->idFrom == IDC_PHPX_LIST &&
+                ((LPNMHDR)lParam)->code == NM_CLICK) {
+                phpExtToggle(hwnd);
+                return 0;
+            }
+            break;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
+            if (id == IDC_PHPX_CLOSE) { DestroyWindow(hwnd); return 0; }
+            if (id == IDC_PHPX_APPLY) {
+                PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                if (!st) return 0;
+                std::vector<std::wstring> wanted;
+                for (size_t i = 0; i < st->exts.size(); ++i)
+                    if (st->want[i]) wanted.push_back(st->exts[i].name);
+                std::wstring ver = st->version;
+                // Writing php.ini and restarting a php-cgi both take a moment
+                // and must not run on the UI thread (see isUiThread's contract).
+                runAsync(Comp::Php, L"应用 PHP " + ver + L" 扩展设置", [ver, wanted](std::wstring& err) {
+                    int n = phpApplyExtensions(ver, wanted, err);
+                    if (n < 0) return false;
+                    // The ini is only read when php-cgi starts, so a live pool
+                    // keeps the old extension set until it is restarted.
+                    std::wstring serr;
+                    if (phpRunning(ver)) {
+                        phpStop(ver, serr);
+                        if (!phpStart(ver, serr)) {
+                            err = L"扩展已写入，但重启 PHP 失败: " + serr;
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+                st->applied = true;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE: DestroyWindow(hwnd); return 0;
+        case WM_DESTROY: return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void showPhpExtDialog(HWND owner, const std::wstring& ver) {
+    std::wstring err;
+    std::vector<PhpExtension> exts = phpListExtensions(ver, err);
+    if (exts.empty()) {
+        MessageBoxW(owner, err.empty() ? L"该版本没有可用的扩展目录" : err.c_str(),
+                    L"扩展管理", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = PhpExtProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"LNPPPhpExt";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    // The state outlives the window: the apply path hands the version and the
+    // wanted set to a worker thread by value before the dialog is destroyed.
+    static PhpExtState st;
+    st.version = ver;
+    st.exts = exts;
+    st.want.clear();
+    st.want.reserve(exts.size());
+    for (const PhpExtension& e : exts) st.want.push_back(e.enabled);
+    st.applied = false;
+
+    std::wstring title = L"PHP " + ver + L" 扩展管理";
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPPhpExt", title.c_str(),
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 520, 420,
+                               owner, nullptr, GetModuleHandleW(nullptr), &st);
+    if (!dlg) return;
+    centerOn(dlg, owner);
+    modal_loop(dlg, owner);
+    DestroyWindow(dlg);
+}
+
 // ============================ Downloader dialog ============================
 
 struct DlState {
@@ -1960,6 +2386,10 @@ static Comp compFromControl(HWND ctl) {
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
+            // Must be the first statement: autoStartComponents() below spawns
+            // workers that PostMessage back to this window as they finish, and
+            // WM_CREATE runs while CreateWindowExW has not yet returned.
+            g_main = hwnd;
             g_tab = makeCtl(IDC_TAB, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 720, 30, hwnd);
             TCITEMW ti = {0};
             ti.mask = TCIF_TEXT;
@@ -1973,6 +2403,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             TabCtrl_InsertItem(g_tab, compToTab(Comp::Redis), &ti);
             ti.pszText = (LPWSTR)L"Node.js";
             TabCtrl_InsertItem(g_tab, compToTab(Comp::Nodejs), &ti);
+            ti.pszText = (LPWSTR)L"PHP";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Php), &ti);
 
             initOverviewPage(hwnd);
             initCommonControls(hwnd, Comp::Nginx);
@@ -1983,6 +2415,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             initRedisPage(hwnd);
             initCommonControls(hwnd, Comp::Nodejs);
             initNodePage(hwnd);
+            initCommonControls(hwnd, Comp::Php);
+            initPhpPage(hwnd);
 
             showPage(TAB_OVERVIEW);
             kickStatusPoll();
@@ -1990,7 +2424,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetTimer(hwnd, 1, 3000, pm2Timer);    // pm2 refresh
             SetTimer(hwnd, 2, 2000, statusTimer); // status poll
             SetTimer(hwnd, 3, 50, iniFlushTimer); // drain pending ini writes
-            autoStartComponents();
+            // autoStartComponents() is NOT called here: it spawns worker threads,
+            // and doing that from inside WM_CREATE means they can finish and
+            // PostMessage back before CreateWindowExW has returned. WinMain calls
+            // it right after the window exists.
             return 0;
         }
         case WM_COMMAND: {
@@ -2090,11 +2527,34 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     bool ssl = SendMessageW(GetDlgItem(hwnd, IDC_NG_SSL), BM_GETCHECK, 0, 0) == BST_CHECKED;
                     GetDlgItemTextW(hwnd, IDC_NG_CERT, cert, 1024);
                     GetDlgItemTextW(hwnd, IDC_NG_KEY, key, 1024);
+                    bool isPhp = siteFormIsPhp(hwnd);
+                    std::wstring phpVer;
+                    if (isPhp) {
+                        // The combo text is "8.3（端口 9000）"; the version is the
+                        // leading token before the bracket.
+                        wchar_t buf[256] = {0};
+                        GetDlgItemTextW(hwnd, IDC_NG_PHPVER, buf, 256);
+                        std::wstring full = buf;
+                        size_t br = full.find(L'（');
+                        phpVer = trimStr(br == std::wstring::npos ? full : full.substr(0, br));
+                        if (phpVer.empty() || phpVer.rfind(L"没有", 0) == 0) {
+                            MessageBoxW(hwnd, L"没有正在运行的 PHP 版本。\n\n"
+                                            L"请先到「PHP」页签启动至少一个版本，再来添加 PHP 站点。",
+                                        L"无法添加站点", MB_OK | MB_ICONWARNING);
+                            break;
+                        }
+                    }
                     std::wstring nm = name, dm = domain, pt = port, ct = cert, ky = key, rt = root;
+                    SiteKind kind = isPhp ? SiteKind::Php : SiteKind::Node;
                     g_pendingVhostClear = true;
-                    runAsync(Comp::Nginx, L"添加虚拟站点 " + nm, [nm, dm, pt, ssl, ct, ky, rt](std::wstring& err) {
-                        return nginxAddVHostEx(nm, dm, pt, ssl, ct, ky, rt, err);
+                    runAsync(Comp::Nginx, L"添加虚拟站点 " + nm,
+                             [nm, dm, pt, ssl, ct, ky, rt, kind, phpVer](std::wstring& err) {
+                        return nginxAddVHostEx(nm, dm, pt, ssl, ct, ky, rt, kind, phpVer, err);
                     });
+                    break;
+                }
+                case IDC_NG_KIND: {
+                    if (HIWORD(wParam) == CBN_SELCHANGE) siteFormIsPhp(hwnd);
                     break;
                 }
                 case IDC_NG_BTN_ROOT: {
@@ -2164,6 +2624,58 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     });
                     break;
                 }
+                case IDC_PHP_BTN_START:
+                case IDC_PHP_BTN_STOP: {
+                    std::wstring v = phpSelectedVersion();
+                    if (v.empty()) { logAppend(Comp::Php, L"请先在版本列表中选中一个 PHP 版本"); break; }
+                    bool start = (id == IDC_PHP_BTN_START);
+                    // The process count is a setting, not a start option, so it
+                    // is committed here: reading it from the edit box at click
+                    // time means the user can just type a number and press 启动.
+                    int want = 1;
+                    if (HWND ew = GetDlgItem(hwnd, IDC_PHP_WORKERS)) {
+                        wchar_t buf[16] = {0};
+                        GetWindowTextW(ew, buf, 16);
+                        std::wstring t = trimStr(buf);
+                        if (!t.empty()) {
+                            want = _wtoi(t.c_str());
+                            if (want < 1) want = 1;
+                            if (want > 32) want = 32;
+                        }
+                    }
+                    if (start && want != phpWorkerCount(v)) {
+                        iniSet(L"php.workers." + v, std::to_wstring(want));
+                        // A site points at an upstream as soon as the pool is
+                        // bigger than one, so the vhost has to be rewritten.
+                        // nginxReload regenerates the config (picking up the new
+                        // {{PHP_UPSTREAM}}) and re-copies every site.
+                        ComponentStatus ng = compStatus(Comp::Nginx);
+                        if (ng.installed) {
+                            std::wstring nerr;
+                            if (!nginxReload(nerr))
+                                logAppend(Comp::Php, L"改进程数后重载 nginx 失败: " + nerr);
+                        }
+                    }
+                    runAsync(Comp::Php, (start ? L"启动 PHP " : L"停止 PHP ") + v,
+                             [v, start](std::wstring& err) {
+                        return start ? phpStart(v, err) : phpStop(v, err);
+                    });
+                    break;
+                }
+                case IDC_PHP_BTN_DEFAULT: {
+                    std::wstring v = phpSelectedVersion();
+                    if (v.empty()) { logAppend(Comp::Php, L"请先选中要设为默认的 PHP 版本"); break; }
+                    runAsync(Comp::Php, L"设 PHP " + v + L" 为默认版本", [v](std::wstring& err) {
+                        return compSwitchVersion(Comp::Php, v, err);
+                    });
+                    break;
+                }
+                case IDC_PHP_BTN_EXT: {
+                    std::wstring v = phpSelectedVersion();
+                    if (v.empty()) { logAppend(Comp::Php, L"请先选中要管理扩展的 PHP 版本"); break; }
+                    showPhpExtDialog(hwnd, v);
+                    break;
+                }
                 case IDC_PG_BTN_INIT: pgOpInit(); break;
                 case IDC_PG_BTN_PWD: pgOpPwd(); break;
                 case IDC_PG_BTN_ADDUSER: pgOpAddUser(); break;
@@ -2197,6 +2709,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             NMHDR* nm = (NMHDR*)lParam;
             if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
                 showPage(TabCtrl_GetCurSel(g_tab));
+            } else if (nm->idFrom == IDC_PHP_POOL_LIST && nm->code == LVN_ITEMCHANGED) {
+                // Keep the process-count box showing what the selected row
+                // actually runs, not whatever was typed for a previous row.
+                syncWorkersEdit();
             }
             break;
         }
@@ -2409,7 +2925,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     g_main = CreateWindowExW(0, L"LNPPManager", L"LNPP 组件管理器",
                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                              WS_MINIMIZEBOX | WS_CLIPCHILDREN,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 760, 610,
                              nullptr, nullptr, hInst, nullptr);
     if (!g_main) return 0;
 
@@ -2417,6 +2933,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) 
     else ShowWindow(g_main, nCmdShow);
     UpdateWindow(g_main);
     trayAdd();
+
+    // Start the components marked "随管理器启动". Outside WM_CREATE on purpose:
+    // each runs on its own thread and reports back by posting to g_main, so the
+    // window must be fully created before any of them can finish.
+    autoStartComponents();
 
     // first run: no components under bin -> prompt the downloader automatically
     if (!g_startHidden && pkgsNeedSetup()) showDownloaderDialog(g_main);

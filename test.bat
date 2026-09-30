@@ -62,7 +62,7 @@ if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
 
-set LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib winhttp.lib version.lib crypt32.lib
+set LIBS=user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib winhttp.lib version.lib crypt32.lib ws2_32.lib
 set FAILED=0
 
 if "%DO_BUILD%"=="1" (

@@ -75,6 +75,11 @@ std::wstring nowText();
 std::wstring iniGet(const std::wstring& key, const std::wstring& def);
 void iniSet(const std::wstring& key, const std::wstring& val);
 bool iniDelete(const std::wstring& key);
+// Everything under a key prefix, with the prefix stripped: iniKeysWithPrefix
+// (L"php.verport.") returns {"8.1", "8.3"} for those two keys. Needed wherever
+// uniqueness spans keys rather than one key's value (the per-version FastCGI
+// port table). Keys come back lower-cased, as they are stored.
+std::vector<std::wstring> iniKeysWithPrefix(const std::wstring& prefix);
 // Writes are debounced; the UI thread calls iniFlushIfDue() from its idle
 // hook to drain pending changes. Use iniFlushNow() before exit / before
 // reading the on-disk file from outside the cache.

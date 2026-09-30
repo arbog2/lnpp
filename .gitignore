@@ -5,6 +5,8 @@ dist/
 *.obj
 *.res
 *.pdb
+*.ilk
+*.idb
 *.user
 
 # third-party component binaries (hundreds of MB, manually copied)

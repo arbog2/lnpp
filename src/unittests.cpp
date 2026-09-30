@@ -17,6 +17,15 @@ static void check(const wchar_t* name, bool ok, const std::wstring& detail = L""
     if (!ok) ++g_fail;
 }
 
+// manager.cpp's validPort() is file-static, so mirror the rule here rather than
+// widening its linkage just for a test.
+static bool isPortToken(const std::wstring& s) {
+    if (s.empty() || s.size() > 5) return false;
+    if (s.find_first_not_of(L"0123456789") != std::wstring::npos) return false;
+    int n = _wtoi(s.c_str());
+    return n > 0 && n <= 65535;
+}
+
 // Scratch file under %TEMP% that cleans itself up.
 class TempFile {
 public:
@@ -52,13 +61,17 @@ int wmain() {
         check(L"node alias -> nodejs", pkgsNameToCompVer(L"node-24.12", c, v) && c == L"nodejs" && v == L"24.12");
         check(L"postgresql", pkgsNameToCompVer(L"postgresql-17.1", c, v) && c == L"postgresql" && v == L"17.1");
         check(L"redis", pkgsNameToCompVer(L"redis-7.2", c, v) && c == L"redis" && v == L"7.2");
+        check(L"php", pkgsNameToCompVer(L"php-8.3", c, v) && c == L"php" && v == L"8.3");
+        // "php" is a real component now, so the negative case needs a name that
+        // is genuinely unknown — mysql was dropped, and must stay rejected.
+        check(L"unknown component rejected", !pkgsNameToCompVer(L"mysql-8.0", c, v));
+        check(L"not a component at all rejected", !pkgsNameToCompVer(L"tomcat-9", c, v));
         // ".sha256" suffixes are intentionally parsed as a version here — the
         // caller (pkgsParseConf) must intercept them BEFORE this function.
         check(L"sha256 treated as version by design",
               pkgsNameToCompVer(L"nginx-1.30.4.sha256", c, v) && c == L"nginx" && v == L"1.30.4.sha256");
         check(L"no dash rejected", !pkgsNameToCompVer(L"whatever", c, v));
         check(L"leading dash rejected", !pkgsNameToCompVer(L"-1.0", c, v));
-        check(L"unknown component rejected", !pkgsNameToCompVer(L"php-8.0", c, v));
         check(L"empty version rejected", !pkgsNameToCompVer(L"nginx-", c, v));
         // The version becomes a directory name and the entry name becomes a temp
         // file name, so traversal and separators have to be rejected outright.
@@ -112,13 +125,24 @@ int wmain() {
             check(L"URL keeps query string", ok, err);
         }
         {
+            // "php" stopped being an unknown component when the PHP component
+            // landed, so this negative case now has to use a name that is
+            // genuinely not a component (mysql was evaluated and dropped).
             auto secs = pkgsParseConfText(
-                L"# Title\n# https://note.example.org\n---\nphp-8.2=https://example.org/c.zip\n"
+                L"# Title\n# https://note.example.org\n---\nmysql-8.0=https://example.org/c.zip\n"
                 L"nginx-1.30.4=https://example.org/a.zip\n---\n", err);
             check(L"unknown component skipped, known kept",
                   secs.size() == 1 && secs[0].items.size() == 1 &&
                   secs[0].items[0].comp == L"nginx");
             check(L"first comment is the title", secs.size() == 1 && secs[0].title == L"Title");
+        }
+        {
+            // php is a component now, so it must survive the same filter.
+            auto secs = pkgsParseConfText(
+                L"---\nphp-8.3=https://example.org/php.zip\n---\n", err);
+            check(L"php entry kept",
+                  secs.size() == 1 && secs[0].items.size() == 1 &&
+                  secs[0].items[0].comp == L"php" && secs[0].items[0].ver == L"8.3", err);
         }
         {
             // Traversal entry: the parser must not surface it as a package.
@@ -150,7 +174,7 @@ int wmain() {
         check(L"template and working list differ", pkgTemplatePath() != pkgListPath());
         check(L"settings.ini lives under data", settingsIniPath().rfind(dataDir(), 0) == 0);
         // The other half of the split: templates still come from etc\.
-        for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs }) {
+        for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs, Comp::Php }) {
             check(compName(c), compEtcDir(c).rfind(etcDir(), 0) == 0, compEtcDir(c));
             // The "配置" button must land on data\, never on etc\.
             check((std::wstring(L"config dir of ") + compName(c)).c_str(),
@@ -163,6 +187,177 @@ int wmain() {
         check(L"nginx 配置目录不是每版本运行副本",
               compConfigDir(Comp::Nginx).find(L"conf\\vhosts") == std::wstring::npos,
               compConfigDir(Comp::Nginx));
+        // PHP's generated php.ini is runtime state too, and it must not be
+        // confused with the template it is rendered from.
+        std::wstring phpTpl = joinPath(joinPath(etcCompDir(L"php"), L"php.ini.append"), L"");
+        check(L"php 模板在 etc\\ 下", phpTpl.rfind(etcDir(), 0) == 0, phpTpl);
+        check(L"php 配置目录在 data\\ 下", compConfigDir(Comp::Php).rfind(dataDir(), 0) == 0,
+              compConfigDir(Comp::Php));
+    }
+
+    wprintf(L"\n=== php: FastCGI 端口分配 ===\n");
+    {
+        // The whole point of the per-version port table is that a site config
+        // carrying a hardcoded fastcgi_pass port keeps working. So an assigned
+        // port must never be re-rolled, and removing another version must not
+        // shift the survivors.
+        std::wstring a = iniGet(L"php.verport.8.1", L"");
+        std::wstring b = iniGet(L"php.verport.8.3", L"");
+        std::wstring e1, e2;
+        std::wstring p1 = phpEnsurePort(L"8.1", e1);
+        std::wstring p2 = phpEnsurePort(L"8.3", e2);
+        check(L"8.1 分配到合法端口", !p1.empty() && isPortToken(p1), p1);
+        check(L"8.3 分配到合法端口", !p2.empty() && isPortToken(p2), p2);
+        check(L"两个版本不共用端口", p1 != p2);
+        // Stable: asking again returns the same number, because every site
+        // config already has it written in.
+        check(L"重复分配不换端口", phpEnsurePort(L"8.1", e1) == p1);
+        check(L"重复分配不换端口 (8.3)", phpEnsurePort(L"8.3", e2) == p2);
+        check(L"phpPortFor 与分配结果一致", phpPortFor(L"8.1") == p1 && phpPortFor(L"8.3") == p2);
+        // A version nobody started has no port at all, and is never running.
+        check(L"未分配的版本没有端口", phpPortFor(L"7.4").empty());
+        check(L"未分配的版本不算运行中", !phpRunning(L"7.4"));
+        // Ports are assigned from php.baseport, not from some fixed constant.
+        check(L"端口落在 baseport 之后", _wtoi(p1.c_str()) >= _wtoi(phpBasePort().c_str()));
+        check(L"默认 baseport 是 9000", phpBasePort() == L"9000");
+        // phpRunning is the liveness probe the poller calls, so it must not
+        // throw on a version that was never started.
+        check(L"查询未运行版本不报错", !phpRunning(L"0.0.0.0-not-a-version"));
+
+        iniDelete(L"php.verport.8.1");
+        iniDelete(L"php.verport.8.3");
+    }
+
+    wprintf(L"\n=== php: 站点模板渲染 ===\n");
+    {
+        // Same substitution path genNginxConfig/nginxAddVHostEx use. If
+        // {{PHP_TARGET}} is not supplied the site would ship a literal
+        // "{{PHP_TARGET}}" into fastcgi_pass and fail every request at runtime,
+        // long after the file is on disk.
+        std::map<std::wstring, std::wstring> kv = {
+            {L"PORT", L"80"}, {L"DOMAIN", L"a.test"}, {L"ROOT", L"../../../www/a"},
+            {L"PHP_TARGET", L"127.0.0.1:9003"}};
+        std::wstring out = renderTemplate(
+            L"fastcgi_pass {{PHP_TARGET}};\r\n", kv);
+        check(L"PHP_TARGET 被替换", out == L"fastcgi_pass 127.0.0.1:9003;\r\n", out);
+        check(L"渲染后无残留占位符", out.find(L"{{") == std::wstring::npos);
+        // A pool is named, not addressed, so the same slot has to accept one.
+        std::map<std::wstring, std::wstring> kv2 = {{L"PHP_TARGET", L"lnpp_php_8_3"}};
+        check(L"upstream 名也能填进 fastcgi_pass",
+              renderTemplate(L"fastcgi_pass {{PHP_TARGET}};", kv2) == L"fastcgi_pass lnpp_php_8_3;");
+
+        // The shipped php templates must not depend on nginx's own
+        // fastcgi_params: only mime.types is copied into the runtime prefix, so
+        // `include fastcgi_params;` would fail nginx -t and roll the site back.
+        std::wstring phpTplPath =
+            joinPath(joinPath(etcCompDir(L"nginx"), L"vhosts"), L"_template_php.conf");
+        std::wstring phpTpl = readFileText(phpTplPath);
+        check(L"PHP 站点模板存在", !phpTpl.empty(), phpTplPath);
+        check(L"模板自带 SCRIPT_FILENAME",
+              phpTpl.find(L"fastcgi_param SCRIPT_FILENAME") != std::wstring::npos);
+        check(L"模板不 include fastcgi_params",
+              phpTpl.find(L"include fastcgi_params") == std::wstring::npos &&
+              phpTpl.find(L"include fastcgi.conf") == std::wstring::npos);
+        check(L"模板不写 default_server",
+              phpTpl.find(L"default_server") == std::wstring::npos);
+        check(L"模板用 PHP_TARGET 占位符",
+              phpTpl.find(L"{{PHP_TARGET}}") != std::wstring::npos &&
+              phpTpl.find(L"{{PHP_PORT}}") == std::wstring::npos);
+        // Both php templates exist, so the HTTPS path cannot fall through to a
+        // node config.
+        check(L"PHP HTTPS 模板存在", !readFileText(joinPath(joinPath(etcCompDir(L"nginx"),
+              L"vhosts"), L"_template_php_https.conf")).empty());
+        // {{PHP_UPSTREAM}} has to be inside http{} for nginx to accept an
+        // upstream there, and genNginxConfig warns when a custom template lacks
+        // it — so the shipped template must carry it.
+        std::wstring mainTpl = readFileText(joinPath(etcCompDir(L"nginx"), L"nginx.conf.tpl"));
+        check(L"主配置模板含 {{PHP_UPSTREAM}}",
+              mainTpl.find(L"{{PHP_UPSTREAM}}") != std::wstring::npos);
+        check(L"upstream 占位符在 http 块内",
+              mainTpl.find(L"http {") < mainTpl.find(L"{{PHP_UPSTREAM}}") &&
+              mainTpl.find(L"{{PHP_UPSTREAM}}") < mainTpl.find(L"include vhosts/*.conf;"));
+    }
+
+    wprintf(L"\n=== php: 多进程 workers ===\n");
+    {
+        // A version with N workers owns N CONSECUTIVE ports, so uniqueness has
+        // to be about ranges, not numbers: two versions starting at 9000 and
+        // 9002 would collide on 9002-9003 with 4 workers each.
+        check(L"默认进程数是 1", phpWorkerCount(L"8.1") == 1);
+        iniSet(L"php.workers.8.3", L"4");
+        check(L"进程数可配置", phpWorkerCount(L"8.3") == 4);
+        iniSet(L"php.workers.8.3", L"0");
+        check(L"进程数 0 归一为 1", phpWorkerCount(L"8.3") == 1);
+        iniSet(L"php.workers.8.3", L"999");
+        check(L"进程数上限 32", phpWorkerCount(L"8.3") == 32);
+        iniDelete(L"php.workers.8.3");
+
+        // Range allocation: 8.1 takes 9000-9003, so 8.3 must not be handed
+        // 9000..9002 — only a port clear of the whole range.
+        iniSet(L"php.verport.8.1", L"9000");
+        iniSet(L"php.workers.8.1", L"4");
+        check(L"8.1 占 4 个端口", phpPortsFor(L"8.1").size() == 4, std::to_wstring(phpPortsFor(L"8.1").size()));
+        check(L"端口连续", phpPortsFor(L"8.1") ==
+              std::vector<std::wstring>({L"9000", L"9001", L"9002", L"9003"}));
+        std::wstring e;
+        std::wstring p = phpEnsurePort(L"8.3", e);
+        check(L"8.3 避开 8.1 的整个区间", !p.empty() && _wtoi(p.c_str()) >= 9004, p);
+        // And a single-worker version does not care about a neighbour's tail.
+        iniSet(L"php.workers.8.3", L"1");
+        check(L"单进程版本 1 个端口", phpPortsFor(L"8.3").size() == 1);
+
+        // The upstream name is derived from the version string, which is a
+        // directory name the user chose — so it must be sanitised, and a dot
+        // must not survive into an nginx identifier.
+        check(L"upstream 名已净化", phpUpstreamName(L"8.1") == L"lnpp_php_8_1",
+              phpUpstreamName(L"8.1"));
+        check(L"upstream 名无非法字符",
+              phpUpstreamName(L"8.1-rc1").find_first_not_of(L"abcdefghijklmnopqrstuvwxyz"
+                                                            L"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+              == std::wstring::npos, phpUpstreamName(L"8.1-rc1"));
+        // A pool is referenced by name, a single worker by address.
+        iniSet(L"php.workers.8.1", L"1");
+        check(L"单进程用地址", phpFastcgiTarget(L"8.1") == L"127.0.0.1:9000",
+              phpFastcgiTarget(L"8.1"));
+        iniSet(L"php.workers.8.1", L"3");
+        check(L"多进程用 upstream 名", phpFastcgiTarget(L"8.1") == L"lnpp_php_8_1",
+              phpFastcgiTarget(L"8.1"));
+
+        iniDelete(L"php.verport.8.1");
+        iniDelete(L"php.verport.8.3");
+        iniDelete(L"php.workers.8.1");
+        iniDelete(L"php.workers.8.3");
+    }
+
+    wprintf(L"\n=== php: 扩展解析 ===\n");
+    {
+        // php.ini belongs to the user, so the parser has to cope with how
+        // people actually write these lines — and must never confuse
+        // extension_dir (a path) with extension= (a name).
+        std::wstring ini =
+            L"extension_dir = \"C:/php/ext\"\r\n"
+            L"extension=curl\r\n"
+            L";extension=gd\r\n"
+            L"  extension = mbstring  ; needed for utf8\r\n"
+            L"extension=php_openssl.dll\r\n"
+            L"; this is a whole-line comment about extensions=foo\r\n"
+            L"zend_extension=opcache\r\n"
+            L"extension=\r\n";
+        auto m = phpParseExtensionLines(ini);
+        check(L"识别 extension_dir 不是扩展", m.find(L"dir") == m.end());
+        check(L"启用项为 true", m[L"curl"] == true);
+        check(L"注释项为 false", m[L"gd"] == false);
+        check(L"带空格与行尾注释", m[L"mbstring"] == true);
+        check(L"php_ 前缀 + .dll 归一", m[L"openssl"] == true);
+        check(L"整行注释被忽略", m.find(L"this is a whole-line comment about extensions=foo") == m.end());
+        check(L"zend_extension 不算扩展", m.find(L"zend_extension") == m.end());
+        check(L"空值被忽略", m.size() == 4, std::to_wstring(m.size()));
+
+        check(L"空文本得到空表", phpParseExtensionLines(L"").empty());
+        check(L"无 extension 行", phpParseExtensionLines(L"[PHP]\r\nmemory_limit=256M\r\n").empty());
+        // A later line wins in php, and so must it here.
+        auto dup = phpParseExtensionLines(L";extension=zip\r\nextension=zip\r\n");
+        check(L"重复项以后者为准", dup[L"zip"] == true);
     }
 
     wprintf(L"\n=== pgRestoreOutputOk ===\n");

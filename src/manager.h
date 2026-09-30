@@ -10,7 +10,17 @@ enum class Comp {
     Postgresql = 1,
     Redis = 2,
     Nodejs = 3,
-    Count = 4
+    Php = 4,
+    Count = 5
+};
+
+// What a vhost runs: the node template (static files first, then proxy_pass to
+// the local nodejs port) or the php template (static files first, then
+// fastcgi_pass to a php-cgi instance). A site belongs to nginx; PHP only decides
+// which template it is rendered from and which FastCGI port it points at.
+enum class SiteKind {
+    Node = 0,
+    Php = 1
 };
 
 struct ComponentStatus {
@@ -41,6 +51,11 @@ struct VHost {
     std::wstring port;                       // display: all listen ports, comma joined
     std::vector<std::wstring> ports;         // every port this site listens on
     std::wstring root;
+    SiteKind kind = SiteKind::Node;
+    // What a php site's fastcgi_pass names, verbatim: "127.0.0.1:9000" for a
+    // single php-cgi, or the upstream name (e.g. "lnpp_php_8_3") for a pool.
+    // Kept as written so the vhost list shows exactly what nginx will use.
+    std::wstring phpTarget;
 };
 
 // ---- Component discovery ----
@@ -93,10 +108,15 @@ bool nginxReload(std::wstring& err);
 std::vector<VHost> nginxListVHosts();
 bool nginxAddVHost(const std::wstring& name, const std::wstring& domain,
                    const std::wstring& port, std::wstring& err);
+// kind/phpVer only matter for SiteKind::Php: phpVer selects the php-cgi instance
+// whose FastCGI port is written into the template. An empty or unusable phpVer
+// falls back to the default version (ver.php).
 bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
                      const std::wstring& port, bool ssl,
                      const std::wstring& certPath, const std::wstring& keyPath,
-                     const std::wstring& root, std::wstring& err);
+                     const std::wstring& root,
+                     SiteKind kind, const std::wstring& phpVer,
+                     std::wstring& err);
 bool nginxRemoveVHost(const std::wstring& name, std::wstring& err);
 
 // postgresql
@@ -133,6 +153,76 @@ bool nodePm2RestartAll(std::wstring& err);
 bool nodePm2Delete(int id, std::wstring& err);
 bool nodePm2Resurrect(std::wstring& err);
 
+// ---- php (FastCGI) ----
+// Windows has no PHP-FPM: the only FastCGI-capable binary in the official
+// build is php-cgi.exe, run as `php-cgi -c <ini> -b 127.0.0.1:<port>`. So a PHP
+// "instance" here is one php-cgi process per version, and PHP is a resident
+// component like the other four — with one difference: several versions run at
+// once, each on its own port, so a project pinned to 8.1 and one pinned to 8.3
+// can be served side by side. ver.php only names the default (which version new
+// sites start out pointing at); it does not gate which versions run.
+struct PhpInstance {
+    std::wstring version;
+    std::wstring port;                        // first FastCGI port, "" if none yet
+    int workers = 1;                          // php-cgi processes for this version
+    bool running = false;
+    bool isDefault = false;                   // the version ver.php points at
+};
+// Assigned port for a version, or "" if it never got one. Read-only on purpose:
+// copying a version into bin\php\ must not rewrite settings.ini, so a port is
+// only ever allocated when that version is actually started.
+std::wstring phpPortFor(const std::wstring& ver);
+// Every port a version owns, consecutive from phpPortFor(). One entry with the
+// default single worker.
+std::vector<std::wstring> phpPortsFor(const std::wstring& ver);
+// php-cgi processes per version (settings.ini: php.workers.<ver>, default 1,
+// clamped to 1..32). Windows has no FPM, so this is the entire concurrency
+// setting for a version: N processes serve N requests at a time.
+int phpWorkerCount(const std::wstring& ver);
+// Allocate and persist a port when the version has none. Reserves workers()
+// consecutive ports and never overlaps another version's range, nor a port
+// something else is listening on.
+std::wstring phpEnsurePort(const std::wstring& ver, std::wstring& err);
+bool phpRunning(const std::wstring& ver);
+bool phpStart(const std::wstring& ver, std::wstring& err);
+bool phpStop(const std::wstring& ver, std::wstring& err);
+std::vector<PhpInstance> phpListPool();
+// nginx upstream block for {{PHP_UPSTREAM}}: one entry per version running more
+// than one php-cgi, empty when they all run a single process. An upstream must
+// be declared once inside http{} — the same name in two vhosts is a fatal
+// "duplicate upstream" — so this can only be spliced into the main config.
+std::wstring phpUpstreamBlock();
+// Name of a version's upstream, sanitised from the version string.
+std::wstring phpUpstreamName(const std::wstring& ver);
+// What a php site's fastcgi_pass should be: the upstream name for a pool, the
+// bare 127.0.0.1:<port> address for a single worker.
+std::wstring phpFastcgiTarget(const std::wstring& ver);
+// Site names in data\nginx\vhosts\*.conf that target a given FastCGI port,
+// matching both the address form and the upstream form, so a version can be
+// stopped or removed only after saying what will break.
+std::vector<std::wstring> phpSitesUsingPort(const std::wstring& port);
+
+// ---- php extensions ----
+struct PhpExtension {
+    std::wstring name;        // without the php_ prefix or .dll suffix, e.g. "curl"
+    std::wstring dll;         // file name in bin\php\<ver>\ext, e.g. "php_curl.dll"
+    bool enabled = false;     // an uncommented extension= line in php.ini
+    bool loaded = false;      // this build actually ships the dll
+};
+// What php.ini currently asks for, keyed by extension name. Parsed from text so
+// the whole rule is unit-testable; a line is "extension=<name>" optionally
+// prefixed with ';' (commented out = not enabled).
+std::map<std::wstring, bool> phpParseExtensionLines(const std::wstring& iniText);
+// The extensions this version could load: the dlls present in its ext\ directory,
+// plus anything php.ini already mentions (so an entry pointing at a missing dll
+// is visible as broken rather than silently dropped).
+std::vector<PhpExtension> phpListExtensions(const std::wstring& ver, std::wstring& err);
+// Rewrite php.ini so exactly `wanted` is enabled, leaving every other line —
+// including comments and unrelated settings — untouched. Returns the number of
+// extension lines changed, or -1 on failure.
+int phpApplyExtensions(const std::wstring& ver, const std::vector<std::wstring>& wanted,
+                      std::wstring& err);
+
 // ---- Config generation ----
 bool genNginxConfig(const std::wstring& ver);
 // The catch-all server blocks substituted into the {{DENY_UNKNOWN}} placeholder
@@ -144,6 +234,11 @@ bool genNginxConfig(const std::wstring& ver);
 std::wstring nginxDenyBlock(bool blockUnknown);
 bool genRedisConfig(const std::wstring& ver);
 bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir);
+// Write data\php\<ver>\php.ini (shipped php.ini-production + rendered
+// etc\php\php.ini.append). Generated once and then left alone: the "配置"
+// button opens that file and users enable extensions in it, so regenerating on
+// every start would silently drop their edits.
+bool genPhpConfig(const std::wstring& ver, std::wstring& err);
 
 // ---- Log rotation ----
 // Rotate the component's log file(s) if they passed 8 MB, keeping 2 generations
@@ -159,5 +254,7 @@ std::wstring pgPort();
 std::wstring nginxPort();
 std::wstring redisPort();
 std::wstring nodejsPort();
+// First port handed out to a php-cgi instance (settings.ini: php.baseport).
+std::wstring phpBasePort();
 
 #endif

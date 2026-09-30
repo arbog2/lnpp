@@ -1,6 +1,9 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "manager.h"
 #include "downloader.h"
 #include <tlhelp32.h>
+#include <set>
 
 // ============================ Path helpers ============================
 
@@ -10,6 +13,7 @@ const wchar_t* compName(Comp c) {
         case Comp::Postgresql: return L"postgresql";
         case Comp::Redis: return L"redis";
         case Comp::Nodejs: return L"nodejs";
+        case Comp::Php: return L"php";
         default: return L"";
     }
 }
@@ -20,6 +24,7 @@ const wchar_t* compDisplay(Comp c) {
         case Comp::Postgresql: return L"PostgreSQL";
         case Comp::Redis: return L"Redis";
         case Comp::Nodejs: return L"Node.js";
+        case Comp::Php: return L"PHP";
         default: return L"";
     }
 }
@@ -50,6 +55,9 @@ std::wstring compConfigDir(Comp c) {
         case Comp::Postgresql: return liveVerDir(Comp::Postgresql);
         case Comp::Redis:      return liveVerDir(Comp::Redis);
         case Comp::Nodejs:     return compDataDir(Comp::Nodejs);
+        // The generated php.ini lives next to the instance it belongs to, so
+        // the "配置" button opens the ini the running php-cgi was started with.
+        case Comp::Php:        return liveVerDir(Comp::Php);
         default:               return compDataDir(c);
     }
 }
@@ -64,6 +72,9 @@ static bool pgValidIdent(const std::wstring& s);
 // Port whitelist shared by every command line and config value we build
 // (psql / pg_dumpall / redis-cli / the nginx listen directive).
 static bool validPort(const std::wstring& s);
+// The php section lives near the end of this file, but the shared lifecycle
+// dispatchers (compIsRunning / compStart / compStop) need it first.
+static bool phpAnyRunning();
 
 // ============================ Operation locks ============================
 // The message returned when an operation is refused because another thread is
@@ -197,6 +208,8 @@ bool compVersionUsable(Comp c, const std::wstring& ver) {
             return fileExists(joinPath(compBinDirVer(c, ver), L"redis-server.exe"));
         case Comp::Nodejs:
             return fileExists(joinPath(compBinDirVer(c, ver), L"node.exe"));
+        case Comp::Php:
+            return fileExists(joinPath(compBinDirVer(c, ver), L"php-cgi.exe"));
         default:
             return false;
     }
@@ -714,6 +727,9 @@ bool compIsRunning(Comp c) {
         case Comp::Redis:      return redisRunningVer(st.currentVersion);
         case Comp::Nodejs:
             return nodeDaemonRunning();
+        // Any php-cgi answering on any port means the component is up; the
+        // per-version detail is what phpListPool() reports.
+        case Comp::Php:        return phpAnyRunning();
         default: return false;
     }
 }
@@ -734,6 +750,9 @@ bool compRunningQuick(Comp c) {
             return isPidAlive(pid);
         }
         case Comp::Nodejs:     return nodeDaemonRunning();
+        // phpRunning() only tests whether a port is bound — no process spawn,
+        // no pid file write — so it is safe to call from the poller too.
+        case Comp::Php:        return phpAnyRunning();
         default: return false;
     }
 }
@@ -787,7 +806,10 @@ void rotateCompLogs(Comp c, const std::wstring& ver) {
             rotateOneLog(joinPath(logsDir(), L"redis-" + ver + L".log"));
             return;
         default:
-            // nodejs: pm2 keeps its own logs under %USERPROFILE%\.pm2\logs
+            // nodejs: pm2 keeps its own logs under %USERPROFILE%\.pm2\logs.
+            // php: php-cgi has no -l style log switch; its diagnostics go into
+            // the FastCGI response (display_errors), so there is no file to
+            // rotate here.
             return;
     }
 }
@@ -1031,6 +1053,31 @@ bool compStart(Comp c, std::wstring& err) {
             }
             return true;
         }
+        case Comp::Php: {
+            // PHP is the one component with more than one instance: every
+            // installed version gets its own php-cgi on its own port, because
+            // projects are routinely pinned to different PHP versions and a
+            // single global "current version" would break half of them. The
+            // overview's 启动 therefore means "start all of them", and a failure
+            // in one version is reported without aborting the others.
+            std::vector<std::wstring> vers = compVersions(Comp::Php);
+            if (vers.empty()) { err = L"未找到 PHP 版本"; return false; }
+            std::wstring failed;
+            int started = 0;
+            for (const std::wstring& v : vers) {
+                std::wstring perr;
+                if (phpStart(v, perr)) {
+                    ++started;
+                } else {
+                    if (!failed.empty()) failed += L"；";
+                    failed += v + L": " + perr;
+                    logMsg(L"php", L"启动 PHP " + v + L" 失败: " + perr);
+                }
+            }
+            if (started == 0) { err = failed.empty() ? L"PHP 启动失败" : failed; return false; }
+            if (!failed.empty()) logMsg(L"php", L"部分 PHP 版本启动失败 -> " + failed);
+            return true;
+        }
         default: return false;
     }
 }
@@ -1133,6 +1180,27 @@ bool compStop(Comp c, std::wstring& err) {
             }
             err = r.output.empty() ? L"pm2 kill 失败" : r.output;
             return !compIsRunning(Comp::Nodejs);
+        }
+        case Comp::Php: {
+            // Mirror of compStart: every version gets stopped, and the first
+            // failure is reported while the rest still get their chance.
+            std::vector<std::wstring> vers = compVersions(Comp::Php);
+            if (vers.empty()) { err = L"未找到 PHP 版本"; return false; }
+            std::wstring failed;
+            int stopped = 0;
+            for (const std::wstring& v : vers) {
+                std::wstring perr;
+                if (phpStop(v, perr)) {
+                    ++stopped;
+                } else {
+                    if (!failed.empty()) failed += L"；";
+                    failed += v + L": " + perr;
+                    logMsg(L"php", L"停止 PHP " + v + L" 失败: " + perr);
+                }
+            }
+            if (stopped == 0) { err = failed.empty() ? L"PHP 停止失败" : failed; return false; }
+            if (!failed.empty()) logMsg(L"php", L"部分 PHP 版本停止失败 -> " + failed);
+            return true;
         }
         default: return false;
     }
@@ -1305,6 +1373,25 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
         // dropped goes to the Recycle Bin, so a bad restore is still undoable.
         pruneStaleDataCopies(Comp::Postgresql);
         pruneOldBackups();
+        return true;
+    }
+
+    // PHP is the odd one out: every version runs at once, so "switching" must
+    // not stop the others. It only records which version new sites default to
+    // (and the 切换版本 button doubles as "make this the default"). Handled
+    // before the generic path below, which would otherwise stop the old version
+    // and start the new one — exactly the behaviour multi-version support
+    // exists to avoid.
+    if (c == Comp::Php) {
+        iniSet(L"ver.php", ver);
+        if (!phpStart(ver, err)) {
+            // Keep the new default even if this one instance failed: the ini
+            // is a preference, and a broken version must not also make every
+            // other version unreachable. Say so instead of pretending.
+            logMsg(L"php", L"已将默认版本设为 " + ver + L"，但启动失败: " + err);
+            err = L"已设为默认版本，但启动失败: " + err;
+            return false;
+        }
         return true;
     }
 
@@ -1527,6 +1614,11 @@ bool genNginxConfig(const std::wstring& ver) {
     kv[L"WWW_DIR"] = L"../../../www";
     kv[L"MIME"] = L"mime.types";
     kv[L"DENY_UNKNOWN"] = nginxDenyBlock(blockUnknown);
+    // upstream blocks for the php versions that run more than one php-cgi. These
+    // must be declared once inside http{} — repeating an upstream name in two
+    // vhost files is "duplicate upstream" and nginx refuses to start. Versions
+    // with a single worker need none: their vhost points straight at the port.
+    kv[L"PHP_UPSTREAM"] = phpUpstreamBlock();
 
     std::wstring conf = renderTemplate(tpl, kv);
     // A template saved before this feature has no {{DENY_UNKNOWN}} placeholder,
@@ -1537,6 +1629,17 @@ bool genNginxConfig(const std::wstring& ver) {
                          L"拒绝 IP 直连/未配置域名的兜底 server 块没有生成，nginx 仍会对"
                          L"未知域名开放。请在该模板的 http { } 内、include vhosts/*.conf 之前"
                          L"加一行 {{DENY_UNKNOWN}}");
+    }
+    // Same silent-failure trap as {{DENY_UNKNOWN}}: a custom nginx.conf.tpl
+    // saved before multi-worker PHP has no {{PHP_UPSTREAM}} line, so a vhost
+    // pointing at an upstream name would make nginx refuse to start with an
+    // "unknown upstream" error naming the site. Name the cause here instead.
+    if (phpUpstreamBlock().find(L"upstream ") != std::wstring::npos &&
+        conf.find(L"upstream ") == std::wstring::npos) {
+        logMsg(L"nginx", L"PHP 有多进程版本，但 etc\\nginx\\nginx.conf.tpl 里没有 "
+                         L"{{PHP_UPSTREAM}} 占位符，upstream 块没有生成，nginx 会因"
+                         L"「unknown upstream」而启动失败。请在该模板的 http { } 内、"
+                         L"include vhosts/*.conf 之前加一行 {{PHP_UPSTREAM}}");
     }
     reportVhostDefaultServers();
     if (!writeFileText(joinPath(prefix, L"conf\\nginx.conf"), conf)) return false;
@@ -1709,10 +1812,23 @@ std::vector<VHost> nginxListVHosts() {
     std::vector<VHost> result;
     std::wstring dir = nginxVhostSourceDir();
     for (auto& f : listFiles(dir, L"conf")) {
-        if (f == L"_template.conf" || f == L"_template_https.conf") continue;
+        // Any _template* file is a template, not a site. Matching the exact two
+        // names let the php variants show up as sites called "_template_php".
+        if (f.rfind(L"_template", 0) == 0) continue;
         VHost v;
         v.name = f.substr(0, f.size() - 5); // strip .conf
         std::wstring content = readFileText(joinPath(dir, f));
+        // A fastcgi_pass makes it a PHP site. What follows is either a bare
+        // address (single php-cgi) or an upstream name (a pool), so the
+        // recorded target is kept as written rather than parsed into a port.
+        size_t fp = content.find(L"fastcgi_pass");
+        if (fp != std::wstring::npos) {
+            v.kind = SiteKind::Php;
+            size_t b = content.find_first_of(L" \t\r\n", fp + 12);
+            size_t e = content.find(L";", fp);
+            if (b != std::wstring::npos && e != std::wstring::npos && b < e)
+                v.phpTarget = trimStr(content.substr(b, e - b));
+        }
         // parse server_name, listen, root
         size_t p1 = content.find(L"server_name");
         if (p1 != std::wstring::npos) {
@@ -1748,7 +1864,9 @@ std::vector<VHost> nginxListVHosts() {
 bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
                      const std::wstring& port, bool ssl,
                      const std::wstring& certPath, const std::wstring& keyPath,
-                     const std::wstring& root, std::wstring& err) {
+                     const std::wstring& root,
+                     SiteKind kind, const std::wstring& phpVer,
+                     std::wstring& err) {
     if (name.empty() || domain.empty()) { err = L"站点名和域名不能为空"; return false; }
     // _template* files are reserved for config templates, so a site name must
     // not collide with that convention (previously _foo was written but never
@@ -1828,9 +1946,43 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
         kv[L"KEY"] = toForward(keyPath);
     }
 
-    std::wstring tplFile = joinPath(vhostDir, ssl ? L"_template_https.conf" : L"_template.conf");
-    std::wstring tpl = readFileText(tplFile);
-    if (tpl.empty()) tpl = ssl ? DEFAULT_VHOST_HTTPS : DEFAULT_VHOST;
+    // Templates live in etc\nginx\vhosts\ (shipped, read-only); data\nginx\vhosts\
+    // holds the per-site files only. Reading from the data dir — as this did
+    // before v1.5.3 was finished — always missed, so every site was rendered
+    // from DEFAULT_VHOST and user edits to _template*.conf were silently
+    // ignored. The built-in HTTPS fallback is also missing the :80 -> :443
+    // redirect block the shipped template has, so that fallback was wrong too.
+    bool isPhp = (kind == SiteKind::Php);
+    std::wstring tplName = isPhp ? (ssl ? L"_template_php_https.conf" : L"_template_php.conf")
+                                  : (ssl ? L"_template_https.conf" : L"_template.conf");
+    std::wstring tpl = readFileText(joinPath(joinPath(compEtcDir(Comp::Nginx), L"vhosts"), tplName));
+    if (tpl.empty()) {
+        if (isPhp) {
+            err = L"未找到 PHP 站点模板 etc\\nginx\\vhosts\\" + tplName;
+            return false;
+        }
+        logMsg(L"nginx", L"未找到模板 etc\\nginx\\vhosts\\" + tplName + L"，改用内置默认配置");
+        tpl = ssl ? DEFAULT_VHOST_HTTPS : DEFAULT_VHOST;
+    }
+    if (isPhp) {
+        // A php site is only useful if its php-cgi answers. Refuse up front
+        // rather than writing a config that fails every request with 502.
+        std::wstring useVer = phpVer.empty() ? iniGet(L"ver.php", L"") : phpVer;
+        if (useVer.empty() || !compVersionUsable(Comp::Php, useVer)) {
+            err = L"PHP 站点需要指定一个已安装的 PHP 版本";
+            return false;
+        }
+        std::wstring fcgPort = phpPortFor(useVer);
+        if (fcgPort.empty() || !phpRunning(useVer)) {
+            err = L"PHP " + useVer + L" 未运行，无法作为站点后端；请先在 PHP 页签启动它";
+            return false;
+        }
+        // A single-worker version is addressed directly; a pool goes through an
+        // nginx upstream (declared once in nginx.conf.tpl via {{PHP_UPSTREAM}}),
+        // because two vhosts each declaring the same upstream is a fatal
+        // "duplicate upstream" for nginx.
+        kv[L"PHP_TARGET"] = phpFastcgiTarget(useVer);
+    }
     std::wstring conf = renderTemplate(tpl, kv);
 
     std::wstring file = joinPath(vhostDir, name + L".conf");
@@ -1878,7 +2030,8 @@ bool nginxAddVHostEx(const std::wstring& name, const std::wstring& domain,
 
 bool nginxAddVHost(const std::wstring& name, const std::wstring& domain,
                    const std::wstring& port, std::wstring& err) {
-    return nginxAddVHostEx(name, domain, port, false, L"", L"", L"", err);
+    return nginxAddVHostEx(name, domain, port, false, L"", L"", L"",
+                           SiteKind::Node, L"", err);
 }
 
 bool nginxRemoveVHost(const std::wstring& name, std::wstring& err) {
@@ -2514,4 +2667,544 @@ bool nodePm2Resurrect(std::wstring& err) {
         }
     }
     return true;
+}
+
+// ============================ php (FastCGI) ============================
+//
+// Windows ships no PHP-FPM. The only FastCGI-capable binary in the official
+// build is php-cgi.exe, which is run as
+//
+//     php-cgi.exe -c <ini> -b 127.0.0.1:<port>
+//
+// and answers requests one at a time (no worker pool, no fork). That single
+// fact shapes everything below:
+//
+//   * one php-cgi per version, so pinning different projects to different PHP
+//     versions works — but each version gets exactly one process, so a slow
+//     script blocks every other request to that version;
+//   * liveness is "is this port bound", not "is this pid alive", which keeps
+//     the background status poller free of process spawns (see the note on
+//     compRunningQuick) and survives php-cgi being restarted by hand.
+
+namespace {
+
+// True when something is listening on 127.0.0.1:<port>. Probed by attempting to
+// bind: a successful bind means the port is free. Loopback only, which is where
+// -b puts us, so this cannot be fooled by an external interface.
+bool tcpPortBound(const std::wstring& port) {
+    if (!validPort(port)) return false;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { WSACleanup(); return false; }
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)_wtoi(port.c_str()));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // Deliberately no SO_REUSEADDR: with it set, a second bind on the same port
+    // succeeds on Windows and every liveness probe would answer "free".
+    bool bound = bind(s, (sockaddr*)&addr, sizeof(addr)) != 0;
+    closesocket(s);
+    WSACleanup();
+    return bound;
+}
+
+std::wstring phpIniPath(const std::wstring& ver) {
+    return joinPath(compDataVerDir(Comp::Php, ver), L"php.ini");
+}
+
+// Port ranges already claimed by some version other than `self`. Read from every
+// php.verport.* key in settings.ini, NOT from the installed set: the guarantee
+// that matters is "two running php-cgi never share a port", and a version whose
+// directory is mid-move (or missing) would otherwise be invisible here and let
+// a new version be handed its port. Keeping the key after a version is deleted
+// is deliberate too — reinstalling that exact version restores the same port, so
+// site configs already pointing at it keep working.
+//
+// Each entry is the version's FIRST port; the version owns workers() ports
+// counting up from it, so a range — not a single number — is what has to stay
+// disjoint. Two ranges that merely start differently can still collide.
+std::vector<std::pair<int, int>> phpClaimedRanges(const std::wstring& self) {
+    std::vector<std::pair<int, int>> out;
+    std::wstring selfKey = lowerStr(L"php.verport." + self);
+    for (const std::wstring& v : iniKeysWithPrefix(L"php.verport.")) {
+        if (v == selfKey) continue;
+        std::wstring p = iniGet(L"php.verport." + v, L"");
+        if (!validPort(p)) continue;
+        int first = _wtoi(p.c_str());
+        out.push_back({first, first + phpWorkerCount(v) - 1});
+    }
+    return out;
+}
+
+}  // namespace
+
+std::wstring phpBasePort() {
+    std::wstring p = iniGet(L"php.baseport", L"9000");
+    return validPort(p) ? p : std::wstring(L"9000");
+}
+
+// How many php-cgi processes a version runs. Windows has no FPM, so a single
+// php-cgi handles requests strictly one at a time; more processes is the only
+// way to get any concurrency. Clamped: 0 would make the version unstartable and
+// anything past 32 is a typo, not a configuration.
+int phpWorkerCount(const std::wstring& ver) {
+    int n = _wtoi(iniGet(L"php.workers." + ver, L"1").c_str());
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    return n;
+}
+
+std::wstring phpPortFor(const std::wstring& ver) {
+    std::wstring p = iniGet(L"php.verport." + ver, L"");
+    return validPort(p) ? p : std::wstring();
+}
+
+// Every port this version owns, first to last. With one worker that is a single
+// port; with several it is the consecutive range nginx round-robins over.
+std::vector<std::wstring> phpPortsFor(const std::wstring& ver) {
+    std::vector<std::wstring> out;
+    std::wstring first = phpPortFor(ver);
+    if (first.empty()) return out;
+    int base = _wtoi(first.c_str());
+    for (int i = 0; i < phpWorkerCount(ver); ++i) out.push_back(std::to_wstring(base + i));
+    return out;
+}
+
+// nginx upstream name for a version running more than one php-cgi. The version
+// is whatever directory name the user chose, so it is sanitised rather than
+// trusted — nginx would reject some characters outright.
+std::wstring phpUpstreamName(const std::wstring& ver) {
+    std::wstring s;
+    for (wchar_t c : ver)
+        s.push_back((iswalnum(c) || c == L'_') ? c : L'_');
+    return L"lnpp_php_" + s;
+}
+
+std::wstring phpEnsurePort(const std::wstring& ver, std::wstring& err) {
+    std::wstring cur = phpPortFor(ver);
+    if (!cur.empty()) {
+        // Already assigned. Trust the assignment even when the port is busy —
+        // if it is busy it is either our own php-cgi (we are being asked to
+        // start it twice) or a leftover from a crash, and either way re-rolling
+        // the number would break every site already pointing at it.
+        return cur;
+    }
+    int workers = phpWorkerCount(ver);
+    std::vector<std::pair<int, int>> claimed = phpClaimedRanges(ver);
+    int base = _wtoi(phpBasePort().c_str());
+    for (int p = base; p < base + 1000; ++p) {
+        int last = p + workers - 1;
+        // The whole range has to clear the other versions' ranges, not just the
+        // first port: a 4-worker version starting at 9000 while another already
+        // owns 9002 would collide on 9002-9003.
+        bool clash = false;
+        for (const auto& r : claimed) {
+            if (p <= r.second && last >= r.first) { clash = true; break; }
+        }
+        if (clash) { p += workers - 1; continue; }
+        // Something else on the machine holds one of them (a system FastCGI,
+        // another stack): skip the whole range rather than hand the user a
+        // php-cgi that dies on bind.
+        bool busy = false;
+        for (int q = p; q <= last; ++q) {
+            if (tcpPortBound(std::to_wstring(q))) { busy = true; break; }
+        }
+        if (busy) { p += workers - 1; continue; }
+        iniSet(L"php.verport." + ver, std::to_wstring(p));
+        return std::to_wstring(p);
+    }
+    err = L"从 " + phpBasePort() + L" 起没有连续的 " + std::to_wstring(workers) + L" 个空闲端口可分配";
+    return std::wstring();
+}
+
+// A version counts as running only when every one of its workers answers.
+// Reporting "up" on a partial pool would let nginx send requests to a port
+// nothing is listening on (502) while the UI shows green.
+bool phpRunning(const std::wstring& ver) {
+    std::vector<std::wstring> ports = phpPortsFor(ver);
+    if (ports.empty()) return false;
+    for (const std::wstring& p : ports)
+        if (!tcpPortBound(p)) return false;
+    return true;
+}
+
+static bool phpAnyRunning() {
+    for (const std::wstring& v : compVersions(Comp::Php)) {
+        if (phpRunning(v)) return true;
+    }
+    return false;
+}
+
+std::vector<PhpInstance> phpListPool() {
+    std::vector<PhpInstance> out;
+    std::wstring def = iniGet(L"ver.php", L"");
+    for (const std::wstring& v : compVersions(Comp::Php)) {
+        PhpInstance inst;
+        inst.version = v;
+        std::vector<std::wstring> ports = phpPortsFor(v);
+        inst.workers = phpWorkerCount(v);
+        inst.port = ports.empty() ? std::wstring() : ports.front();
+        inst.running = phpRunning(v);
+        inst.isDefault = (v == def);
+        out.push_back(inst);
+    }
+    return out;
+}
+
+bool genPhpConfig(const std::wstring& ver, std::wstring& err) {
+    std::wstring dir = compDataVerDir(Comp::Php, ver);
+    if (!makeDirs(dir)) { err = L"无法创建 PHP 配置目录: " + dir; return false; }
+    std::wstring ini = phpIniPath(ver);
+    // Generated once, then owned by the user: the "配置" button opens exactly
+    // this file and they enable extensions in it, so regenerating on every
+    // start would silently drop their edits. Delete it to get the defaults back.
+    if (fileExists(ini)) return true;
+
+    std::wstring binDir = compBinDirVer(Comp::Php, ver);
+    std::wstring base = readFileText(joinPath(binDir, L"php.ini-production"));
+    if (base.empty()) base = readFileText(joinPath(binDir, L"php.ini"));
+    if (base.empty()) {
+        err = L"未找到 " + binDir + L"\\php.ini-production，PHP 组件可能解压不完整";
+        return false;
+    }
+    std::wstring tpl = readFileText(joinPath(compEtcDir(Comp::Php), L"php.ini.append"));
+    if (tpl.empty()) {
+        err = L"未找到模板 etc\\php\\php.ini.append";
+        return false;
+    }
+    std::map<std::wstring, std::wstring> kv;
+    // Absolute: a relative extension_dir resolves against the process working
+    // directory, which is not the PHP directory.
+    kv[L"EXTENSION_DIR"]      = toForward(joinPath(binDir, L"ext"));
+    kv[L"MEMORY_LIMIT"]       = L"256M";
+    kv[L"MAX_EXECUTION_TIME"] = L"120";
+    kv[L"POST_MAX_SIZE"]      = L"32M";
+    kv[L"UPLOAD_MAX_SIZE"]    = L"32M";
+    kv[L"DATE_TIMEZONE"]      = L"Asia/Shanghai";
+    if (!writeFileText(ini, base + L"\r\n" + renderTemplate(tpl, kv))) {
+        err = L"写入 php.ini 失败: " + ini;
+        return false;
+    }
+    logMsg(L"php", L"已生成 " + ini);
+    return true;
+}
+
+bool phpStart(const std::wstring& ver, std::wstring& err) {
+    if (!compVersionUsable(Comp::Php, ver)) { err = L"PHP 版本不可用: " + ver; return false; }
+    if (phpRunning(ver)) return true;   // already up; starting twice would only collide
+    if (!genPhpConfig(ver, err)) return false;
+
+    if (phpEnsurePort(ver, err).empty()) return false;
+    std::vector<std::wstring> ports = phpPortsFor(ver);
+
+    std::wstring exe = joinPath(compBinDirVer(Comp::Php, ver), L"php-cgi.exe");
+    if (!fileExists(exe)) { err = L"未找到 php-cgi.exe"; return false; }
+
+    std::wstring ini = phpIniPath(ver);
+    // One php-cgi per port. Windows has no FPM, so this list IS the concurrency
+    // setting: N processes serve N requests at a time and nginx round-robins.
+    std::vector<ProcInfo> spawned;
+    for (const std::wstring& port : ports) {
+        ProcInfo pi;
+        std::wstring args = L"-c \"" + toForward(ini) + L"\" -b 127.0.0.1:" + port;
+        if (!startProcessDetached(exe, args, compBinDirVer(Comp::Php, ver), pi)) {
+            for (ProcInfo& p : spawned) { CloseHandle(p.hProcess); }
+            err = L"启动 php-cgi 失败（端口 " + port + L"）";
+            return false;
+        }
+        spawned.push_back(pi);
+    }
+    // php-cgi binds its port before it serves anything, so a short poll on the
+    // ports is a real readiness check (and needs no process inspection).
+    bool up = false;
+    for (int i = 0; i < 50 && !up; ++i) {
+        if (phpRunning(ver)) up = true;
+        else Sleep(100);
+    }
+    for (ProcInfo& p : spawned) CloseHandle(p.hProcess);
+    if (!up) {
+        // A partial pool is worse than none: nginx would keep round-robining
+        // into the ports that never came up. Take the whole version down again
+        // so the state on screen matches reality.
+        phpStop(ver, err);
+        err = L"php-cgi 启动后未全部监听端口 " + ports.front() + L"-" + ports.back() +
+              L"（检查 " + ini + L" 是否有效，例如 extension_dir 指错会直接退出）";
+        return false;
+    }
+    logMsg(L"php", L"PHP " + ver + L" 已启动，" + std::to_wstring(ports.size()) +
+                  L" 个 php-cgi，FastCGI 端口 " + ports.front() +
+                  (ports.size() > 1 ? L"-" + ports.back() : L""));
+    return true;
+}
+
+// Enumerate php-cgi.exe processes whose image lives under bin\php\<ver>.
+// Matching on the process name alone would let us kill a php-cgi the user
+// started outside the manager — the same mistake nginx made with its masters.
+static std::vector<DWORD> ourPhpCgiPids(const std::wstring& ver) {
+    std::vector<DWORD> pids;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return pids;
+    std::wstring ours = lowerStr(toForward(compBinDirVer(Comp::Php, ver)));
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"php-cgi.exe") != 0) continue;
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!h) continue;
+            wchar_t path[MAX_PATH];
+            DWORD size = MAX_PATH;
+            BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
+            CloseHandle(h);
+            if (!ok) continue;
+            std::wstring e = lowerStr(toForward(dirOf(path)));
+            // The separator check keeps bin\php\8.1x from matching version 8.1.
+            if (e.size() > ours.size() && e.compare(0, ours.size(), ours) == 0 &&
+                e[ours.size()] == L'/') {
+                pids.push_back(pe.th32ProcessID);
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pids;
+}
+
+bool phpStop(const std::wstring& ver, std::wstring& err) {
+    std::vector<std::wstring> ports = phpPortsFor(ver);
+    // php-cgi has no shutdown command; terminating it is the only option, and
+    // it is safe because a php-cgi keeps nothing across requests (each request
+    // is a fresh execution context). Killing by image path takes every worker
+    // of this version, which is what we want.
+    for (DWORD pid : ourPhpCgiPids(ver)) killProcessByPid(pid);
+    if (ports.empty()) return true;   // never started, nothing to wait for
+    for (int i = 0; i < 30; ++i) {
+        bool allFree = true;
+        for (const std::wstring& p : ports)
+            if (tcpPortBound(p)) { allFree = false; break; }
+        if (allFree) return true;
+        Sleep(100);
+    }
+    // A port still bound after killing every php-cgi we own: something that is
+    // not ours is holding it, so report rather than claiming success.
+    for (const std::wstring& p : ports) {
+        if (tcpPortBound(p)) {
+            err = L"端口 " + p + L" 仍被占用，可能不是本管理器启动的 php-cgi";
+            return false;
+        }
+    }
+    return true;
+}
+
+// The upstream blocks for {{PHP_UPSTREAM}} in nginx.conf.tpl, or "" when every
+// version runs a single php-cgi (the common case — it needs no upstream at all,
+// so a stock nginx.conf.tpl works).
+//
+// A version that runs N>1 processes needs one, because fastcgi_pass to a bare
+// address pins the site to a single serial process; the upstream is what makes
+// nginx spread requests over the pool.
+std::wstring phpUpstreamBlock() {
+    std::wstring out;
+    for (const std::wstring& v : compVersions(Comp::Php)) {
+        std::vector<std::wstring> ports = phpPortsFor(v);
+        if (ports.size() < 2) continue;
+        if (!out.empty()) out += L"\r\n";
+        out += L"    upstream " + phpUpstreamName(v) + L" {\r\n";
+        for (const std::wstring& p : ports)
+            out += L"        server 127.0.0.1:" + p + L";\r\n";
+        out += L"    }\r\n";
+    }
+    return out;
+}
+
+// What a php site's fastcgi_pass should name: the upstream when the version
+// runs a pool, otherwise the single address. Kept in one place so a site is
+// written the same way every time it is added.
+std::wstring phpFastcgiTarget(const std::wstring& ver) {
+    std::vector<std::wstring> ports = phpPortsFor(ver);
+    if (ports.empty()) return std::wstring();
+    if (ports.size() == 1) return L"127.0.0.1:" + ports.front();
+    return phpUpstreamName(ver);
+}
+
+// ============================ php extensions ============================
+//
+// php.ini is a line-oriented file the user owns: they enable extensions, tweak
+// limits, add their own settings. So extension management here only ever
+// rewrites the `extension=` / `;extension=` lines and copies every other line
+// through unchanged — regenerating the file from a model would drop whatever
+// they typed next to it.
+
+// "  extension = curl" -> name "curl". Rejects extension_dir, comments, junk.
+static bool parseExtensionLine(const std::wstring& line, std::wstring& name) {
+    std::wstring s = trimStr(line);
+    if (s.empty() || s[0] == L';' || s[0] == L'#') return false;
+    if (s.compare(0, 9, L"extension") != 0) return false;
+    size_t i = 9;
+    if (i < s.size() && (s[i] == L'_' || s[i] == L'-')) return false;   // extension_dir
+    while (i < s.size() && (s[i] == L' ' || s[i] == L'\t')) ++i;
+    if (i >= s.size() || s[i] != L'=') return false;
+    ++i;
+    while (i < s.size() && (s[i] == L' ' || s[i] == L'\t')) ++i;
+    std::wstring val = trimStr(s.substr(i));
+    if (val.empty()) return false;
+    // Drop a trailing comment ("extension=curl ; needed by ...") and quotes.
+    size_t sc = val.find(L';');
+    if (sc != std::wstring::npos) val = trimStr(val.substr(0, sc));
+    if (val.size() >= 2 && val.front() == L'"' && val.back() == L'"')
+        val = val.substr(1, val.size() - 2);
+    // Accept "curl", "php_curl" and "php_curl.dll" alike — php does, and users
+    // write all three. Normalise to one bare name so each extension has one key.
+    std::wstring lower = lowerStr(val);
+    if (lower.rfind(L"php_", 0) == 0) lower = lower.substr(4);
+    if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, L".dll") == 0)
+        lower = lower.substr(0, lower.size() - 4);
+    if (lower.empty() ||
+        lower.find_first_not_of(L"abcdefghijklmnopqrstuvwxyz0123456789_") != std::wstring::npos)
+        return false;
+    name = lower;
+    return true;
+}
+
+// Same, but also recognises the commented-out form, so the caller can tell
+// "switched off" apart from "never mentioned".
+static bool parseExtensionLineAny(const std::wstring& line, std::wstring& name, bool& enabled) {
+    std::wstring s = trimStr(line);
+    if (s.empty() || s[0] == L'#') return false;
+    bool commented = false;
+    if (s[0] == L';') { commented = true; s = trimStr(s.substr(1)); }
+    if (!parseExtensionLine(s, name)) return false;
+    enabled = !commented;
+    return true;
+}
+
+std::map<std::wstring, bool> phpParseExtensionLines(const std::wstring& iniText) {
+    std::map<std::wstring, bool> out;
+    size_t pos = 0;
+    while (pos <= iniText.size()) {
+        size_t nl = iniText.find(L'\n', pos);
+        bool last = (nl == std::wstring::npos);
+        std::wstring line = iniText.substr(pos, last ? std::wstring::npos : nl - pos);
+        std::wstring name;
+        bool enabled = false;
+        if (parseExtensionLineAny(line, name, enabled)) out[name] = enabled;
+        if (last) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+std::vector<PhpExtension> phpListExtensions(const std::wstring& ver, std::wstring& err) {
+    if (!compVersionUsable(Comp::Php, ver)) { err = L"PHP 版本不可用: " + ver; return {}; }
+    std::wstring perr;
+    if (!genPhpConfig(ver, perr)) { err = perr; return {}; }
+    std::map<std::wstring, bool> state = phpParseExtensionLines(readFileText(phpIniPath(ver)));
+
+    std::map<std::wstring, PhpExtension> byName;
+    for (const std::wstring& f : listFiles(joinPath(compBinDirVer(Comp::Php, ver), L"ext"), L"dll")) {
+        std::wstring base = f;
+        if (base.size() > 4) base = base.substr(0, base.size() - 4);
+        std::wstring lower = lowerStr(base);
+        if (lower.rfind(L"php_", 0) == 0) lower = lower.substr(4);
+        if (lower.empty()) continue;
+        PhpExtension e;
+        e.name = lower;
+        e.dll = f;
+        e.loaded = true;
+        byName[lower] = e;
+    }
+    // An entry php.ini asks for but the build does not ship is the case worth
+    // surfacing: it fails at startup with a warning nobody ever sees, because
+    // php-cgi writes it to stderr and we start it detached.
+    for (const auto& kv : state) {
+        if (byName.find(kv.first) != byName.end()) continue;
+        PhpExtension e;
+        e.name = kv.first;
+        e.dll = L"php_" + kv.first + L".dll";
+        e.loaded = false;
+        byName[kv.first] = e;
+    }
+    for (auto& kv : byName) kv.second.enabled = state.count(kv.first) ? state[kv.first] : false;
+
+    std::vector<PhpExtension> out;
+    out.reserve(byName.size());
+    for (auto& kv : byName) out.push_back(kv.second);
+    // Enabled first, then entries whose dll is missing (they need attention),
+    // then the rest by name — stable and scannable.
+    std::sort(out.begin(), out.end(), [](const PhpExtension& a, const PhpExtension& b) {
+        if (a.enabled != b.enabled) return a.enabled > b.enabled;
+        if (a.loaded != b.loaded) return a.loaded < b.loaded;
+        return naturalGt(a.name, b.name);
+    });
+    return out;
+}
+
+int phpApplyExtensions(const std::wstring& ver, const std::vector<std::wstring>& wanted,
+                      std::wstring& err) {
+    if (!compVersionUsable(Comp::Php, ver)) { err = L"PHP 版本不可用: " + ver; return -1; }
+    std::wstring perr;
+    if (!genPhpConfig(ver, perr)) { err = perr; return -1; }
+    std::wstring ini = phpIniPath(ver);
+    std::wstring text = readFileText(ini);
+    if (text.empty()) { err = L"读取 php.ini 失败: " + ini; return -1; }
+
+    std::set<std::wstring> want(wanted.begin(), wanted.end());
+    int changed = 0;
+    std::wstring out;
+    out.reserve(text.size() + 256);
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find(L'\n', pos);
+        bool last = (nl == std::wstring::npos);
+        std::wstring line = text.substr(pos, last ? std::wstring::npos : nl - pos);
+        std::wstring name;
+        bool enabled = false;
+        if (parseExtensionLineAny(line, name, enabled)) {
+            // Every occurrence is rewritten, not just the first. php.ini may
+            // legally repeat the directive and php takes the last one, so
+            // toggling only the first would leave the result order-dependent.
+            std::wstring repl = (want.count(name) ? L"extension=" : L";extension=") + name;
+            if (repl != line) ++changed;
+            out += repl;
+        } else {
+            out += line;
+        }
+        if (last) break;
+        out += L"\n";
+        pos = nl + 1;
+    }
+    if (changed == 0) return 0;
+    if (!writeFileText(ini, out)) { err = L"写入 php.ini 失败: " + ini; return -1; }
+    logMsg(L"php", L"PHP " + ver + L" 的扩展设置已更新（" + std::to_wstring(changed) +
+                  L" 行），需要重启该版本生效");
+    return changed;
+}
+
+std::vector<std::wstring> phpSitesUsingPort(const std::wstring& port) {
+    std::vector<std::wstring> out;
+    if (!validPort(port)) return out;
+    // A site targets a php version either by address (single worker) or by
+    // upstream name (a pool), and which one is in force depends on a setting
+    // that can change after the site was written. So match both: any port in
+    // the addressed version's range, and any upstream name derived from a
+    // version whose range contains this port.
+    std::vector<std::wstring> needles = {L"127.0.0.1:" + port};
+    for (const std::wstring& v : compVersions(Comp::Php)) {
+        std::vector<std::wstring> ps = phpPortsFor(v);
+        if (std::find(ps.begin(), ps.end(), port) != ps.end())
+            needles.push_back(phpUpstreamName(v));
+    }
+    std::wstring dir = nginxVhostSourceDir();
+    for (const std::wstring& f : listFiles(dir, L"conf")) {
+        if (f.rfind(L"_template", 0) == 0) continue;
+        std::wstring content = readFileText(joinPath(dir, f));
+        if (content.find(L"fastcgi_pass") == std::wstring::npos) continue;
+        for (const std::wstring& n : needles) {
+            if (content.find(n) != std::wstring::npos) {
+                out.push_back(f.substr(0, f.size() - 5));
+                break;
+            }
+        }
+    }
+    return out;
 }

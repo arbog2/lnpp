@@ -167,11 +167,13 @@ bool pkgsNameToCompVer(const std::wstring& name, std::wstring& comp, std::wstrin
     ver = name.substr(dash + 1);
     if (comp == L"node") comp = L"nodejs";   // alias: dir is bin\nodejs
     if (!validVersionToken(ver)) return false;
-    return comp == L"nginx" || comp == L"nodejs" || comp == L"postgresql" || comp == L"redis";
+    return comp == L"nginx" || comp == L"nodejs" || comp == L"postgresql" ||
+           comp == L"redis" || comp == L"php";
 }
 
 bool pkgsNeedSetup() {
-    const Comp components[] = {Comp::Nginx, Comp::Nodejs, Comp::Postgresql, Comp::Redis};
+    const Comp components[] = {Comp::Nginx, Comp::Nodejs, Comp::Postgresql,
+                                Comp::Redis, Comp::Php};
     for (Comp c : components) {
         if (!compVersions(c).empty()) return false;
     }
@@ -473,8 +475,8 @@ bool pkgsInstall(const PkgItem& item,
         return false;
     }
 
-    // nginx/node/pg zips wrap everything in one top-level folder; redis ships
-    // loose files. Normalize to "the folder that holds component files".
+    // nginx/node/pg/php zips wrap everything in one top-level folder; redis
+    // ships loose files. Normalize to "the folder that holds component files".
     std::wstring srcDir = extractDir;
     {
         auto subs = listSubDirs(extractDir);
@@ -492,7 +494,8 @@ bool pkgsInstall(const PkgItem& item,
 
     Comp c = comp == L"nginx" ? Comp::Nginx :
              comp == L"nodejs" ? Comp::Nodejs :
-             comp == L"postgresql" ? Comp::Postgresql : Comp::Redis;
+             comp == L"postgresql" ? Comp::Postgresql :
+             comp == L"php" ? Comp::Php : Comp::Redis;
     if (!compVersionUsable(c, ver)) {
         err = L"安装完成但缺少组件核心文件: " + target;
         shDeleteTree(target);

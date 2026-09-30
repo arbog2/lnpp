@@ -440,6 +440,16 @@ bool iniDelete(const std::wstring& key) {
     return true;
 }
 
+std::vector<std::wstring> iniKeysWithPrefix(const std::wstring& prefix) {
+    std::wstring p = lowerStr(prefix);
+    std::lock_guard<std::mutex> lk(g_iniMtx);
+    std::vector<std::wstring> out;
+    for (const auto& kv : iniMapLocked())
+        if (kv.first.rfind(p, 0) == 0)
+            out.push_back(kv.first.substr(p.size()));
+    return out;
+}
+
 // ---- DPAPI secret protection ----
 std::wstring dpProtect(const std::wstring& plain) {
     DATA_BLOB in = {(DWORD)(plain.size() * sizeof(wchar_t)), (BYTE*)plain.c_str()};

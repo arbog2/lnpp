@@ -1,0 +1,46 @@
+
+; ==================== LNPP 追加片段 ====================
+; 本段由 LNPP 追加到 bin\php\<版本>\php.ini-production 的末尾，
+; 产物是 data\php\<版本>\php.ini（php-cgi 用 -c 指定该文件）。
+; php.ini 里「后出现的值生效」，所以这里的设置覆盖发行版自带值。
+; 追加之后的内容不再改动，你的修改不会被下一次启动冲掉——
+; 需要恢复默认请删掉 data\php\<版本>\php.ini，下次启动会自动重建。
+
+; 扩展目录必须写绝对路径：进程工作目录一变，相对路径就找不到 dll。
+extension_dir = "{{EXTENSION_DIR}}"
+
+memory_limit = {{MEMORY_LIMIT}}
+max_execution_time = {{MAX_EXECUTION_TIME}}
+post_max_size = {{POST_MAX_SIZE}}
+upload_max_filesize = {{UPLOAD_MAX_SIZE}}
+max_file_uploads = 40
+
+date.timezone = {{DATE_TIMEZONE}}
+
+; 开发期在本机看得到错误；上线站点请自行改回 Off。
+display_errors = On
+display_startup_errors = On
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+
+; 常见扩展，只放开官方 Windows 发行包里自带的（php_redis.dll / php_imagick.dll
+; 这类 PECL 扩展不随包发布，写死开启只会得到一堆启动告警，需要时自己装好再放开）。
+; 扩展加载失败不会中断启动，错误直接进响应（display_errors=On 时看得到）。
+extension=curl
+extension=gd
+extension=mbstring
+extension=openssl
+extension=pdo_pgsql
+extension=pgsql
+extension=sodium
+extension=zip
+;extension=imagick
+;extension=memcached
+;extension=pdo_mysql
+;extension=redis
+
+; OPcache：PHP 8 默认已编译进来，但仍需显式打开才有效果
+opcache.enable = 1
+opcache.enable_cli = 0
+opcache.memory_consumption = 128
+opcache.max_accelerated_files = 20000
+opcache.revalidate_freq = 2

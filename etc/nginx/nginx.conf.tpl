@@ -17,5 +17,7 @@ http {
 
 {{DENY_UNKNOWN}}
 
+{{PHP_UPSTREAM}}
+
     include vhosts/*.conf;
 }

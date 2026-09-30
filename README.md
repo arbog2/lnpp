@@ -1,6 +1,6 @@
 # LNPP 组件管理器 v1.5.3
 
-Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis 的启动、停止、版本切换、配置。
+Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis / php 的启动、停止、版本切换、配置。
 
 ## 目录结构
 
@@ -12,13 +12,17 @@ lnpp.exe
 │   ├── nodejs\<版本>\         # 手动拷贝 node.exe、npm 等
 │   ├── nginx\<版本>\          # 手动拷贝 nginx.exe、conf\mime.types 等
 │   ├── postgresql\<版本>\     # 手动拷贝整个 zip 解压目录（含 bin\）
-│   └── redis\<版本>\          # 手动拷贝 redis-server.exe、redis-cli.exe
+│   ├── redis\<版本>\          # 手动拷贝 redis-server.exe、redis-cli.exe
+│   └── php\<版本>\            # 手动拷贝整个 zip 解压目录（php-cgi.exe、ext\）
 ├── etc\                      # ← 只放模板，随包分发、只读
 │   ├── nginx\nginx.conf.tpl
 │   ├── nginx\vhosts\_template.conf
 │   ├── nginx\vhosts\_template_https.conf
+│   ├── nginx\vhosts\_template_php.conf
+│   ├── nginx\vhosts\_template_php_https.conf
 │   ├── postgresql\postgresql.conf.append
 │   ├── redis\redis.conf.tpl
+│   ├── php\php.ini.append
 │   └── packages.conf.tpl     # 组件下载源模板
 ├── data\                     # ← 全部运行时状态，缺失时首次运行自动创建
 │   ├── settings.ini          # 版本选择、端口、DPAPI 加密的库口令
@@ -27,7 +31,8 @@ lnpp.exe
 │   │   ├── vhosts\*.conf     # 站点配置（用户数据；在总览/站点页增删）
 │   │   └── <版本>\           # 该版本的运行配置 conf\nginx.conf + conf\vhosts\
 │   ├── postgresql\<版本>\    # 数据目录 + postgresql.conf
-│   └── redis\<版本>\         # redis.conf + 数据
+│   ├── redis\<版本>\         # redis.conf + 数据
+│   └── php\<版本>\           # 该版本的 php.ini
 ├── backup\                   # 数据库备份（pg_dumpall 输出，时间戳命名）
 ├── logs\                     # 运行日志
 ├── ssl\                      # TLS 证书与私钥
@@ -48,19 +53,21 @@ lnpp.exe
 | nginx | `bin\nginx\<版本>\` | nginx.exe, conf\mime.types |
 | postgresql | `bin\postgresql\<版本>\` | bin\pg_ctl.exe, bin\initdb.exe, bin\psql.exe, bin\pg_dumpall.exe |
 | redis | `bin\redis\<版本>\` | redis-server.exe, redis-cli.exe |
+| php | `bin\php\<版本>\` | php-cgi.exe, ext\*.dll, php.ini-production |
 
-多个版本目录并存即可在下拉框中切换版本。PostgreSQL 版本切换会自动做数据迁移（pg_dumpall 备份 → initdb → 恢复）。
+多个版本目录并存即可在下拉框中切换版本。PostgreSQL 版本切换会自动做数据迁移（pg_dumpall 备份 → initdb → 恢复）；PHP 例外，见「PHP」一节。
 
 ## 功能
 
 - 总览页：三态状态灯（灰=未安装 / 红=已停止 / 绿=运行中）、单组件启动/停止、全部启动/重启/停止
 - 各组件启动/停止，状态灯实时显示
 - 版本切换（自动重启 + 重新生成配置）
-- nginx：可视化添加/删除虚拟站点（写 `data\nginx\vhosts\`），支持 HTTPS（证书 + key），www\ 下自动建目录；**拒绝 IP 直连与未配置域名**（见下节）
+- nginx：可视化添加/删除虚拟站点（写 `data\nginx\vhosts\`），支持 HTTPS（证书 + key），www\ 下自动建目录；站点类型可选 **Node.js** 或 **PHP（FastCGI）**，PHP 站点可指定用哪个 PHP 版本；**拒绝 IP 直连与未配置域名**（见下节）
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）、还原数据库
 - Node.js：pm2 进程列表实时监控，支持重启/停止；一键将当前 Node 版本加入/移除用户 PATH
+- PHP：多版本共存，每个版本一组 php-cgi 进程、各占一段 FastCGI 端口；版本池列表可单独启停、设默认版本、调进程数（多进程由 nginx upstream 轮询）、管理扩展
 - 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `data\packages.conf`，下载完成后自动解压到 `bin\<组件>\<版本>`
-- 「配置」按钮：打开该组件的**运行时**配置目录（`data\` 下）。nginx 是 `data\nginx\vhosts\`（站点配置源，**不是**每版本的运行副本——那份每次启动都会被覆盖）；PostgreSQL / Redis 是当前版本的数据目录；Node.js 是 `data\nodejs\`，并提示 pm2 自己的文件在 `%USERPROFILE%\.pm2`
+- 「配置」按钮：打开该组件的**运行时**配置目录（`data\` 下）。nginx 是 `data\nginx\vhosts\`（站点配置源，**不是**每版本的运行副本——那份每次启动都会被覆盖）；PostgreSQL / Redis 是当前版本的数据目录；Node.js 是 `data\nodejs\`，并提示 pm2 自己的文件在 `%USERPROFILE%\.pm2`；PHP 是当前版本的 `data\php\<默认版本>\`（放生成的 php.ini）
 - 常驻托盘：关闭按钮只最小化到托盘（组件继续运行），退出请用托盘右键菜单「退出」
 - 随管理器自动启动（总开关 + 每组件勾选）、随 Windows 开机启动（`--hidden` 直接最小化到托盘）
 - 总览页右下角：版本号 + 「关于」弹窗（作者、可点击 GitHub 链接）
@@ -71,15 +78,70 @@ lnpp.exe
 
 | 模板 | 占位符 |
 |---|---|
-| `etc\nginx\nginx.conf.tpl` | {{PORT}} {{WWW_DIR}} {{MIME}} **{{DENY_UNKNOWN}}** |
+| `etc\nginx\nginx.conf.tpl` | {{PORT}} {{WWW_DIR}} {{MIME}} **{{DENY_UNKNOWN}}** {{PHP_UPSTREAM}} |
 | `etc\nginx\vhosts\_template.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} |
 | `etc\nginx\vhosts\_template_https.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} {{CERT}} {{KEY}} |
+| `etc\nginx\vhosts\_template_php.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} **{{PHP_TARGET}}** |
+| `etc\nginx\vhosts\_template_php_https.conf` | 同上 + {{CERT}} {{KEY}} |
 | `etc\redis\redis.conf.tpl` | {{PORT}} {{PIDFILE}} {{LOGFILE}} {{DIR}} |
 | `etc\postgresql\postgresql.conf.append` | {{PORT}} |
+| `etc\php\php.ini.append` | {{EXTENSION_DIR}} {{MEMORY_LIMIT}} {{MAX_EXECUTION_TIME}} {{POST_MAX_SIZE}} {{UPLOAD_MAX_SIZE}} {{DATE_TIMEZONE}} |
 
 **`{{DENY_UNKNOWN}}` 漏掉会静默失效**——没有它，兜底块不会生成，nginx 仍会对未知域名开放（默认落到第一个站点）。自定义过 `nginx.conf.tpl` 的话，务必在 `http { }` 内、`include vhosts/*.conf;` 之前保留这一行；管理器发现渲染结果里没有 `default_server` 时会在 `logs\lnpp.log` 告警，但不会在界面上提示。
 
 `{{NODEJS_PORT}}` 取 `data\settings.ini` 的 `nodejs.port`（默认 3000）——两个站点模板都用它，改这一个键即可让所有 GUI 新建的站点跟着换端口。
+
+`{{PHP_TARGET}}` 是该站点所选 PHP 版本的后端：单进程时是 `127.0.0.1:<端口>`，多进程时是 upstream 名（见下）。它写死在生成出来的站点配置里。
+
+## PHP
+
+### 为什么是 FastCGI 常驻进程
+
+Windows 上**没有 PHP-FPM**，官方发行包唯一能接 FastCGI 的是 `php-cgi.exe`，启动方式：
+
+```
+bin\php\<版本>\php-cgi.exe -c data\php\<版本>\php.ini -b 127.0.0.1:<端口>
+```
+
+所以这里的 PHP 是常驻组件：状态灯 = 端口有没有被绑定，停止 = 结束进程。没有 pid 文件，状态探测也不 spawn 任何进程。
+
+### 多版本共存
+
+这是 PHP 和其他四个组件最大的不同：**所有已安装版本同时运行**，每个版本一组 php-cgi、各占一段端口。A 项目要 8.1、B 项目要 8.3 可以并存。
+
+| settings.ini 键 | 含义 |
+|---|---|
+| `ver.php` | **默认版本**，只决定新建站点默认选中谁，不影响谁在跑 |
+| `php.baseport` | 端口分配起点，默认 9000 |
+| `php.verport.<版本>` | 该版本**第一**个 FastCGI 端口 |
+| `php.workers.<版本>` | 该版本的 php-cgi 进程数，1–32，默认 1 |
+
+端口**只在启动该版本时分配**，且一旦分配就写进 ini 永不重摇——站点配置里已经写死了后端。所以删掉 8.1 不会让 8.3 漂移；把 8.1 装回来，它会拿回原来那段的第一个端口，老站点配置继续有效。分配时保证**整段区间**（不是单个端口）不与别的版本重叠，也不落在已被别的东西监听的端口上。
+
+「切换版本」按钮对 PHP 的含义是**设为默认版本**，不会停掉其他版本。
+
+### 进程数与并发
+
+一个 php-cgi **串行**处理请求，所以进程数就是这个版本的全部并发能力。N 个进程占 N 个连续端口（`verport` 到 `verport+N-1`）。
+
+- **进程数 = 1**：站点直接写 `fastcgi_pass 127.0.0.1:9000;`，不需要 upstream
+- **进程数 > 1**：`genNginxConfig` 在 `http { }` 里生成一个 upstream，站点写 `fastcgi_pass lnpp_php_<版本>;` 由 nginx 轮询
+
+> ⚠️ 自定义过 `nginx.conf.tpl` 的话，**必须在 `http { }` 内、`include vhosts/*.conf;` 之前保留 `{{PHP_UPSTREAM}}` 这一行**。多进程版本缺了它，upstream 块不会生成，nginx 会以「unknown upstream」启动失败。管理器检测到这种组合会在 `logs\lnpp.log` 里点名提示。
+
+在 PHP 页签选中版本、改「进程数」再点「启动选中」即可生效；管理器会顺手重载 nginx，让站点改指向对应的 upstream。**只有全部进程都监听成功，该版本才显示「运行中」**——半死不活的进程池比没有更糟，因为 nginx 会继续往没起来的端口发请求。
+
+### php.ini
+
+首次启动某个 PHP 版本时生成 `data\php\<版本>\php.ini` = 发行版自带的 `php.ini-production` + 渲染后的 `etc\php\php.ini.append`。**生成一次就不再改动**——「配置」按钮打开的就是这个文件。想恢复默认就删掉它，下次启动会重建。
+
+`extension_dir` 写的是**绝对路径**：相对路径按进程工作目录解析，换个目录就找不到 dll。
+
+### 扩展管理
+
+PHP 页签选中版本 → 「扩展管理」：列出该版本 `ext\` 里的全部 dll，以及 `php.ini` 里提到但该版本**没附带**的扩展（通常是 PECL 的 redis / imagick / memcached，需要自己装 dll 再回来勾上）。
+
+点行切换勾选，「应用并重启」把改动写进 `php.ini` 并重启该版本。写入只重写 `extension=` / `;extension=` 这几行，**其余每一行原样保留**——你写在同一文件里的 `memory_limit`、自定义设置都不会被动到。
 
 ## 构建
 
