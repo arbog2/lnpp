@@ -1989,10 +1989,16 @@ static void phpExtRefresh(HWND hwnd) {
         if (st->want[i]) ++onCount;
         if (!st->exts[i].loaded) ++missing;
     }
+    // Keep it to two short lines: the hint sits between the list and the
+    // buttons, and anything longer gets clipped rather than pushing them apart.
     std::wstring info = L"共 " + std::to_wstring(st->exts.size()) + L" 个扩展，已启用 " +
-                        std::to_wstring(onCount) + L" 个";
-    if (missing) info += L"；其中 " + std::to_wstring(missing) + L" 个缺少 dll（通常是 PECL 扩展，需自行安装）";
-    info += L"。点「应用」写入 " + st->version + L" 的 php.ini，然后重启该版本生效。";
+                        std::to_wstring(onCount) + L" 个。点「应用」写入 php.ini 并重启 " +
+                        st->version + L"。";
+    if (missing)
+        info = L"共 " + std::to_wstring(st->exts.size()) + L" 个扩展，已启用 " +
+               std::to_wstring(onCount) + L" 个；其中 " + std::to_wstring(missing) +
+               L" 个缺少 dll（多为 PECL 扩展，需自行安装 dll 后再勾选）。\r\n" +
+               L"点「应用」写入 php.ini 并重启 " + st->version + L"。";
     SetWindowTextW(st->info, info.c_str());
 }
 
@@ -2016,26 +2022,40 @@ static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (!st) return -1;   // refuse to create rather than crash
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
             RECT rc; GetClientRect(hwnd, &rc);
+            // Lay out from the bottom edge upward. Each control used to be placed
+            // independently as rc.bottom - N, so the button row (bottom-30) landed
+            // inside the hint text block (bottom-52, 30px tall): the hint wraps
+            // to two lines, and the buttons were drawn straight over the second
+            // one. Deriving every y from the one above it makes overlap
+            // impossible rather than merely unlikely.
+            const int kPad = 10;      // edge margin
+            const int kGap = 8;       // between list / hint / buttons
+            const int kBtnH = 26;
+            const int kInfoH = 56;    // two wrapped lines of hint text
+            const int btnY = rc.bottom - kPad - kBtnH;
+            const int infoY = btnY - kGap - kInfoH;
+            const int listH = infoY - kGap - kPad;
+            const int colW = rc.right - 2 * kPad;
             st->list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP |
                 LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                10, 10, rc.right - 20, rc.bottom - 66, hwnd,
+                kPad, kPad, colW, listH, hwnd,
                 (HMENU)(INT_PTR)IDC_PHPX_LIST, GetModuleHandleW(nullptr), nullptr);
             if (st->list) {
                 ListView_SetExtendedListViewStyle(st->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
                 LVCOLUMNW col = {0};
                 col.mask = LVCF_TEXT | LVCF_WIDTH;
-                col.cx = rc.right - 40; col.pszText = (LPWSTR)L"扩展（点一行切换勾选）";
+                col.cx = colW - 8; col.pszText = (LPWSTR)L"扩展（点一行切换勾选）";
                 ListView_InsertColumn(st->list, 0, &col);
             }
             st->info = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                10, rc.bottom - 52, rc.right - 20, 30, hwnd,
+                kPad, infoY, colW, kInfoH, hwnd,
                 (HMENU)(INT_PTR)IDC_PHPX_INFO, GetModuleHandleW(nullptr), nullptr);
             HWND bApply = CreateWindowExW(0, L"BUTTON", L"应用并重启", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                rc.right - 200, rc.bottom - 30, 90, 24, hwnd,
+                rc.right - kPad - 200, btnY, 90, kBtnH, hwnd,
                 (HMENU)(INT_PTR)IDC_PHPX_APPLY, GetModuleHandleW(nullptr), nullptr);
             CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                rc.right - 100, rc.bottom - 30, 90, 24, hwnd,
+                rc.right - kPad - 100, btnY, 90, kBtnH, hwnd,
                 (HMENU)(INT_PTR)IDC_PHPX_CLOSE, GetModuleHandleW(nullptr), nullptr);
             SetFocus(bApply);
             phpExtRefresh(hwnd);
@@ -2117,8 +2137,9 @@ static void showPhpExtDialog(HWND owner, const std::wstring& ver) {
     st.applied = false;
 
     std::wstring title = L"PHP " + ver + L" 扩展管理";
+    // Tall enough that ~19 extensions show without scrolling; there are 40+.
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPPhpExt", title.c_str(),
-                               WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 520, 420,
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 560, 520,
                                owner, nullptr, GetModuleHandleW(nullptr), &st);
     if (!dlg) return;
     centerOn(dlg, owner);
