@@ -59,6 +59,17 @@ struct VHost {
 };
 
 // ---- Component discovery ----
+// ---- Process helpers ----
+// True when `childDir` is `parentDir` itself or a directory beneath it,
+// compared case-insensitively with either separator. Used to decide whether a
+// running process is one of ours: matching on the process name alone made the
+// manager kill (or adopt) an nginx.exe / php-cgi.exe the user started outside
+// it. Public so unit tests can pin the exact-match case — the php copy of this
+// logic once required a trailing separator, which matched nothing at all for a
+// flat install and made Stop kill no process while blaming the port on a
+// stranger.
+bool dirIsUnder(const std::wstring& childDir, const std::wstring& parentDir);
+
 std::vector<std::wstring> compVersions(Comp c);
 // Natural descending version comparison used by compVersions ("1.30" > "1.9").
 bool naturalGt(const std::wstring& a, const std::wstring& b);

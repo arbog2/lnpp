@@ -40,7 +40,7 @@ if "%BUILD_MODE%"=="debug" (
 
 cl %CL_FLAGS% /Fo"build\\" /Fe"%OUT_EXE%" ^
     src\main.cpp src\common.cpp src\process.cpp src\manager.cpp src\downloader.cpp ^
-    /link user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib comdlg32.lib winhttp.lib version.lib crypt32.lib ws2_32.lib ^
+    /link user32.lib gdi32.lib shell32.lib comctl32.lib advapi32.lib ole32.lib comdlg32.lib winhttp.lib version.lib crypt32.lib ws2_32.lib iphlpapi.lib ^
     build\\app.res
 
 if errorlevel 1 (

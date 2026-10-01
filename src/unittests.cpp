@@ -195,6 +195,33 @@ int wmain() {
               compConfigDir(Comp::Php));
     }
 
+    wprintf(L"\n=== dirIsUnder（进程归属判定）===\n");
+    {
+        // This is what decides whether Stop kills a process or leaves it alone.
+        // The exact-match case is the one that matters most: the Windows php zip
+        // is flat, so php-cgi.exe sits directly in bin\php\<ver>\. A version
+        // that required a trailing separator matched nothing there, so Stop
+        // killed no process and then blamed the still-bound port on a stranger.
+        check(L"完全相等（php 的实际情形）",
+              dirIsUnder(L"D:/code/lnpp/bin/php/8.4.26", L"D:/code/lnpp/bin/php/8.4.26"));
+        check(L"完全相等，反斜杠",
+              dirIsUnder(L"D:\\code\\lnpp\\bin\\nginx\\1.30.4", L"D:\\code\\lnpp\\bin\\nginx\\1.30.4"));
+        check(L"父目录带尾部分隔符也该匹配",
+              dirIsUnder(L"D:/code/lnpp/bin/php/8.4.26", L"D:/code/lnpp/bin/php/8.4.26/"));
+        check(L"子目录算在下面",
+              dirIsUnder(L"D:/code/lnpp/bin/nginx/1.30.4/logs", L"D:/code/lnpp/bin/nginx/1.30.4"));
+        check(L"大小写不敏感",
+              dirIsUnder(L"D:/CODE/LNPP/BIN/PHP/8.4.26", L"d:/code/lnpp/bin/php/8.4.26"));
+        // The separator check is what stops 8.1x from being claimed as 8.1.
+        check(L"前缀相同但不是路径分隔符 -> 拒绝",
+              !dirIsUnder(L"D:/code/lnpp/bin/php/8.1x", L"D:/code/lnpp/bin/php/8.1"));
+        check(L"不同版本 -> 拒绝",
+              !dirIsUnder(L"D:/code/lnpp/bin/php/8.1", L"D:/code/lnpp/bin/php/8.3"));
+        check(L"别处的同名程序 -> 拒绝",
+              !dirIsUnder(L"D:/tools/php/8.4.26", L"D:/code/lnpp/bin/php/8.4.26"));
+        check(L"父目录为空 -> 拒绝", !dirIsUnder(L"D:/code/lnpp/bin/php/8.4.26", L""));
+    }
+
     wprintf(L"\n=== php: FastCGI 端口分配 ===\n");
     {
         // The whole point of the per-version port table is that a site config

@@ -1,5 +1,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+// The TCP_TABLE_CLASS enum lives here; iphlpapi.h only forward-declares its use
+// in prototypes. The SDK dropped the old TCP_TABLE_OWNER_PID name in favour of
+// the _LISTENER / _CONNECTIONS / _ALL variants.
+#include <Iprtrmib.h>
 #include "manager.h"
 #include "downloader.h"
 #include <tlhelp32.h>
@@ -278,6 +283,28 @@ static bool processImageIs(DWORD pid, const std::wstring& exePath) {
     return lowerStr(toForward(path)) == lowerStr(toForward(exePath));
 }
 
+// True when `childDir` is `parentDir` itself or a directory beneath it. Both
+// are compared case-insensitively with forward slashes. The separator check on
+// the last matched character is what keeps e.g. bin\nginx\1.30x from matching
+// version 1.30.
+//
+// Extracted because both nginx and php need it, and they had drifted: the php
+// copy only handled the "subdirectory" case and forgot the exact match, so a
+// php-cgi.exe sitting directly in bin\php\<ver>\ (which is where the flat
+// Windows zip puts it) was never recognised as ours — Stop killed nothing and
+// then blamed the port on a foreign process. Public so a unit test can pin the
+// exact-match case that broke.
+bool dirIsUnder(const std::wstring& childDir, const std::wstring& parentDir) {
+    std::wstring e = lowerStr(toForward(childDir));
+    std::wstring o = lowerStr(toForward(parentDir));
+    if (o.empty()) return false;
+    // strip a trailing separator so "bin\php\8.4.26\" also matches exactly
+    while (o.size() > 1 && (o.back() == L'/' || o.back() == L'\\')) o.pop_back();
+    if (e.size() < o.size()) return false;
+    if (e == o) return true;
+    return e.compare(0, o.size(), o) == 0 && (e[o.size()] == L'/' || e[o.size()] == L'\\');
+}
+
 // True when `pid` is an nginx.exe whose image lives under our own
 // bin\nginx\<ver> directory. Matching by process name alone (the old code)
 // made the manager "adopt" any nginx.exe on the system — its master pid then
@@ -291,15 +318,7 @@ static bool isOurNginx(DWORD pid, const std::wstring& ver) {
     BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
     CloseHandle(h);
     if (!ok) return false;
-    std::wstring exeDir = toForward(dirOf(path));
-    std::wstring ours = toForward(compBinDirVer(Comp::Nginx, ver));
-    std::wstring e = lowerStr(exeDir), o = lowerStr(ours);
-    // Exact dir means nginx.exe lives in bin\nginx\<ver>. Also accept a
-    // subdirectory under that version dir, while the separator check keeps
-    // e.g. bin\nginx\1.30x from matching version 1.30.
-    if (e.size() < o.size()) return false;
-    if (e == o) return true;
-    return e.compare(0, o.size(), o) == 0 && e[o.size()] == L'/';
+    return dirIsUnder(dirOf(path), compBinDirVer(Comp::Nginx, ver));
 }
 
 static bool anyNginxRunning(const std::wstring& ver) {
@@ -2688,25 +2707,36 @@ bool nodePm2Resurrect(std::wstring& err) {
 
 namespace {
 
-// True when something is listening on 127.0.0.1:<port>. Probed by attempting to
-// bind: a successful bind means the port is free. Loopback only, which is where
-// -b puts us, so this cannot be fooled by an external interface.
-bool tcpPortBound(const std::wstring& port) {
+// True when some process has a LISTENING socket on 127.0.0.1:<port>.
+//
+// This reads the kernel's TCP table rather than probing with bind(). A bind
+// probe has no way to tell "someone is listening" from "this port still has a
+// connection in TIME_WAIT", and distinguishing them matters here: the probe
+// cannot use SO_REUSEADDR (with it, every bind on a live port succeeds and the
+// liveness check becomes useless), so without it a php-cgi that just served a
+// request and was killed would still look alive — the pool would show 运行中
+// for a dead process and the next 启动 would be refused as "already running".
+bool tcpPortListening(const std::wstring& port) {
     if (!validPort(port)) return false;
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { WSACleanup(); return false; }
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)_wtoi(port.c_str()));
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    // Deliberately no SO_REUSEADDR: with it set, a second bind on the same port
-    // succeeds on Windows and every liveness probe would answer "free".
-    bool bound = bind(s, (sockaddr*)&addr, sizeof(addr)) != 0;
-    closesocket(s);
-    WSACleanup();
-    return bound;
+    ULONG size = 0;
+    DWORD rc = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET,
+                                   TCP_TABLE_OWNER_PID_ALL, 0);
+    if (rc != ERROR_INSUFFICIENT_BUFFER || size < sizeof(DWORD)) return false;
+    std::vector<BYTE> buf(size);
+    rc = GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET,
+                             TCP_TABLE_OWNER_PID_ALL, 0);
+    if (rc != NO_ERROR) return false;
+    auto* tbl = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    // 127.0.0.1 held in a DWORD, little-endian: 7F 00 00 01 -> 0x0100007F
+    const DWORD kLoopback = 0x0100007Fu;
+    const USHORT want = htons((u_short)_wtoi(port.c_str()));
+    for (DWORD i = 0; i < tbl->dwNumEntries; ++i) {
+        const MIB_TCPROW_OWNER_PID& r = tbl->table[i];
+        if (r.dwState != MIB_TCP_STATE_LISTEN) continue;
+        if (r.dwLocalAddr != kLoopback) continue;
+        if (r.dwLocalPort == want) return true;
+    }
+    return false;
 }
 
 std::wstring phpIniPath(const std::wstring& ver) {
@@ -2808,7 +2838,7 @@ std::wstring phpEnsurePort(const std::wstring& ver, std::wstring& err) {
         // php-cgi that dies on bind.
         bool busy = false;
         for (int q = p; q <= last; ++q) {
-            if (tcpPortBound(std::to_wstring(q))) { busy = true; break; }
+            if (tcpPortListening(std::to_wstring(q))) { busy = true; break; }
         }
         if (busy) { p += workers - 1; continue; }
         iniSet(L"php.verport." + ver, std::to_wstring(p));
@@ -2825,7 +2855,7 @@ bool phpRunning(const std::wstring& ver) {
     std::vector<std::wstring> ports = phpPortsFor(ver);
     if (ports.empty()) return false;
     for (const std::wstring& p : ports)
-        if (!tcpPortBound(p)) return false;
+        if (!tcpPortListening(p)) return false;
     return true;
 }
 
@@ -2945,7 +2975,7 @@ static std::vector<DWORD> ourPhpCgiPids(const std::wstring& ver) {
     std::vector<DWORD> pids;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return pids;
-    std::wstring ours = lowerStr(toForward(compBinDirVer(Comp::Php, ver)));
+    std::wstring ours = compBinDirVer(Comp::Php, ver);
     PROCESSENTRY32W pe = {0};
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
@@ -2958,12 +2988,13 @@ static std::vector<DWORD> ourPhpCgiPids(const std::wstring& ver) {
             BOOL ok = QueryFullProcessImageNameW(h, 0, path, &size);
             CloseHandle(h);
             if (!ok) continue;
-            std::wstring e = lowerStr(toForward(dirOf(path)));
-            // The separator check keeps bin\php\8.1x from matching version 8.1.
-            if (e.size() > ours.size() && e.compare(0, ours.size(), ours) == 0 &&
-                e[ours.size()] == L'/') {
+            // dirIsUnder, not a bare "is it a subdirectory" test: the Windows
+            // php zip is flat, so php-cgi.exe sits DIRECTLY in bin\php\<ver>\.
+            // Requiring e.size() > ours.size() here matched nothing at all, so
+            // Stop killed nothing and then reported the still-bound port as
+            // belonging to some foreign process.
+            if (dirIsUnder(dirOf(path), ours))
                 pids.push_back(pe.th32ProcessID);
-            }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
@@ -2981,14 +3012,14 @@ bool phpStop(const std::wstring& ver, std::wstring& err) {
     for (int i = 0; i < 30; ++i) {
         bool allFree = true;
         for (const std::wstring& p : ports)
-            if (tcpPortBound(p)) { allFree = false; break; }
+            if (tcpPortListening(p)) { allFree = false; break; }
         if (allFree) return true;
         Sleep(100);
     }
     // A port still bound after killing every php-cgi we own: something that is
     // not ours is holding it, so report rather than claiming success.
     for (const std::wstring& p : ports) {
-        if (tcpPortBound(p)) {
+        if (tcpPortListening(p)) {
             err = L"端口 " + p + L" 仍被占用，可能不是本管理器启动的 php-cgi";
             return false;
         }
