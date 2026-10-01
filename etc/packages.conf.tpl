@@ -46,9 +46,10 @@ Redis-5.0.14=https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Re
 # PHP（Windows NTS x64）
 # https://windows.php.net/downloads/releases/
 #
-# 这里只列一个版本。下载器装到 bin\php\<版本>\ 后，PHP 组件是**多版本共存**的：
-# 把别的版本也加进来（格式完全一样，SHA256 用 certutil -hashfile 自算），
-# 启动时各占一个 FastCGI 端口，站点可以分别指向不同版本。
+# 列了 8.1 ~ 8.5 各一个当前补丁版——PHP 组件是**多版本共存**的，几个项目分别
+# 要不同 PHP 版本时各装一个即可，启动时各占一个 FastCGI 端口，站点可以分别
+# 指向不同版本。8.0 已停止安全维护，未列入；需要的话按同样格式加一行
+# （URL 把版本号换掉，SHA256 用 certutil -hashfile <下载的zip> SHA256 自算）。
 #
 # - 选 **NTS**（Non Thread Safe）：本管理器把 PHP 当 FastCGI 后端跑
 #   （php-cgi.exe -b 127.0.0.1:<端口>），NTS 正是这个场景的常规选择；
@@ -60,7 +61,16 @@ Redis-5.0.14=https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Re
 # - 压缩包是「散文件」结构：解压后 bin\php\<版本>\ 下直接就是 php-cgi.exe、
 #   ext\、php.ini-production，不套一层目录。
 # - SHA256 是 2026-10-01 从上述官方地址下载后实算的。PHP 官方只在
-#   https://windows.php.net/download/ 上公布当前最新版的校验和，旧补丁版需自算。
+#   https://windows.php.net/download/ 上公布当前最新版的校验和，旧补丁版需自算；
+#   其中 8.5.11 与官方公布值逐字符比对通过，8.3.35 重下两次哈希可复现。
+php-8.1.34=https://windows.php.net/downloads/releases/php-8.1.34-nts-Win32-vs16-x64.zip
+php-8.1.34.sha256=9cfe246cb144076c16f5913a3ef88a474c3dd7e60f0f0c8bb95faf68674016cc
+php-8.2.34=https://windows.php.net/downloads/releases/php-8.2.34-nts-Win32-vs16-x64.zip
+php-8.2.34.sha256=03249b5c9414c6dbe30276f4a7598bd9d2a7417ee81f709b06b99e9c4a2aff4f
+php-8.3.35=https://windows.php.net/downloads/releases/php-8.3.35-nts-Win32-vs16-x64.zip
+php-8.3.35.sha256=25a8e2ac9ff30f1d768d1447c09a600617fa6e6082729f6e95f008b59c91fe45
 php-8.4.26=https://windows.php.net/downloads/releases/php-8.4.26-nts-Win32-vs17-x64.zip
 php-8.4.26.sha256=da68394f9193b7f6b89d0c76861a4034ae10efee7fd55a7255d8118c2acf70d7
+php-8.5.11=https://windows.php.net/downloads/releases/php-8.5.11-nts-Win32-vs17-x64.zip
+php-8.5.11.sha256=0ea96e0d2b9b737a6036f05cf4e95c49313faa6d0f27bd97edb2742503f0c043
 ---
