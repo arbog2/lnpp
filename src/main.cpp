@@ -400,6 +400,7 @@ static void kickPm2Poll() {
 // Defined with the add-site form (initNginxPage), but the vhost refresh needs
 // it too: a php site can only point at a running php-cgi.
 static void refreshPhpVerCombo(HWND parent);
+static void showPhpExtDialog(HWND owner, const std::wstring& ver);
 
 static void refreshNginxVHosts() {
     HWND lv = GetDlgItem(g_main, IDC_NG_VHOST_LIST);
@@ -1241,6 +1242,7 @@ static void initOverviewPage(HWND parent) {
     ov.verTxt = ver;
 }
 
+
 // ============================ Main window proc ============================
 
 static void initNginxPage(HWND parent) {
@@ -2006,7 +2008,12 @@ static void phpExtToggle(HWND hwnd) {
 static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            PhpExtState* st = (PhpExtState*)lParam;
+            // WM_CREATE hands us a CREATESTRUCT, not the pointer we passed as
+            // lpCreateParams — reading lParam directly yields a wild pointer and
+            // the very next store through it takes the whole process down.
+            CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+            PhpExtState* st = cs ? (PhpExtState*)cs->lpCreateParams : nullptr;
+            if (!st) return -1;   // refuse to create rather than crash
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
             RECT rc; GetClientRect(hwnd, &rc);
             st->list = CreateWindowExW(0, WC_LISTVIEWW, L"",
