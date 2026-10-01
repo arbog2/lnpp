@@ -1,11 +1,13 @@
 # LNPP 组件下载源示例 — 复制为 packages.conf 后按需增删
 #
 # 格式：按组列出，`# 标题` 后跟 `---` 分隔符，条目为 `名称=URL`。
-# 程序只认 nginx / nodejs / postgresql / redis 四种组件（node 目录别名 nodejs）。
+# 程序只认 nginx / nodejs / postgresql / redis / php 五种组件
+# （node 目录别名 nodejs）。
 #
 # 安全要求：
 # - 只接受 https:// 开头的 URL，http 会被直接拒绝。下载物是随后以当前用户
-#   权限执行的 nginx.exe / initdb.exe / redis-server.exe，明文传输等于不设防。
+#   权限执行的 nginx.exe / initdb.exe / redis-server.exe / php-cgi.exe，
+#   明文传输等于不设防。
 # - 名称的 `-` 之后是版本号，只能包含字母/数字/`.`/`_`/`-`/`+`；名字里不能有
 #   路径分隔符，也不能是 `.` / `..`（该值会用作 bin\<组件>\<版本> 目录名）。
 #
@@ -39,4 +41,26 @@ postgresql-17.2=https://sbp.enterprisedb.com/getfile.jsp?fileid=1259294
 # Redis
 ---
 Redis-5.0.14=https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip
+---
+
+# PHP（Windows NTS x64）
+# https://windows.php.net/downloads/releases/
+#
+# 这里只列一个版本。下载器装到 bin\php\<版本>\ 后，PHP 组件是**多版本共存**的：
+# 把别的版本也加进来（格式完全一样，SHA256 用 certutil -hashfile 自算），
+# 启动时各占一个 FastCGI 端口，站点可以分别指向不同版本。
+#
+# - 选 **NTS**（Non Thread Safe）：本管理器把 PHP 当 FastCGI 后端跑
+#   （php-cgi.exe -b 127.0.0.1:<端口>），NTS 正是这个场景的常规选择；
+#   TS 是给多线程 Web API 用的。
+# - vs16 = 用 Visual Studio 2019 编译，vs17 = VS2022（8.4 起官方只出 vs17）。
+#   **两者都要求安装「Microsoft Visual C++ 2015-2022 可再发行组件包」(x64)**，
+#   缺了 php-cgi.exe 会在启动时直接退出，页面上表现为端口一直不监听：
+#   https://aka.ms/vs/17/release/vc_redist.x64.exe
+# - 压缩包是「散文件」结构：解压后 bin\php\<版本>\ 下直接就是 php-cgi.exe、
+#   ext\、php.ini-production，不套一层目录。
+# - SHA256 是 2026-10-01 从上述官方地址下载后实算的。PHP 官方只在
+#   https://windows.php.net/download/ 上公布当前最新版的校验和，旧补丁版需自算。
+php-8.4.26=https://windows.php.net/downloads/releases/php-8.4.26-nts-Win32-vs17-x64.zip
+php-8.4.26.sha256=da68394f9193b7f6b89d0c76861a4034ae10efee7fd55a7255d8118c2acf70d7
 ---
