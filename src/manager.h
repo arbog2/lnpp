@@ -208,10 +208,19 @@ std::wstring phpUpstreamName(const std::wstring& ver);
 // What a php site's fastcgi_pass should be: the upstream name for a pool, the
 // bare 127.0.0.1:<port> address for a single worker.
 std::wstring phpFastcgiTarget(const std::wstring& ver);
+// Rewrite the fastcgi_pass target of every site pointing at `ver`, because a
+// change in worker count changes the answer: phpUpstreamBlock only declares an
+// upstream for a pool, so a pool collapsing to one worker would leave the old
+// sites naming an upstream that no longer exists — and every later nginx -t
+// then fails with "unknown upstream". Returns sites changed, or -1 on failure.
+int phpRewriteSitesFor(const std::wstring& ver, std::wstring& err);
 // Site names in data\nginx\vhosts\*.conf that target a given FastCGI port,
 // matching both the address form and the upstream form, so a version can be
 // stopped or removed only after saying what will break.
 std::vector<std::wstring> phpSitesUsingPort(const std::wstring& port);
+// Same list as a ready-to-show message ("站点 a、b 将无法访问"), for the
+// confirm-before-destroy prompts.
+std::wstring phpSitesUsingPortText(const std::wstring& port);
 
 // ---- php extensions ----
 struct PhpExtension {
@@ -224,6 +233,14 @@ struct PhpExtension {
 // the whole rule is unit-testable; a line is "extension=<name>" optionally
 // prefixed with ';' (commented out = not enabled).
 std::map<std::wstring, bool> phpParseExtensionLines(const std::wstring& iniText);
+// Rewrite the extension= / ;extension= lines of a php.ini so exactly `wanted`
+// is enabled, leaving every other byte — other settings, blank lines, the
+// user's own comments and the file's line endings — untouched. `changed` is
+// optional. Exposed separately from phpApplyExtensions so the rewrite itself is
+// unit-testable without a real PHP install on disk.
+std::wstring phpRewriteExtensionLines(const std::wstring& iniText,
+                                      const std::vector<std::wstring>& wanted,
+                                      int* changed);
 // The extensions this version could load: the dlls present in its ext\ directory,
 // plus anything php.ini already mentions (so an entry pointing at a missing dll
 // is visible as broken rather than silently dropped).

@@ -48,11 +48,16 @@ enum {
     IDC_OV_AUTOSTART_ALL = 700, IDC_OV_BTN_ALL_START = 701, IDC_OV_BTN_ALL_RESTART = 702,
     IDC_OV_BTN_ALL_STOP = 703, IDC_OV_RESULT = 704, IDC_OV_BOOT_START = 705,
     IDC_OV_BTN_PATH_ADD = 706, IDC_OV_BTN_PATH_DEL = 707,
-    IDC_OV_BTN_DL = 708, IDC_OV_VER_TXT = 709, IDC_OV_ABOUT_LINK = 714,
-    IDC_OV_LOG = 715, IDC_OV_BTN_CLEAR_LOG = 716,
+    IDC_OV_BTN_DL = 708, IDC_OV_VER_TXT = 709,
     IDC_OV_COMP_START_BASE = 710,   // + comp index: start/stop toggle button
     IDC_OV_COMP_AUTO_BASE = 720,    // + comp index: "随管理器启动" checkbox
     IDC_OV_COMP_STATUS_BASE = 730,  // + comp index: status text
+    // Must NOT sit inside 710..710+Comp::Count-1: a component row's button is
+    // addressed by number, so sharing one with an unrelated control makes that
+    // control's notification dispatch to the wrong handler. (ABOUT_LINK was 714
+    // and collided with Nginx=0..PHP=4's toggle at 714, killing both.)
+    IDC_OV_ABOUT_LINK = 740,
+    IDC_OV_LOG = 715, IDC_OV_BTN_CLEAR_LOG = 716,
     // php page
     IDC_PHP_POOL_LIST = 800, IDC_PHP_BTN_START = 801, IDC_PHP_BTN_STOP = 802,
     IDC_PHP_BTN_DEFAULT = 803, IDC_PHP_INFO = 804,
@@ -79,6 +84,37 @@ constexpr int kPgPageIds[] = {
 };
 static_assert(idsDistinct(kPgPageIds, sizeof(kPgPageIds) / sizeof(kPgPageIds[0])),
               "duplicate control id on the postgresql page - see the note above");
+
+// The overview addresses component rows by arithmetic (BASE + comp index), so
+// any fixed id landing in those three ranges is a live control that will be
+// shadowed by a row's button or checkbox. Checked at compile time: adding a
+// component must never silently take over another control's id.
+constexpr int kOvReserved[] = {
+    IDC_OV_AUTOSTART_ALL, IDC_OV_BTN_ALL_START, IDC_OV_BTN_ALL_RESTART,
+    IDC_OV_BTN_ALL_STOP, IDC_OV_RESULT, IDC_OV_BOOT_START,
+    IDC_OV_BTN_PATH_ADD, IDC_OV_BTN_PATH_DEL, IDC_OV_BTN_DL, IDC_OV_VER_TXT,
+    IDC_OV_ABOUT_LINK, IDC_OV_LOG, IDC_OV_BTN_CLEAR_LOG,
+};
+static_assert([] {
+    for (int k : kOvReserved) {
+        if (k >= IDC_OV_COMP_START_BASE &&
+            k < IDC_OV_COMP_START_BASE + (int)Comp::Count) return false;
+        if (k >= IDC_OV_COMP_AUTO_BASE &&
+            k < IDC_OV_COMP_AUTO_BASE + (int)Comp::Count) return false;
+        if (k >= IDC_OV_COMP_STATUS_BASE &&
+            k < IDC_OV_COMP_STATUS_BASE + (int)Comp::Count) return false;
+    }
+    return true;
+}(), "a fixed overview control id collides with a component row - see IDC_OV_ABOUT_LINK above");
+// The three row bases are 10 apart, so a component count above 10 would make one
+// row's button overlap the next row's checkbox.
+static_assert((int)Comp::Count <= 10, "component rows are 10px apart; trim the spacing or the rows overlap");
+// The overview row band is 156px and each row needs 26px (a 24px button plus
+// breathing room). Beyond six components the clamped pitch can no longer fit and
+// the last row would land on the PATH button row — the exact bug that produced
+// the "PHP row painted over the buttons" overlap.
+static_assert((int)Comp::Count <= 6,
+              "overview rows would overlap the PATH button row; widen kRowLimit or shrink the row pitch");
 
 // tray menu item ids
 enum {
@@ -399,7 +435,8 @@ static void kickPm2Poll() {
 
 // Defined with the add-site form (initNginxPage), but the vhost refresh needs
 // it too: a php site can only point at a running php-cgi.
-static void refreshPhpVerCombo(HWND parent);
+static void refreshPhpVerCombo(HWND parent, const std::vector<PhpInstance>* pool);
+static void refreshPhpVerCombo(HWND parent) { refreshPhpVerCombo(parent, nullptr); }
 static void showPhpExtDialog(HWND owner, const std::wstring& ver);
 
 static void refreshNginxVHosts() {
@@ -428,27 +465,39 @@ static void refreshNginxVHosts() {
     refreshPhpVerCombo(g_main);
 }
 
+// Set while refreshPhpPool restores a selection, so the resulting
+// LVN_ITEMCHANGED does not kick off another full pool scan.
+static bool g_restoringPhpSel = false;
+
+// Defined with the PHP pool list (below), but the vhost refresh and the
+// workers box both need it earlier in the file.
+static std::wstring phpSelectedVersion();
+
+// Keep the "进程数" box in step with the selected row, so it always shows what
+// that version is actually running rather than a stale number.
+static void syncWorkersEdit(const std::wstring& ver);
+
+static void syncWorkersEdit() { syncWorkersEdit(phpSelectedVersion()); }
+
 // The PHP version pool: one php-cgi per version, each on its own FastCGI port.
 // All installed versions run at once, so this is the real status view — the
 // common one-dot-one-version chrome above cannot express it.
-static void syncWorkersEdit();
-
 static void refreshPhpPool() {
     HWND lv = GetDlgItem(g_main, IDC_PHP_POOL_LIST);
     if (!lv) return;
     int prev = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-    std::wstring keepSel;
-    // Row -> version is the order of phpListPool(), so the selected version is
-    // recovered by re-querying rather than by reading the control's text:
-    // LVM_GETITEMTEXT copies whatever length the caller claims (the P0-2 trap)
-    // and a version name is a directory name on disk, so it is not bounded.
-    if (prev >= 0) {
-        std::vector<PhpInstance> pool = phpListPool();
-        if (prev < (int)pool.size()) keepSel = pool[prev].version;
-    }
+    // One snapshot for the whole refresh. phpListPool() walks every installed
+    // version and reads the kernel TCP table once per worker, so calling it per
+    // row — and again for the selection, the workers box and the combo — meant
+    // five full scans per repaint on the UI thread.
+    std::vector<PhpInstance> pool = phpListPool();
+    auto versionAtRow = [&](int row) -> std::wstring {
+        return (row >= 0 && row < (int)pool.size()) ? pool[row].version : std::wstring();
+    };
+    std::wstring keepSel = versionAtRow(prev);
     ListView_DeleteAllItems(lv);
     int row = 0;
-    for (const PhpInstance& pi : phpListPool()) {
+    for (const PhpInstance& pi : pool) {
         LVITEMW item = {0};
         item.mask = LVIF_TEXT;
         item.iItem = row;
@@ -466,36 +515,36 @@ static void refreshPhpPool() {
         ++row;
     }
     if (!keepSel.empty()) {
-        std::vector<PhpInstance> pool = phpListPool();
         for (int i = 0; i < (int)pool.size(); ++i) {
             if (pool[i].version == keepSel) {
+                // Restoring the selection re-enters LVN_ITEMCHANGED; the guard
+                // flag stops that from bouncing back into another scan.
+                g_restoringPhpSel = true;
                 ListView_SetItemState(lv, i, LVIS_SELECTED | LVIS_FOCUSED,
                                       LVIS_SELECTED | LVIS_FOCUSED);
+                g_restoringPhpSel = false;
                 break;
             }
         }
     }
-    syncWorkersEdit();
-    refreshPhpVerCombo(g_main);
+    syncWorkersEdit(versionAtRow(ListView_GetNextItem(lv, -1, LVNI_SELECTED)));
+    refreshPhpVerCombo(g_main, &pool);
 }
-
-// Defined with the PHP pool list (below), but the vhost refresh and the
-// workers box both need it earlier in the file.
-static std::wstring phpSelectedVersion();
 
 // Keep the "进程数" box in step with the selected row, so it always shows what
 // that version is actually running rather than a stale number.
-static void syncWorkersEdit() {
+static void syncWorkersEdit(const std::wstring& ver) {
     HWND e = GetDlgItem(g_main, IDC_PHP_WORKERS);
     if (!e) return;
-    std::wstring v = phpSelectedVersion();
-    if (v.empty()) { SetWindowTextW(e, L""); return; }
-    SetWindowTextW(e, std::to_wstring(phpWorkerCount(v)).c_str());
+    if (ver.empty()) { SetWindowTextW(e, L""); return; }
+    SetWindowTextW(e, std::to_wstring(phpWorkerCount(ver)).c_str());
 }
 
 // Version string of the selected row in the PHP pool, or "" when nothing is
-// selected. Same reason as above: derived from the pool, never from the
-// control's own text.
+// selected. Derived from the pool, never from the control's own text: reading
+// the control's text would need an unbounded copy (LVM_GETITEMTEXT copies
+// whatever length the caller claims — the P0-2 trap) over a version name that
+// is a directory name on disk.
 static std::wstring phpSelectedVersion() {
     HWND lv = GetDlgItem(g_main, IDC_PHP_POOL_LIST);
     if (!lv) return std::wstring();
@@ -1077,6 +1126,12 @@ static void applyStatusSnapshot() {
     if (cur >= TAB_COMP_BASE) refreshVersions(tabToComp(cur));
     refreshPgInfo();
     refreshRedisInfo();
+    // The PHP pool's 运行中/已停止 column comes from this same poll, so it has
+    // to be refreshed here too. Node gets applyPm2Snapshot for exactly this
+    // reason; without the PHP counterpart a php-cgi that crashed (or was killed
+    // from Task Manager) left the pool claiming it was running while the
+    // overview dot correctly showed it stopped.
+    if (cur >= TAB_COMP_BASE && tabToComp(cur) == Comp::Php) refreshPhpPool();
     refreshOverview();
 }
 
@@ -1327,7 +1382,8 @@ static void initNginxPage(HWND parent) {
 // every request with 502, so an idle version must not be offered here.
 // Takes the parent explicitly: this runs from WM_CREATE, where g_main is still
 // null (it is only assigned once CreateWindowExW returns).
-static void refreshPhpVerCombo(HWND parent) {
+// `pool` may be supplied by a caller that already has one, to avoid re-scanning.
+static void refreshPhpVerCombo(HWND parent, const std::vector<PhpInstance>* pool) {
     HWND c = GetDlgItem(parent, IDC_NG_PHPVER);
     if (!c) return;
     std::wstring keep;
@@ -1344,8 +1400,10 @@ static void refreshPhpVerCombo(HWND parent) {
         }
     }
     SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    std::vector<PhpInstance> local;
+    const std::vector<PhpInstance>& all = pool ? *pool : (local = phpListPool(), local);
     int n = 0;
-    for (const PhpInstance& pi : phpListPool()) {
+    for (const PhpInstance& pi : all) {
         if (!pi.running) continue;
         std::wstring item = pi.version + L"（端口 " + pi.port + L"）";
         SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)item.c_str());
@@ -2002,25 +2060,36 @@ static void phpExtRefresh(HWND hwnd) {
     SetWindowTextW(st->info, info.c_str());
 }
 
-static void phpExtToggle(HWND hwnd) {
+static void phpExtToggle(HWND hwnd, int idx) {
     PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (!st || !st->list) return;
-    int sel = ListView_GetNextItem(st->list, -1, LVNI_SELECTED);
-    if (sel < 0 || sel >= (int)st->exts.size()) return;
-    st->want[sel] = !st->want[sel];
+    // -1 means the click landed in blank space below the rows. Toggling the
+    // still-selected row then looks like the list randomly flipped an entry.
+    if (idx < 0 || idx >= (int)st->exts.size()) return;
+    st->want[idx] = !st->want[idx];
     phpExtRefresh(hwnd);
 }
 
 static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_CREATE: {
-            // WM_CREATE hands us a CREATESTRUCT, not the pointer we passed as
-            // lpCreateParams — reading lParam directly yields a wild pointer and
-            // the very next store through it takes the whole process down.
+        case WM_NCCREATE: {
+            // Grab the state here rather than in WM_CREATE: the pointer has to
+            // be in place before any child control is created, and the state is
+            // heap-allocated so a re-entered dialog cannot share state with a
+            // previous one (a function-local `static` would).
             CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
             PhpExtState* st = cs ? (PhpExtState*)cs->lpCreateParams : nullptr;
-            if (!st) return -1;   // refuse to create rather than crash
+            if (!st) return FALSE;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+            return TRUE;
+        }
+        case WM_CREATE: {
+            // NB: WM_CREATE's lParam is the CREATESTRUCT, not our pointer — the
+            // state was already picked up in WM_NCCREATE above. Reading lParam
+            // directly here yielded a wild pointer and the next store through it
+            // took the process down.
+            PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (!st) return -1;
             RECT rc; GetClientRect(hwnd, &rc);
             // Lay out from the bottom edge upward. Each control used to be placed
             // independently as rc.bottom - N, so the button row (bottom-30) landed
@@ -2062,9 +2131,22 @@ static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_NOTIFY: {
-            if (((LPNMHDR)lParam)->idFrom == IDC_PHPX_LIST &&
-                ((LPNMHDR)lParam)->code == NM_CLICK) {
-                phpExtToggle(hwnd);
+            // NMLISTVIEW has no `code` member — that field is on the NMHDR
+            // base, and LVN_KEYDOWN's iItem is -1 because a key press has no
+            // point, so the toggle falls back to the current selection.
+            NMHDR* nh = (NMHDR*)lParam;
+            if (nh->idFrom != IDC_PHPX_LIST) break;
+            NMLISTVIEW* nv = (NMLISTVIEW*)lParam;
+            if (nh->code == NM_CLICK || nh->code == NM_DBLCLK) {
+                phpExtToggle(hwnd, nv->iItem);
+                return 0;
+            }
+            if (nh->code == LVN_KEYDOWN && wParam == VK_SPACE) {
+                phpExtToggle(hwnd, nv->iItem);
+                return 0;
+            }
+            if (nh->code == NM_RETURN) {
+                phpExtToggle(hwnd, ListView_GetNextItem(nv->hdr.hwndFrom, -1, LVNI_SELECTED));
                 return 0;
             }
             break;
@@ -2075,6 +2157,16 @@ static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (id == IDC_PHPX_APPLY) {
                 PhpExtState* st = (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
                 if (!st) return 0;
+                // runAsync drops the call silently when the component is busy.
+                // Closing the dialog anyway made "已应用" look like it worked
+                // while nothing was written — and the ini write + restart both
+                // take long enough that clicking 启动 then 应用 is easy to do.
+                if (g_ui[(int)Comp::Php].busy) {
+                    MessageBoxW(hwnd, L"PHP 正在执行其它操作（启动/停止/切换），扩展设置未写入。\n\n"
+                                      L"请等该操作结束后再点「应用并重启」。",
+                                L"扩展管理", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
                 std::vector<std::wstring> wanted;
                 for (size_t i = 0; i < st->exts.size(); ++i)
                     if (st->want[i]) wanted.push_back(st->exts[i].name);
@@ -2103,7 +2195,14 @@ static LRESULT CALLBACK PhpExtProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             break;
         }
         case WM_CLOSE: DestroyWindow(hwnd); return 0;
-        case WM_DESTROY: return 0;
+        case WM_DESTROY: {
+            // Heap-allocated state (see WM_NCCREATE): freeing here keeps two
+            // dialogs from ever sharing one block, which a function-local
+            // `static` would do if the dialog were ever re-entered.
+            delete (PhpExtState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -2126,22 +2225,23 @@ static void showPhpExtDialog(HWND owner, const std::wstring& ver) {
         RegisterClassW(&wc);
         reg = true;
     }
-    // The state outlives the window: the apply path hands the version and the
-    // wanted set to a worker thread by value before the dialog is destroyed.
-    static PhpExtState st;
-    st.version = ver;
-    st.exts = exts;
-    st.want.clear();
-    st.want.reserve(exts.size());
-    for (const PhpExtension& e : exts) st.want.push_back(e.enabled);
-    st.applied = false;
+    // Heap-allocated: WM_NCCREATE adopts it and WM_DESTROY frees it, so two
+    // dialogs can never share one block. The apply path copies the version and
+    // the wanted set by value into the worker lambda, so nothing here is
+    // touched after the window is gone.
+    PhpExtState* st = new PhpExtState();
+    st->version = ver;
+    st->exts = exts;
+    st->want.reserve(exts.size());
+    for (const PhpExtension& e : exts) st->want.push_back(e.enabled);
+    st->applied = false;
 
     std::wstring title = L"PHP " + ver + L" 扩展管理";
     // Tall enough that ~19 extensions show without scrolling; there are 40+.
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPPhpExt", title.c_str(),
                                WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, 560, 520,
-                               owner, nullptr, GetModuleHandleW(nullptr), &st);
-    if (!dlg) return;
+                               owner, nullptr, GetModuleHandleW(nullptr), st);
+    if (!dlg) { delete st; return; }   // WM_NCCREATE never ran, nothing freed it
     centerOn(dlg, owner);
     modal_loop(dlg, owner);
     DestroyWindow(dlg);
@@ -2493,10 +2593,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_COMP_START_BASE + 1: ovToggle(Comp::Postgresql); break;
                 case IDC_OV_COMP_START_BASE + 2: ovToggle(Comp::Redis); break;
                 case IDC_OV_COMP_START_BASE + 3: ovToggle(Comp::Nodejs); break;
+                case IDC_OV_COMP_START_BASE + 4: ovToggle(Comp::Php); break;
                 case IDC_OV_COMP_AUTO_BASE + 0: ovAutoComp(Comp::Nginx, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 1: ovAutoComp(Comp::Postgresql, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 2: ovAutoComp(Comp::Redis, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 3: ovAutoComp(Comp::Nodejs, (HWND)lParam); break;
+                case IDC_OV_COMP_AUTO_BASE + 4: ovAutoComp(Comp::Php, (HWND)lParam); break;
                 case IDC_BTN_START:
                     if (sender != Comp::Count) actStart(sender);
                     break;
@@ -2671,21 +2773,55 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                             if (want > 32) want = 32;
                         }
                     }
-                    if (start && want != phpWorkerCount(v)) {
-                        iniSet(L"php.workers." + v, std::to_wstring(want));
-                        // A site points at an upstream as soon as the pool is
-                        // bigger than one, so the vhost has to be rewritten.
-                        // nginxReload regenerates the config (picking up the new
-                        // {{PHP_UPSTREAM}}) and re-copies every site.
-                        ComponentStatus ng = compStatus(Comp::Nginx);
-                        if (ng.installed) {
-                            std::wstring nerr;
-                            if (!nginxReload(nerr))
-                                logAppend(Comp::Php, L"改进程数后重载 nginx 失败: " + nerr);
+                    // Stopping a version whose ports a site points at turns that
+                    // site into 502s with no explanation anywhere, so name the
+                    // affected sites before doing it.
+                    if (!start) {
+                        std::wstring impact;
+                        for (const std::wstring& p : phpPortsFor(v)) {
+                            std::wstring t = phpSitesUsingPortText(p);
+                            if (t.empty()) continue;
+                            impact += impact.empty() ? t : (L"\n" + t);
+                        }
+                        if (!impact.empty()) {
+                            std::wstring prompt = L"停止 PHP " + v + L" 后，以下站点将无法访问：\n\n" +
+                                                  impact + L"\n\n仍要停止吗？";
+                            if (MessageBoxW(hwnd, prompt.c_str(), L"停止 PHP",
+                                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                                logAppend(Comp::Php, L"已取消停止 PHP " + v);
+                                break;
+                            }
                         }
                     }
+                    // Rewriting the sites and reloading nginx both touch disk
+                    // and spawn nginx, so they belong on the worker thread with
+                    // the start itself — running them here froze the window for
+                    // the whole nginx -t / reload round trip.
                     runAsync(Comp::Php, (start ? L"启动 PHP " : L"停止 PHP ") + v,
-                             [v, start](std::wstring& err) {
+                             [v, start, want](std::wstring& err) {
+                        if (start && want != phpWorkerCount(v)) {
+                            iniSet(L"php.workers." + v, std::to_wstring(want));
+                            // A site points at an upstream as soon as the pool is
+                            // bigger than one, and at a bare address when it
+                            // collapses back — so the sites have to follow the
+                            // change, otherwise nginx -t fails with an unknown
+                            // upstream on every later start.
+                            std::wstring rerr;
+                            int n = phpRewriteSitesFor(v, rerr);
+                            if (n < 0) { err = rerr; return false; }
+                            if (n > 0)
+                                logMsg(L"php", L"PHP " + v + L" 进程数改为 " +
+                                      std::to_wstring(want) + L"，已更新 " +
+                                      std::to_wstring(n) + L" 个站点的后端");
+                            ComponentStatus ng = compStatus(Comp::Nginx);
+                            if (ng.installed) {
+                                std::wstring nerr;
+                                if (!nginxReload(nerr)) {
+                                    err = L"进程数已改，但重载 nginx 失败: " + nerr;
+                                    return false;
+                                }
+                            }
+                        }
                         return start ? phpStart(v, err) : phpStop(v, err);
                     });
                     break;
@@ -2738,9 +2874,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
                 showPage(TabCtrl_GetCurSel(g_tab));
             } else if (nm->idFrom == IDC_PHP_POOL_LIST && nm->code == LVN_ITEMCHANGED) {
-                // Keep the process-count box showing what the selected row
-                // actually runs, not whatever was typed for a previous row.
-                syncWorkersEdit();
+                // Only react to a real selection change. The notification also
+                // fires for focus moves and for refreshPhpPool restoring the
+                // selection, and each one used to trigger another full pool scan.
+                if (g_restoringPhpSel) break;
+                NMLISTVIEW* nv = (NMLISTVIEW*)lParam;
+                if (!(nv->uChanged & LVIF_STATE)) break;
+                bool wasSel = (nv->uOldState & LVIS_SELECTED) != 0;
+                bool isSel  = (nv->uNewState & LVIS_SELECTED) != 0;
+                if (wasSel != isSel) syncWorkersEdit();
             }
             break;
         }

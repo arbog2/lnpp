@@ -1,4 +1,4 @@
-# LNPP 组件管理器 v1.5.4
+# LNPP 组件管理器 v1.5.5
 
 Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis / php 的启动、停止、版本切换、配置。
 
@@ -78,7 +78,7 @@ lnpp.exe
 
 | 模板 | 占位符 |
 |---|---|
-| `etc\nginx\nginx.conf.tpl` | {{PORT}} {{WWW_DIR}} {{MIME}} **{{DENY_UNKNOWN}}** {{PHP_UPSTREAM}} |
+| `etc\nginx\nginx.conf.tpl` | {{MIME}} **{{DENY_UNKNOWN}}** {{PHP_UPSTREAM}} |
 | `etc\nginx\vhosts\_template.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} |
 | `etc\nginx\vhosts\_template_https.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} {{NODEJS_PORT}} {{CERT}} {{KEY}} |
 | `etc\nginx\vhosts\_template_php.conf` | {{PORT}} {{DOMAIN}} {{ROOT}} **{{PHP_TARGET}}** |
@@ -164,7 +164,7 @@ package.bat 1.5.3        # 指定版本号（不改 app.rc）
 package.bat /nobuild     # 不编译，用现有 lnpp.exe
 ```
 
-产出 `dist\LNPP-<版本>.zip`（约 300 KB），内含 `lnpp.exe`、`README.md`、上表 5 个 `etc\*.tpl` / `*.append` 模板、`www\.gitkeep`。**包里的 `etc\` 只有模板**——`etc\nginx\vhosts\` 里连用户的站点配置都没有，因此打包时不可能误带内网域名、绝对路径或证书。
+产出 `dist\LNPP-<版本>.zip`（约 350 KB（v1.5.4 实测 354.6 KB）），内含 `lnpp.exe`、`README.md`、9 个 `etc\` 模板（`nginx\nginx.conf.tpl`、`nginx\vhosts\` 下 4 个站点模板、`postgresql\postgresql.conf.append`、`redis\redis.conf.tpl`、`php\php.ini.append`、`packages.conf.tpl`）、`www\.gitkeep`。**包里的 `etc\` 只有模板**——`etc\nginx\vhosts\` 里连用户的站点配置都没有，因此打包时不可能误带内网域名、绝对路径或证书。
 
 **按设计不包含**：`bin\`（组件二进制，几 GB）、`data\`（运行配置、DPAPI 加密的库口令、站点配置）、`logs\`、`backup\`（数据库 dump）、`ssl\`（私钥）。打包走白名单逐个拷贝，压缩前再核验一遍暂存目录：发现上述任一项就中止报错。删除暂存目录前会检查目录内的 `.lnpp-stage` 标记，标记不对就拒绝删除。
 
@@ -186,7 +186,7 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 > ⚠️ `migtest` 会重建 `data\postgresql\<版本>`。在有真实数据的机器上跑之前请先备份。
 > 退出码：`0` 通过 / `1` 失败 / `2` 跳过——**跳过不会被算作通过**。
 
-`unittests` 覆盖模板渲染、`packages.conf` 语法、条目名到组件/版本的解析（含路径穿越拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一文件）、DPAPI 加解密往返、文件编码。所有临时文件都在 `%TEMP%` 并自动清理。
+`unittests` 覆盖模板渲染、`packages.conf` 语法、条目名到组件/版本的解析（含路径穿越拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一文件）、DPAPI 加解密往返、文件编码，以及运行时布局（`etc\` 只放模板、`data\` 放运行时）与模板内容断言、PHP 相关断言：FastCGI **端口区间不重叠**（N 进程占 N 个连续端口，另一版本须避开整段）、**upstream 名净化与碰撞去重**（版本号里的 `.`/`-` 等字符会丢成 `_`，同名再追加序号）、**扩展行解析与写回保真**（`extension_dir` 不是扩展、整行注释忽略、只重写 `extension=`/`;extension=` 行、其余原样保留）、`dirIsUnder` 的**精确匹配与分隔符分支**（版本目录自身算命中、子目录算命中、`8.1x` 不算 `8.1`）。所有临时文件都在 `%TEMP%` 并自动清理。
 
 ## 拒绝 IP 直连与未配置域名
 
@@ -201,7 +201,7 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 
 - 所有路径基于 exe 所在位置推导，绿色便携。默认端口 PostgreSQL 5432 / redis 6379 / nginx 80，在 `data\settings.ini` 中可改
 - PostgreSQL 密码用 DPAPI（绑定当前 Windows 用户）加密后存 `data\settings.ini` 的 `pg.password.enc`；加密串换机器或换用户后无法解密，需重新填写密码。首次使用 PostgreSQL：切到对应页签点「初始化数据库」（密码不能为空）
-- 组件下载源 **`data\packages.conf`**：按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis 四个组件。**只接受 `https://`**；名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）。可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（`certutil -hashfile <文件> SHA256` 生成），不匹配则拒绝安装，没有该行时跳过
+- 组件下载源 **`data\packages.conf`**：按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis/php 五个组件（node 是 nodejs 的目录别名）。**只接受 `https://`**；名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）。可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（`certutil -hashfile <文件> SHA256` 生成），不匹配则拒绝安装，没有该行时跳过
 - **PostgreSQL 版本切换会留下旧数据副本**：每次切换在 `data\postgresql\<版本>` 旁生成 `.old-<时间戳>`（约 120MB/份），并在 `backup\` 留一份全量 dump。管理器自动把它们**移入回收站**（可撤销），保留数量由 `data\settings.ini` 的 `keep.datacopies`（默认 2）/ `keep.backups`（默认 10）调整。也可在确认新集群正常后手工删 `data\postgresql\*.old-*` 与旧 dump
 - 日志轮转：管理器日志 `logs\lnpp.log` 超过 4MB 自动轮转为 `lnpp.log.1`；组件日志超过 8MB 时在**组件下次启动前**轮转为 `.1`/`.2`（保留 2 份）——Windows 下运行中的服务会独占日志文件，无法改名。pm2 自己的日志在 `%USERPROFILE%\.pm2\logs`，由 pm2 管理
 - Redis 默认只监听 `127.0.0.1`（`etc\redis\redis.conf.tpl` 里的 `bind`）。要跨机访问请自行改模板并加 `requirepass`

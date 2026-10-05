@@ -1,8 +1,14 @@
-// Pure-logic unit tests for LNPP Manager — no processes, no ports. The only disk
-// access is %TEMP% scratch space for the writeFileText / DPAPI / encoding
-// cases, all removed again. Covers renderTemplate, packages.conf parsing,
-// pkgsNameToCompVer, the natural version sort, pm2 jlist parsing, the INI text
-// helpers and the file writer. Build/run via test.bat (target "unittests").
+// LNPP Manager 的纯逻辑单元测试 —— 不启停任何进程，也不 bind 任何端口。
+// 唯一的写操作是 %TEMP% 下的临时文件（writeFileText / DPAPI / 编码用例），
+// 用完即删。
+// php 用例含只读探测：phpEnsurePort 内部会经 tcpPortListening 读内核 TCP
+// 连接表，还会读 etc\ 下的真实模板，并通过 iniGet 读 data\settings.ini。
+// 测试确实会 iniSet / iniDelete，但只改内存缓存：写盘是防抖的，而这个进程
+// 没有驱动刷写的定时器，所以用户的 settings.ini 不会被改写；凡改过的键，
+// 都在所在测试块结尾按「有原值则恢复、原本没有才删除」还原。
+// 覆盖 renderTemplate、packages.conf 解析、pkgsNameToCompVer、自然版本排序、
+// pm2 jlist 解析、INI 文本助手、文件写入器，以及 php 端口分配与扩展解析。
+// 通过 test.bat（target "unittests"）构建与运行。
 #include "common.h"
 #include "manager.h"
 #include "downloader.h"
@@ -39,6 +45,24 @@ public:
     bool valid() const { return !m_path.empty(); }
 private:
     std::wstring m_path;
+};
+
+// 记下某个 ini 键的当前值，出作用域时按「有原值则恢复、原本没有才删除」还原。
+// 端口分配、worker 数这些逻辑只能靠改 settings.ini 来驱动，而那是用户自己的
+// 文件：写完必须还原，不能因为跑一次测试就把人家配好的端口删掉。顺带一提，
+// 「用户本来就配过」正是必须能跑通的场景，所以也不能假设这些键一开始不存在。
+class IniKeyGuard {
+public:
+    explicit IniKeyGuard(const std::wstring& key)
+        : m_key(key), m_old(iniGet(key, L"")) {}
+    ~IniKeyGuard() {
+        if (m_old.empty()) iniDelete(m_key); else iniSet(m_key, m_old);
+    }
+    IniKeyGuard(const IniKeyGuard&) = delete;
+    IniKeyGuard& operator=(const IniKeyGuard&) = delete;
+private:
+    std::wstring m_key;
+    std::wstring m_old;
 };
 
 int wmain() {
@@ -228,8 +252,12 @@ int wmain() {
         // carrying a hardcoded fastcgi_pass port keeps working. So an assigned
         // port must never be re-rolled, and removing another version must not
         // shift the survivors.
-        std::wstring a = iniGet(L"php.verport.8.1", L"");
-        std::wstring b = iniGet(L"php.verport.8.3", L"");
+        // 分配逻辑只认 settings.ini，所以这几个键必须先存后写；baseport 临时钉成
+        // 9000，否则用户改过 baseport 时下面那条“默认值”断言会把测试跑红。
+        IniKeyGuard gBase(L"php.baseport");
+        IniKeyGuard gVer81(L"php.verport.8.1");
+        IniKeyGuard gVer83(L"php.verport.8.3");
+        iniSet(L"php.baseport", L"9000");
         std::wstring e1, e2;
         std::wstring p1 = phpEnsurePort(L"8.1", e1);
         std::wstring p2 = phpEnsurePort(L"8.3", e2);
@@ -250,9 +278,7 @@ int wmain() {
         // phpRunning is the liveness probe the poller calls, so it must not
         // throw on a version that was never started.
         check(L"查询未运行版本不报错", !phpRunning(L"0.0.0.0-not-a-version"));
-
-        iniDelete(L"php.verport.8.1");
-        iniDelete(L"php.verport.8.3");
+        // baseport 与两个 verport 由 guard 在出作用域时还原，不再无条件 iniDelete。
     }
 
     wprintf(L"\n=== php: 站点模板渲染 ===\n");
@@ -310,6 +336,13 @@ int wmain() {
         // A version with N workers owns N CONSECUTIVE ports, so uniqueness has
         // to be about ranges, not numbers: two versions starting at 9000 and
         // 9002 would collide on 9002-9003 with 4 workers each.
+        // 同上：这里会反复改这四个键，一律用 guard 还原，避免删掉用户自己的配置。
+        IniKeyGuard gVer81(L"php.verport.8.1");
+        IniKeyGuard gVer83(L"php.verport.8.3");
+        IniKeyGuard gWrk81(L"php.workers.8.1");
+        IniKeyGuard gWrk83(L"php.workers.8.3");
+        // Also need the default path, so make sure no leftover value is in play.
+        iniDelete(L"php.workers.8.1");
         check(L"默认进程数是 1", phpWorkerCount(L"8.1") == 1);
         iniSet(L"php.workers.8.3", L"4");
         check(L"进程数可配置", phpWorkerCount(L"8.3") == 4);
@@ -350,10 +383,20 @@ int wmain() {
         check(L"多进程用 upstream 名", phpFastcgiTarget(L"8.1") == L"lnpp_php_8_1",
               phpFastcgiTarget(L"8.1"));
 
-        iniDelete(L"php.verport.8.1");
-        iniDelete(L"php.verport.8.3");
-        iniDelete(L"php.workers.8.1");
-        iniDelete(L"php.workers.8.3");
+        // A free port must actually be assignable. The skip-to-just-past-the-
+        // clash rewrite used to initialise its cursor to p+1, which made every
+        // all-free candidate look busy and spun the search to the end of the
+        // range — nothing was ever assignable.
+        {
+            IniKeyGuard gBase2(L"php.baseport");
+            IniKeyGuard g91(L"php.verport.9.9.9");
+            iniDelete(L"php.verport.9.9.9");
+            iniSet(L"php.baseport", L"45100");
+            std::wstring e2;
+            std::wstring got = phpEnsurePort(L"9.9.9", e2);
+            check(L"空闲端口可分配", isPortToken(got), got.empty() ? e2 : got);
+        }
+        // 四个键由上面的 guard 在出作用域时按原值还原。
     }
 
     wprintf(L"\n=== php: 扩展解析 ===\n");
@@ -385,6 +428,95 @@ int wmain() {
         // A later line wins in php, and so must it here.
         auto dup = phpParseExtensionLines(L";extension=zip\r\nextension=zip\r\n");
         check(L"重复项以后者为准", dup[L"zip"] == true);
+
+        // 归一化：用户三种写法（curl / php_curl.dll / "curl"，还带各种大小写）都见过，
+        // 只要归一到同一个键，开关才不会互相错配——否则一个按 "CURL" 写进 ini 的
+        // 复选框去匹配解析出来的 "curl" 就会把扩展判成关闭。
+        {
+            auto upper = phpParseExtensionLines(L"extension=CURL\r\n");
+            auto lower = phpParseExtensionLines(L"extension=curl\r\n");
+            check(L"大小写归一到同一个键",
+                  upper.size() == 1 && lower.size() == 1 &&
+                  upper.find(L"curl") != upper.end() && lower.find(L"curl") != lower.end() &&
+                  upper[L"curl"] == true && lower[L"curl"] == true);
+            auto dll = phpParseExtensionLines(L"extension=PHP_CURL.DLL\r\n");
+            check(L"php_ 前缀 + .dll 后缀归一为 curl",
+                  dll.size() == 1 && dll.find(L"curl") != dll.end() && dll[L"curl"] == true,
+                  std::to_wstring(dll.size()));
+            auto quoted = phpParseExtensionLines(L"extension=\"curl\"\r\n");
+            check(L"带引号的值归一为 curl",
+                  quoted.size() == 1 && quoted.find(L"curl") != quoted.end() && quoted[L"curl"] == true);
+            // 注释掉的写法必须落到同一个键、但为 false，否则“未启用”和“未提及”
+            // 分不开，勾选框会写出错误的 ;extension= 行。
+            auto commented = phpParseExtensionLines(L";extension=\"PHP_CURL.dll\"\r\n");
+            check(L"注释掉的写法同键且为 false",
+                  commented.size() == 1 && commented.find(L"curl") != commented.end() &&
+                  commented[L"curl"] == false);
+            // 归一化后的名字必须能对上 ext\ 目录里真实的 dll 文件名，不能残留
+            // php_ 前缀或 .dll 后缀。
+            check(L"归一后不残留前缀/后缀",
+                  dll.find(L"php_curl.dll") == dll.end() && dll.find(L"php_curl") == dll.end());
+        }
+    }
+
+    wprintf(L"\n=== php: 扩展写回保真 ===\n");
+    {
+        // php.ini belongs to the user, so toggling one extension must not cost
+        // them the comment they wrote next to it, nor reformat the file.
+        std::wstring ini =
+            L"[PHP]\r\n"
+            L"memory_limit = 256M\r\n"
+            L"extension=curl\r\n"
+            L"  extension = mbstring  ; needed for utf8\r\n"
+            L";extension=gd\r\n"
+            L"extension=zip\r\n";
+        int changed = -1;
+        // Turn curl off, keep the rest as-is.
+        std::wstring out = phpRewriteExtensionLines(ini, {L"mbstring", L"zip"}, &changed);
+        check(L"关掉的加上分号", out.find(L";extension=curl") != std::wstring::npos, out);
+        // Assert the state through the parser rather than by substring: the
+        // user's own spacing ("extension = mbstring") must survive, so looking
+        // for a canonical "extension=mbstring" text would fail on a correct file.
+        {
+            auto after = phpParseExtensionLines(out);
+            check(L"保留的仍是启用",
+                  after.find(L"mbstring") != after.end() && after[L"mbstring"] == true, out);
+            check(L"关掉的变为未启用",
+                  after.find(L"curl") != after.end() && after[L"curl"] == false);
+            check(L"原本未启用的保持未启用",
+                  after.find(L"gd") != after.end() && after[L"gd"] == false);
+        }
+        check(L"行尾注释保留",
+              out.find(L"extension = mbstring  ; needed for utf8") != std::wstring::npos, out);
+        check(L"缩进保留",
+              out.find(L"  extension = mbstring") != std::wstring::npos, out);
+        check(L"非扩展行原样保留",
+              out.find(L"memory_limit = 256M") != std::wstring::npos &&
+              out.find(L"[PHP]") != std::wstring::npos, out);
+        check(L"CRLF 不被改成 LF",
+              out.find(L"\n") == out.find(L"\r\n") + 1, out);
+        // Only curl's state actually moved: mbstring was already on (its odd
+        // "extension = mbstring" spacing must survive verbatim) and gd was
+        // already off.
+        check(L"只报告 1 行变化", changed == 1, std::to_wstring(changed));
+        check(L"未动的行逐字节保留",
+              out.find(L"extension = mbstring  ; needed for utf8") != std::wstring::npos &&
+              out.find(L";extension=gd") != std::wstring::npos, out);
+        // Idempotent: applying the same set again must report no change, or a
+        // second click would rewrite the file for nothing.
+        int changed2 = -1;
+        std::wstring out2 = phpRewriteExtensionLines(out, {L"mbstring", L"zip"}, &changed2);
+        check(L"重复应用不报告变化", changed2 == 0, std::to_wstring(changed2));
+        check(L"重复应用内容不变", out2 == out);
+
+        // wanted must be normalised the same way parsing is, otherwise a caller
+        // passing "CURL" switches the extension off instead of on.
+        int changed3 = -1;
+        std::wstring out3 = phpRewriteExtensionLines(L";extension=curl\r\n",
+                                                     {L"PHP_CURL.DLL"}, &changed3);
+        check(L"wanted 归一后可开启", changed3 == 1 &&
+              out3.find(L"extension=curl") != std::wstring::npos &&
+              out3.find(L";extension=") == std::wstring::npos, out3);
     }
 
     wprintf(L"\n=== pgRestoreOutputOk ===\n");
