@@ -1,7 +1,10 @@
 # LNPP 组件下载源示例 — 复制为 packages.conf 后按需增删
 #
+# 已有 data\packages.conf 不会被新版模板覆盖：升级后若要新增组件（如 MySQL），
+# 请把下面对应的整节复制到 data\packages.conf 里。
+#
 # 格式：按组列出，`# 标题` 后跟 `---` 分隔符，条目为 `名称=URL`。
-# 程序只认 nginx / nodejs / postgresql / redis / php 五种组件
+# 程序只认 nginx / nodejs / postgresql / redis / php / mysql 六种组件
 # （node 目录别名 nodejs）。
 #
 # 安全要求：
@@ -36,6 +39,23 @@ node-24.12=https://nodejs.org/dist/v24.12.0/node-v24.12.0-win-x64.zip
 ---
 postgresql-16.6=https://sbp.enterprisedb.com/getfile.jsp?fileid=1259297
 postgresql-17.2=https://sbp.enterprisedb.com/getfile.jsp?fileid=1259294
+---
+
+# MySQL（Windows ZIP Archive）
+# 8.0.x：https://dev.mysql.com/downloads/mysql/8.0.html
+# 8.4.x LTS：https://dev.mysql.com/downloads/mysql/8.4.html
+# 均选 "Windows (x86, 64-bit), ZIP Archive"
+---
+# - 8.0.x 与 8.4.x LTS 都收：8.4 默认禁用 mysql_native_password，管理器用
+#   my-8.4.ini.tpl 把它打开（新建账号用 IDENTIFIED WITH 显式指定它），其余
+#   启停/备份流程与 8.0 一致。9.x 创新版行为变化大，暂不收。
+# - zip 解开是 mysql-<版本>-winx64\ 顶层目录（程序会剥掉），里面 bin\mysqld.exe、
+#   bin\mysql.exe、bin\mysqldump.exe、share\。数据目录在 data\mysql\<版本>\data\。
+# - SHA256 用 certutil -hashfile <下载的zip> SHA256 自算后补上（不填则跳过校验）。
+mysql-8.0.46=https://cdn.mysql.com/Downloads/MySQL-8.0/mysql-8.0.46-winx64.zip
+# mysql-8.0.46.sha256=<64位hex>
+mysql-8.4.11=https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.11-winx64.zip
+# mysql-8.4.11.sha256=<64位hex>
 ---
 
 # Redis

@@ -144,6 +144,35 @@ int wmain() {
         }
     }
 
+    wprintf(L"\n=== MySQL ===\n");
+    {
+        // Never initialize here: creating a data directory and setting the
+        // root password is a one-way, user-owned operation. This block only
+        // exercises start/stop/backup on an install the user already set up,
+        // and leaves a previously running server running.
+        ComponentStatus st = compStatus(Comp::Mysql);
+        if (!st.installed) {
+            wprintf(L"  未安装 MySQL，跳过\n");
+        } else if (!myDataInitialized(Comp::Mysql, st.currentVersion)) {
+            wprintf(L"  MySQL %s 已安装但未初始化，跳过（不自动初始化）\n",
+                    st.currentVersion.c_str());
+        } else {
+            bool wasRunning = compIsRunning(Comp::Mysql);
+            if (!wasRunning) check(L"start", compStart(Comp::Mysql, err), err);
+            Sleep(2000);
+            check(L"running", compIsRunning(Comp::Mysql));
+            std::wstring backupFile;
+            check(L"backup", myBackup(Comp::Mysql, backupFile, err) && fileExists(backupFile), err);
+            if (wasRunning) {
+                check(L"left running", compIsRunning(Comp::Mysql));
+            } else {
+                check(L"stop", compStop(Comp::Mysql, err), err);
+                Sleep(1200);
+                check(L"stopped", !compIsRunning(Comp::Mysql));
+            }
+        }
+    }
+
     wprintf(L"\n=== Node.js / pm2 ===\n");
     {
         // Read-only: never resurrect or kill here, the user's apps must not be

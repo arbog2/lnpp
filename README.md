@@ -1,6 +1,6 @@
-# LNPP 组件管理器 v1.5.5
+# LNPP 组件管理器 v1.6.0
 
-Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / redis / php 的启动、停止、版本切换、配置。
+Windows 原生 C++ (Win32) 桌面工具，管理 nodejs / nginx / postgresql / mysql / redis / php 的启动、停止、版本切换、配置。
 
 ## 目录结构
 
@@ -12,6 +12,7 @@ lnpp.exe
 │   ├── nodejs\<版本>\         # 手动拷贝 node.exe、npm 等
 │   ├── nginx\<版本>\          # 手动拷贝 nginx.exe、conf\mime.types 等
 │   ├── postgresql\<版本>\     # 手动拷贝整个 zip 解压目录（含 bin\）
+│   ├── mysql\<版本>\          # 手动拷贝 MySQL 8.0.x / 8.4.x zip 解压目录（含 bin\、share\）
 │   ├── redis\<版本>\          # 手动拷贝 redis-server.exe、redis-cli.exe
 │   └── php\<版本>\            # 手动拷贝整个 zip 解压目录（php-cgi.exe、ext\）
 ├── etc\                      # ← 只放模板，随包分发、只读
@@ -21,6 +22,8 @@ lnpp.exe
 │   ├── nginx\vhosts\_template_php.conf
 │   ├── nginx\vhosts\_template_php_https.conf
 │   ├── postgresql\postgresql.conf.append
+│   ├── mysql\my.ini.tpl
+│   ├── mysql\my-8.4.ini.tpl
 │   ├── redis\redis.conf.tpl
 │   ├── php\php.ini.append
 │   └── packages.conf.tpl     # 组件下载源模板
@@ -31,9 +34,10 @@ lnpp.exe
 │   │   ├── vhosts\*.conf     # 站点配置（用户数据；在总览/站点页增删）
 │   │   └── <版本>\           # 该版本的运行配置 conf\nginx.conf + conf\vhosts\
 │   ├── postgresql\<版本>\    # 数据目录 + postgresql.conf
+│   ├── mysql\<版本>\         # my.ini + conf.d\ + data\（真正的数据库文件）
 │   ├── redis\<版本>\         # redis.conf + 数据
 │   └── php\<版本>\           # 该版本的 php.ini
-├── backup\                   # 数据库备份（pg_dumpall 输出，时间戳命名）
+├── backup\                   # 数据库备份（pg_dumpall / mysqldump 输出，时间戳命名）
 ├── logs\                     # 运行日志
 ├── ssl\                      # TLS 证书与私钥
 └── www\                      # nginx 站点根目录
@@ -52,10 +56,11 @@ lnpp.exe
 | nodejs | `bin\nodejs\<版本>\` | node.exe, npm.cmd, (可选 pm2.cmd) |
 | nginx | `bin\nginx\<版本>\` | nginx.exe, conf\mime.types |
 | postgresql | `bin\postgresql\<版本>\` | bin\pg_ctl.exe, bin\initdb.exe, bin\psql.exe, bin\pg_dumpall.exe |
+| mysql | `bin\mysql\<版本>\` | bin\mysqld.exe, bin\mysql.exe, bin\mysqladmin.exe, bin\mysqldump.exe, share\ |
 | redis | `bin\redis\<版本>\` | redis-server.exe, redis-cli.exe |
 | php | `bin\php\<版本>\` | php-cgi.exe, ext\*.dll, php.ini-production |
 
-多个版本目录并存即可在下拉框中切换版本。PostgreSQL 版本切换会自动做数据迁移（pg_dumpall 备份 → initdb → 恢复）；PHP 例外，见「PHP」一节。
+多个版本目录并存即可在下拉框中切换版本。PostgreSQL 版本切换会自动做数据迁移（pg_dumpall 备份 → initdb → 恢复）；MySQL 与 PHP 例外，见「MySQL」与「PHP」两节。
 
 ## 功能
 
@@ -64,10 +69,11 @@ lnpp.exe
 - 版本切换（自动重启 + 重新生成配置）
 - nginx：可视化添加/删除虚拟站点（写 `data\nginx\vhosts\`），支持 HTTPS（证书 + key），www\ 下自动建目录；站点类型可选 **Node.js** 或 **PHP（FastCGI）**，PHP 站点可指定用哪个 PHP 版本；**拒绝 IP 直连与未配置域名**（见下节）
 - PostgreSQL：初始化、改密码、创建/删除用户、备份（pg_dumpall）、还原数据库
+- MySQL：初始化、改密码、创建/删除用户、备份（mysqldump）、还原数据库；版本切换不迁移数据（见「MySQL」一节）
 - Node.js：pm2 进程列表实时监控，支持重启/停止；一键将当前 Node 版本加入/移除用户 PATH
 - PHP：多版本共存，每个版本一组 php-cgi 进程、各占一段 FastCGI 端口；版本池列表可单独启停、设默认版本、调进程数（多进程由 nginx upstream 轮询）、管理扩展
 - 组件下载：首启（bin 为空）自动弹出，或在总览页点「下载组件」；地址读 `data\packages.conf`，下载完成后自动解压到 `bin\<组件>\<版本>`
-- 「配置」按钮：打开该组件的**运行时**配置目录（`data\` 下）。nginx 是 `data\nginx\vhosts\`（站点配置源，**不是**每版本的运行副本——那份每次启动都会被覆盖）；PostgreSQL / Redis 是当前版本的数据目录；Node.js 是 `data\nodejs\`，并提示 pm2 自己的文件在 `%USERPROFILE%\.pm2`；PHP 是当前版本的 `data\php\<默认版本>\`（放生成的 php.ini）
+- 「配置」按钮：打开该组件的**运行时**配置目录（`data\` 下）。nginx 是 `data\nginx\vhosts\`（站点配置源，**不是**每版本的运行副本——那份每次启动都会被覆盖）；PostgreSQL / Redis / MySQL 是当前版本的数据目录；Node.js 是 `data\nodejs\`，并提示 pm2 自己的文件在 `%USERPROFILE%\.pm2`；PHP 是当前版本的 `data\php\<默认版本>\`（放生成的 php.ini）
 - 常驻托盘：关闭按钮只最小化到托盘（组件继续运行），退出请用托盘右键菜单「退出」
 - 随管理器自动启动（总开关 + 每组件勾选）、随 Windows 开机启动（`--hidden` 直接最小化到托盘）
 - 总览页右下角：版本号 + 「关于」弹窗（作者、可点击 GitHub 链接）
@@ -85,6 +91,8 @@ lnpp.exe
 | `etc\nginx\vhosts\_template_php_https.conf` | 同上 + {{CERT}} {{KEY}} |
 | `etc\redis\redis.conf.tpl` | {{PORT}} {{PIDFILE}} {{LOGFILE}} {{DIR}} |
 | `etc\postgresql\postgresql.conf.append` | {{PORT}} |
+| `etc\mysql\my.ini.tpl` | {{BASEDIR}} {{DATADIR}} {{PORT}} {{LOGFILE}} {{PIDFILE}} {{CONFDIR}} |
+| `etc\mysql\my-8.4.ini.tpl` | 同上（8.4 版多一行 `mysql_native_password = ON`） |
 | `etc\php\php.ini.append` | {{EXTENSION_DIR}} {{MEMORY_LIMIT}} {{MAX_EXECUTION_TIME}} {{POST_MAX_SIZE}} {{UPLOAD_MAX_SIZE}} {{DATE_TIMEZONE}} |
 
 **`{{DENY_UNKNOWN}}` 漏掉会静默失效**——没有它，兜底块不会生成，nginx 仍会对未知域名开放（默认落到第一个站点）。自定义过 `nginx.conf.tpl` 的话，务必在 `http { }` 内、`include vhosts/*.conf;` 之前保留这一行；管理器发现渲染结果里没有 `default_server` 时会在 `logs\lnpp.log` 告警，但不会在界面上提示。
@@ -92,6 +100,30 @@ lnpp.exe
 `{{NODEJS_PORT}}` 取 `data\settings.ini` 的 `nodejs.port`（默认 3000）——两个站点模板都用它，改这一个键即可让所有 GUI 新建的站点跟着换端口。
 
 `{{PHP_TARGET}}` 是该站点所选 PHP 版本的后端：单进程时是 `127.0.0.1:<端口>`，多进程时是 upstream 名（见下）。它写死在生成出来的站点配置里。
+
+## MySQL
+
+MySQL 按和 PostgreSQL 对等的常驻组件建模，收 **8.0.x 与 8.4.x LTS 便携版**（9.x 创新版暂不收）：
+
+```
+bin\mysql\<版本>\bin\mysqld.exe --defaults-file=data\mysql\<版本>\my.ini
+```
+
+- **状态灯 = 有没有属于该版本的 `mysqld.exe` 进程**，启动完成还要同时看到端口监听。Windows 上 `mysqld` 不写可用的 pid 文件，所以按镜像路径判定归属，不会把别处装的 MySQL 认成自己的。
+- **只管理 `root@localhost`**。客户端连接、备份、还原都用这个账号；页面上只能新建 `'名字'@'localhost'`，账号列表显示为 `名字@主机`。
+- **初始化**用 `--initialize-insecure` 重建空数据目录，然后一次性启动、设置 `root` 密码、验证登录、再停下来。密码不能为空，也不能含换行；初始化完成后点「启动」运行。初始化中途失败会在日志里点名原因，半成品数据目录会被移入回收站（而不是拦住你下次重试）。
+- `my.ini` **每次启动都从模板重新生成**：8.0.x 用 `etc\mysql\my.ini.tpl`，8.4.x 用 `etc\mysql\my-8.4.ini.tpl`（8.4 默认关闭 `mysql_native_password`，该模板把它打开；且 8.4 删掉了 `default_authentication_plugin` 变量，写它会让初始化/启动直接失败，所以新建账号一律用显式的 `IDENTIFIED WITH mysql_native_password`，不依赖服务器默认）。直接改 `data\mysql\<版本>\my.ini` 会被覆盖；自己的配置请放到同目录的 `conf.d\*.cnf`，模板末尾的 `!includedir` 会并入它们。如果在 `conf.d` 里覆盖了端口，也要同步改 `data\settings.ini` 的 `mysql.port`，否则客户端会连错端口。
+- **版本切换不迁移数据**：切到哪个版本，就用它自己的 `data\mysql\<版本>\data\`。要跨版本搬数据，请用本页的「备份 → 切换版本 → 还原」。
+- 备份用 `mysqldump --all-databases` 写到 `backup\mysql-<版本>-<时间>.sql`；还原可选「还原前初始化」。重建还原后，`root` 及其他账号以备份时的为准；如果之后的密码对不上，请用「初始化数据库」重来。
+- 管理器调用 `mysql` / `mysqladmin` / `mysqldump` 时，口令放在临时 `--defaults-extra-file`，操作语句放在临时 SQL 文件，用完即删，不会出现在命令行里。
+- 老版本升级上来时，已存在的 `data\packages.conf` 不会被覆盖；要用下载器装 MySQL，请把 `etc\packages.conf.tpl` 里的 MySQL 一节复制过去。
+
+| settings.ini 键 | 含义 |
+|---|---|
+| `ver.mysql` | 当前版本 |
+| `mysql.port` | 监听端口，默认 3306，重启生效 |
+| `mysql.user` | 管理账号，默认 `root` |
+| `mysql.password.enc` | DPAPI 加密的 root 口令 |
 
 ## PHP
 
@@ -107,7 +139,7 @@ bin\php\<版本>\php-cgi.exe -c data\php\<版本>\php.ini -b 127.0.0.1:<端口>
 
 ### 多版本共存
 
-这是 PHP 和其他四个组件最大的不同：**所有已安装版本同时运行**，每个版本一组 php-cgi、各占一段端口。A 项目要 8.1、B 项目要 8.3 可以并存。
+这是 PHP 和其他五个组件最大的不同：**所有已安装版本同时运行**，每个版本一组 php-cgi、各占一段端口。A 项目要 8.1、B 项目要 8.3 可以并存。
 
 | settings.ini 键 | 含义 |
 |---|---|
@@ -164,7 +196,7 @@ package.bat 1.5.3        # 指定版本号（不改 app.rc）
 package.bat /nobuild     # 不编译，用现有 lnpp.exe
 ```
 
-产出 `dist\LNPP-<版本>.zip`（约 350 KB（v1.5.4 实测 354.6 KB）），内含 `lnpp.exe`、`README.md`、9 个 `etc\` 模板（`nginx\nginx.conf.tpl`、`nginx\vhosts\` 下 4 个站点模板、`postgresql\postgresql.conf.append`、`redis\redis.conf.tpl`、`php\php.ini.append`、`packages.conf.tpl`）、`www\.gitkeep`。**包里的 `etc\` 只有模板**——`etc\nginx\vhosts\` 里连用户的站点配置都没有，因此打包时不可能误带内网域名、绝对路径或证书。
+产出 `dist\LNPP-<版本>.zip`（约 350 KB（v1.5.4 实测 354.6 KB）），内含 `lnpp.exe`、`README.md`、11 个 `etc\` 模板（`nginx\nginx.conf.tpl`、`nginx\vhosts\` 下 4 个站点模板、`postgresql\postgresql.conf.append`、`mysql\my.ini.tpl`、`mysql\my-8.4.ini.tpl`、`redis\redis.conf.tpl`、`php\php.ini.append`、`packages.conf.tpl`）、`www\.gitkeep`。**包里的 `etc\` 只有模板**——`etc\nginx\vhosts\` 里连用户的站点配置都没有，因此打包时不可能误带内网域名、绝对路径或证书。
 
 **按设计不包含**：`bin\`（组件二进制，几 GB）、`data\`（运行配置、DPAPI 加密的库口令、站点配置）、`logs\`、`backup\`（数据库 dump）、`ssl\`（私钥）。打包走白名单逐个拷贝，压缩前再核验一遍暂存目录：发现上述任一项就中止报错。删除暂存目录前会检查目录内的 `.lnpp-stage` 标记，标记不对就拒绝删除。
 
@@ -177,7 +209,7 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 | 命令 | 跑什么 | 是否动真实环境 |
 |---|---|---|
 | `test.bat run` / `test.bat all` | 只跑 `unittests`（纯逻辑，不碰进程和端口） | 否 |
-| `test.bat selftest` | 真实启停 nginx / PG / Redis，**切换 nginx 版本并在结束时还原** | 是 |
+| `test.bat selftest` | 真实启停 nginx / PG / Redis / 已初始化的 MySQL，**切换 nginx 版本并在结束时还原** | 是 |
 | `test.bat proctest` | `pm2 resurrect` 后再 `pm2 kill`——**会把你的应用停掉** | 是 |
 | `test.bat migtest` | 对**真实数据库**做版本迁移（pg_dumpall → initdb → 恢复） | 是（不可逆） |
 | `test.bat destructive` | 上面三个全跑 | 是 |
@@ -186,7 +218,7 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 > ⚠️ `migtest` 会重建 `data\postgresql\<版本>`。在有真实数据的机器上跑之前请先备份。
 > 退出码：`0` 通过 / `1` 失败 / `2` 跳过——**跳过不会被算作通过**。
 
-`unittests` 覆盖模板渲染、`packages.conf` 语法、条目名到组件/版本的解析（含路径穿越拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一文件）、DPAPI 加解密往返、文件编码，以及运行时布局（`etc\` 只放模板、`data\` 放运行时）与模板内容断言、PHP 相关断言：FastCGI **端口区间不重叠**（N 进程占 N 个连续端口，另一版本须避开整段）、**upstream 名净化与碰撞去重**（版本号里的 `.`/`-` 等字符会丢成 `_`，同名再追加序号）、**扩展行解析与写回保真**（`extension_dir` 不是扩展、整行注释忽略、只重写 `extension=`/`;extension=` 行、其余原样保留）、`dirIsUnder` 的**精确匹配与分隔符分支**（版本目录自身算命中、子目录算命中、`8.1x` 不算 `8.1`）。所有临时文件都在 `%TEMP%` 并自动清理。
+`unittests` 覆盖模板渲染、`packages.conf` 语法、条目名到组件/版本的解析（含 MySQL 8.0/8.4 与路径穿越拒绝）、版本排序、pm2 `jlist` 解析、INI 文本往返、`writeFileText`（含 8 线程并发写同一文件）、DPAPI 加解密往返、文件编码，以及运行时布局（`etc\` 只放模板、`data\` 放运行时）与模板内容断言、MySQL 组件接线/恢复输出分类/8.4 模板选择、PHP 相关断言：FastCGI **端口区间不重叠**（N 进程占 N 个连续端口，另一版本须避开整段）、**upstream 名净化与碰撞去重**（版本号里的 `.`/`-` 等字符会丢成 `_`，同名再追加序号）、**扩展行解析与写回保真**（`extension_dir` 不是扩展、整行注释忽略、只重写 `extension=`/`;extension=` 行、其余原样保留）、`dirIsUnder` 的**精确匹配与分隔符分支**（版本目录自身算命中、子目录算命中、`8.1x` 不算 `8.1`）。所有临时文件都在 `%TEMP%` 并自动清理。
 
 ## 拒绝 IP 直连与未配置域名
 
@@ -199,9 +231,9 @@ package.bat /nobuild     # 不编译，用现有 lnpp.exe
 
 ## 说明
 
-- 所有路径基于 exe 所在位置推导，绿色便携。默认端口 PostgreSQL 5432 / redis 6379 / nginx 80，在 `data\settings.ini` 中可改
-- PostgreSQL 密码用 DPAPI（绑定当前 Windows 用户）加密后存 `data\settings.ini` 的 `pg.password.enc`；加密串换机器或换用户后无法解密，需重新填写密码。首次使用 PostgreSQL：切到对应页签点「初始化数据库」（密码不能为空）
-- 组件下载源 **`data\packages.conf`**：按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/redis/php 五个组件（node 是 nodejs 的目录别名）。**只接受 `https://`**；名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）。可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（`certutil -hashfile <文件> SHA256` 生成），不匹配则拒绝安装，没有该行时跳过
+- 所有路径基于 exe 所在位置推导，绿色便携。默认端口 PostgreSQL 5432 / MySQL 3306 / redis 6379 / nginx 80，在 `data\settings.ini` 中可改
+- PostgreSQL 密码用 DPAPI（绑定当前 Windows 用户）加密后存 `data\settings.ini` 的 `pg.password.enc`；MySQL 的 root 口令同样加密后存 `mysql.password.enc`；加密串换机器或换用户后无法解密，需重新填写密码。首次使用 PostgreSQL：切到对应页签点「初始化数据库」（密码不能为空）；首次使用 MySQL 也是如此
+- 组件下载源 **`data\packages.conf`**：按组列出（`# 标题` `---` 分隔，条目 `名称=URL`），程序只认 nginx/nodejs/postgresql/mysql/redis/php 六个组件（node 是 nodejs 的目录别名）。**只接受 `https://`**；名称中 `-` 之后是版本号，只允许字母/数字/`.`/`_`/`-`/`+`（该值用作 `bin\<组件>\<版本>` 目录名）。可选完整性校验：在 URL 条目下方加一行 `名称.sha256=64位hex`（`certutil -hashfile <文件> SHA256` 生成），不匹配则拒绝安装，没有该行时跳过
 - **PostgreSQL 版本切换会留下旧数据副本**：每次切换在 `data\postgresql\<版本>` 旁生成 `.old-<时间戳>`（约 120MB/份），并在 `backup\` 留一份全量 dump。管理器自动把它们**移入回收站**（可撤销），保留数量由 `data\settings.ini` 的 `keep.datacopies`（默认 2）/ `keep.backups`（默认 10）调整。也可在确认新集群正常后手工删 `data\postgresql\*.old-*` 与旧 dump
 - 日志轮转：管理器日志 `logs\lnpp.log` 超过 4MB 自动轮转为 `lnpp.log.1`；组件日志超过 8MB 时在**组件下次启动前**轮转为 `.1`/`.2`（保留 2 份）——Windows 下运行中的服务会独占日志文件，无法改名。pm2 自己的日志在 `%USERPROFILE%\.pm2\logs`，由 pm2 管理
 - Redis 默认只监听 `127.0.0.1`（`etc\redis\redis.conf.tpl` 里的 `bind`）。要跨机访问请自行改模板并加 `requirepass`

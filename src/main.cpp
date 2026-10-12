@@ -39,6 +39,13 @@ enum {
     IDC_PG_USER = 406, IDC_PG_PWD = 407, IDC_PG_PORT = 408,
     IDC_PG_LABEL_USER = 409, IDC_PG_LABEL_PWD = 410, IDC_PG_LABEL_PORT = 411,
     IDC_PG_BTN_RESTORE = 412,
+    // mysql page. Same uniqueness rule as the pg block (WM_COMMAND dispatches
+    // on the id alone). Kept in a fresh numeric range so neither page's ids can
+    // drift into the other's or the restore dialog's 1000 static label.
+    IDC_MY_BTN_INIT = 1013, IDC_MY_BTN_PWD = 1014, IDC_MY_BTN_ADDUSER = 1015,
+    IDC_MY_BTN_DELUSER = 1016, IDC_MY_BTN_BACKUP = 1017, IDC_MY_BTN_RESTORE = 1018,
+    IDC_MY_INFO = 1019, IDC_MY_USER = 1020, IDC_MY_PWD = 1021, IDC_MY_PORT = 1022,
+    IDC_MY_LABEL_USER = 1023, IDC_MY_LABEL_PWD = 1024, IDC_MY_LABEL_PORT = 1025,
     // redis page
     IDC_REDIS_INFO = 500,
     // nodejs page
@@ -57,7 +64,10 @@ enum {
     // control's notification dispatch to the wrong handler. (ABOUT_LINK was 714
     // and collided with Nginx=0..PHP=4's toggle at 714, killing both.)
     IDC_OV_ABOUT_LINK = 740,
-    IDC_OV_LOG = 715, IDC_OV_BTN_CLEAR_LOG = 716,
+    // 715/716 sit inside the sixth component row's button range once Count=6,
+    // so they moved two slots down. 717/718 stay below the 710..715 row band,
+    // above the 720.. auto-checkbox band, and outside every reserved range.
+    IDC_OV_LOG = 717, IDC_OV_BTN_CLEAR_LOG = 718,
     // php page
     IDC_PHP_POOL_LIST = 800, IDC_PHP_BTN_START = 801, IDC_PHP_BTN_STOP = 802,
     IDC_PHP_BTN_DEFAULT = 803, IDC_PHP_INFO = 804,
@@ -84,6 +94,15 @@ constexpr int kPgPageIds[] = {
 };
 static_assert(idsDistinct(kPgPageIds, sizeof(kPgPageIds) / sizeof(kPgPageIds[0])),
               "duplicate control id on the postgresql page - see the note above");
+
+constexpr int kMyPageIds[] = {
+    IDC_MY_BTN_INIT, IDC_MY_BTN_PWD, IDC_MY_BTN_ADDUSER, IDC_MY_BTN_DELUSER,
+    IDC_MY_BTN_BACKUP, IDC_MY_BTN_RESTORE, IDC_MY_INFO,
+    IDC_MY_USER, IDC_MY_PWD, IDC_MY_PORT,
+    IDC_MY_LABEL_USER, IDC_MY_LABEL_PWD, IDC_MY_LABEL_PORT,
+};
+static_assert(idsDistinct(kMyPageIds, sizeof(kMyPageIds) / sizeof(kMyPageIds[0])),
+              "duplicate control id on the mysql page - see the note above");
 
 // The overview addresses component rows by arithmetic (BASE + comp index), so
 // any fixed id landing in those three ranges is a live control that will be
@@ -134,6 +153,7 @@ enum {
     WM_TRAYICON = WM_APP + 5,     // tray icon callback
     WM_REAL_EXIT = WM_APP + 6,    // all components stopped -> destroy window / quit
     WM_PG_USERS = WM_APP + 7,     // pg user list loaded -> fill the user combo
+    WM_MY_USERS = WM_APP + 12,    // mysql user list loaded -> fill the user combo
     WM_DL_STAGE = WM_APP + 8,     // downloader: stage changed (lParam = heap wchar_t*)
     WM_DL_PROGRESS = WM_APP + 9,  // downloader: bytes (wParam=done, lParam=total)
     WM_DL_DONE = WM_APP + 10,     // downloader: finished (wParam=ok, lParam=heap wchar_t* err)
@@ -175,6 +195,8 @@ static std::atomic<int> g_curTab{0};
 static bool g_pendingVhostClear = false;   // clear nginx add form after a successful add
 static std::vector<std::wstring> g_pgUsers;   // pg user list for the user combo
 static std::atomic<bool> g_pgUsersBusy{false};
+static std::vector<std::wstring> g_myUsers;   // mysql account list (name@host)
+static std::atomic<bool> g_myUsersBusy{false};
 
 // ---- system tray / boot start ----
 static bool g_trayAdded = false;
@@ -192,7 +214,7 @@ struct CompUI {
 static CompUI g_ui[(int)Comp::Count];
 
 // ---- Overview (first tab) ----
-// Tab layout: [0] 总览, [1..] nginx / PostgreSQL / Redis / Node.js
+// Tab layout: [0] 总览, [1..] nginx / PostgreSQL / MySQL / Redis / Node.js / PHP
 static const int TAB_OVERVIEW = 0;
 static const int TAB_COMP_BASE = 1;
 static Comp tabToComp(int idx) { return (Comp)(idx - TAB_COMP_BASE); }
@@ -572,6 +594,28 @@ static void refreshPgInfo() {
     SetWindowTextW(info, txt.c_str());
 }
 
+static void refreshMyInfo() {
+    HWND info = GetDlgItem(g_main, IDC_MY_INFO);
+    if (!info) return;
+    std::wstring ver;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_snapMtx);
+        ver = g_snapCurrent[(int)Comp::Mysql];
+        installed = g_snapInstalled[(int)Comp::Mysql];
+    }
+    // Only the real data dir is shown: my.ini sits next to it, so showing the
+    // version root would point users at a generated file they must not edit.
+    std::wstring txt = L"当前版本: " + ver + L"\r\n"
+        + L"端口: " + mysqlPort() + L"\r\n"
+        + L"用户: " + myUser() + L"\r\n"
+        + L"数据目录: " + (installed
+            ? joinPath(compDataVerDir(Comp::Mysql, ver), L"data")
+            : L"(未安装)")
+        + L"\r\n切换版本不迁移数据：切到哪个版本，就用它自己的数据目录";
+    SetWindowTextW(info, txt.c_str());
+}
+
 static void refreshRedisInfo() {
     HWND info = GetDlgItem(g_main, IDC_REDIS_INFO);
     if (!info) return;
@@ -637,6 +681,7 @@ static void refreshAll(Comp c) {
     switch (c) {
         case Comp::Nginx: refreshNginxVHosts(); break;
         case Comp::Postgresql: refreshPgInfo(); break;
+        case Comp::Mysql: refreshMyInfo(); break;
         case Comp::Redis: refreshRedisInfo(); break;
         case Comp::Nodejs: refreshPm2List(); break;
         case Comp::Php: refreshPhpPool(); break;
@@ -1061,6 +1106,7 @@ static void showTrayMenu(HWND hwnd) {
 
 // ============================ Tab control ============================
 static void refreshPgUsers();   // defined later
+static void refreshMyUsers();   // defined later
 static void modal_loop(HWND dlg, HWND owner);   // defined later
 static void centerOn(HWND dlg, HWND owner);   // defined later
 
@@ -1088,6 +1134,7 @@ static void showPage(int idx) {
     if (ov) refreshOverview();
     else refreshAll(tabToComp(idx));
     if (idx == compToTab(Comp::Postgresql)) refreshPgUsers();
+    if (idx == compToTab(Comp::Mysql)) refreshMyUsers();
     kickStatusPoll();
     kickPm2Poll();
 }
@@ -1125,6 +1172,7 @@ static void applyStatusSnapshot() {
     int cur = g_tab ? TabCtrl_GetCurSel(g_tab) : -1;
     if (cur >= TAB_COMP_BASE) refreshVersions(tabToComp(cur));
     refreshPgInfo();
+    refreshMyInfo();
     refreshRedisInfo();
     // The PHP pool's 运行中/已停止 column comes from this same poll, so it has
     // to be refreshed here too. Node gets applyPm2Snapshot for exactly this
@@ -1474,6 +1522,49 @@ static void initPgPage(HWND parent) {
     ui.pageControls.push_back(info);
 }
 
+static void initMyPage(HWND parent) {
+    CompUI& ui = g_ui[(int)Comp::Mysql];
+    // Same six-row layout as PostgreSQL: buttons left, fields and status right,
+    // log edit below starts at y=280.
+    HWND bInit = makeCtl(IDC_MY_BTN_INIT, L"BUTTON", L"初始化数据库", BS_PUSHBUTTON, 20, 88, 120, 26, parent);
+    HWND bPwd = makeCtl(IDC_MY_BTN_PWD, L"BUTTON", L"修改密码", BS_PUSHBUTTON, 20, 120, 120, 26, parent);
+    HWND bAddU = makeCtl(IDC_MY_BTN_ADDUSER, L"BUTTON", L"创建用户", BS_PUSHBUTTON, 20, 152, 120, 26, parent);
+    HWND bDelU = makeCtl(IDC_MY_BTN_DELUSER, L"BUTTON", L"删除用户", BS_PUSHBUTTON, 20, 184, 120, 26, parent);
+    HWND bBak = makeCtl(IDC_MY_BTN_BACKUP, L"BUTTON", L"备份数据库", BS_PUSHBUTTON, 20, 216, 120, 26, parent);
+    HWND bRes = makeCtl(IDC_MY_BTN_RESTORE, L"BUTTON", L"还原数据库", BS_PUSHBUTTON, 20, 248, 120, 26, parent);
+    ui.pageControls.push_back(bInit);
+    ui.pageControls.push_back(bPwd);
+    ui.pageControls.push_back(bAddU);
+    ui.pageControls.push_back(bDelU);
+    ui.pageControls.push_back(bBak);
+    ui.pageControls.push_back(bRes);
+    addTooltip(parent, bBak, L"用 mysqldump 备份全部数据库到 backup\\mysql-<版本>-<时间>.sql");
+    addTooltip(parent, bRes, L"用 backup\\ 下的 mysqldump 备份覆盖当前数据库。可选择先初始化（重建数据目录）。危险操作，会二次确认");
+
+    HWND lUser = makeCtl(IDC_MY_LABEL_USER, L"STATIC", L"账号:", SS_LEFT, 160, 90, 60, 20, parent);
+    HWND eUser = makeCtl(IDC_MY_USER, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                         CBS_DROPDOWN | WS_VSCROLL, 225, 88, 170, 200, parent);
+    HWND lPwd = makeCtl(IDC_MY_LABEL_PWD, L"STATIC", L"密码:", SS_LEFT, 160, 118, 60, 20, parent);
+    HWND ePwd = makeCtl(IDC_MY_PWD, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD, 225, 116, 170, 22, parent);
+    HWND lPort = makeCtl(IDC_MY_LABEL_PORT, L"STATIC", L"端口:", SS_LEFT, 160, 146, 60, 20, parent);
+    HWND ePort = makeCtl(IDC_MY_PORT, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 225, 144, 170, 22, parent);
+    ui.pageControls.push_back(lUser);
+    ui.pageControls.push_back(lPwd);
+    ui.pageControls.push_back(lPort);
+    ui.pageControls.push_back(eUser);
+    ui.pageControls.push_back(ePwd);
+    ui.pageControls.push_back(ePort);
+
+    // pre-fill with current settings (password left blank: never round-trip
+    // the stored secret through the UI; the user types it when operating)
+    SetWindowTextW(eUser, (myUser() + L"@localhost").c_str());
+    SetWindowTextW(ePort, mysqlPort().c_str());
+    SetWindowTextW(ePwd, L"");
+
+    HWND info = makeCtl(IDC_MY_INFO, L"STATIC", L"", SS_LEFT, 160, 178, 300, 90, parent);
+    ui.pageControls.push_back(info);
+}
+
 static void initRedisPage(HWND parent) {
     CompUI& ui = g_ui[(int)Comp::Redis];
     HWND info = makeCtl(IDC_REDIS_INFO, L"STATIC", L"", SS_LEFT, 20, 90, 400, 160, parent);
@@ -1649,16 +1740,77 @@ static void pgOpBackup() {
     });
 }
 
+// ---- inline field helpers (values come from the mysql page, not popups) ----
+
+static std::wstring myEditText(int id) {
+    wchar_t buf[512];
+    GetDlgItemTextW(g_main, id, buf, 512);
+    return std::wstring(buf);
+}
+
+static void myOpInit() {
+    // The installer-level user is always root@localhost; the field is shown
+    // for symmetry with PostgreSQL but is not a choice here.
+    std::wstring pwd = myEditText(IDC_MY_PWD);
+    std::wstring port = myEditText(IDC_MY_PORT);
+    if (port.empty()) port = L"3306";
+    ComponentStatus st = compStatusQuick(Comp::Mysql);
+    runAsync(Comp::Mysql, L"初始化数据库", [st, pwd, port](std::wstring& err) {
+        return myInit(Comp::Mysql, st.currentVersion, pwd, port, err);
+    });
+}
+
+static void myOpPwd() {
+    std::wstring user = myEditText(IDC_MY_USER);
+    if (user.empty()) user = myUser() + L"@localhost";
+    std::wstring pwd = myEditText(IDC_MY_PWD);
+    if (pwd.empty()) { logAppend(Comp::Mysql, L"请填写新密码"); return; }
+    runAsync(Comp::Mysql, L"修改密码", [user, pwd](std::wstring& err) {
+        return myChangePassword(Comp::Mysql, user, pwd, err);
+    });
+}
+
+static void myOpAddUser() {
+    std::wstring user = myEditText(IDC_MY_USER);
+    if (user.empty()) { logAppend(Comp::Mysql, L"请填写用户名"); return; }
+    std::wstring pwd = myEditText(IDC_MY_PWD);
+    if (pwd.empty()) { logAppend(Comp::Mysql, L"请填写密码"); return; }
+    runAsync(Comp::Mysql, L"创建用户", [user, pwd](std::wstring& err) {
+        return myCreateUser(Comp::Mysql, user, pwd, err);
+    });
+}
+
+static void myOpDelUser() {
+    std::wstring user = myEditText(IDC_MY_USER);
+    if (user.empty()) { logAppend(Comp::Mysql, L"请填写用户名"); return; }
+    runAsync(Comp::Mysql, L"删除用户", [user](std::wstring& err) {
+        return myDropUser(Comp::Mysql, user, err);
+    });
+}
+
+static void myOpBackup() {
+    runAsync(Comp::Mysql, L"备份数据库", [](std::wstring& err) {
+        std::wstring file;
+        bool ok = myBackup(Comp::Mysql, file, err);
+        if (ok) err = L"已保存到 " + file;
+        return ok;
+    });
+}
+
 // ---- PostgreSQL restore dialog ----
 // The dialog only collects intent (which dump, whether to rebuild first).
-// pgOpRestore owns the confirmation prompts and runs the work off-thread — a
+// dbRestoreOp owns the confirmation prompts and runs the work off-thread — a
 // restore of a multi-hundred-MB dump takes minutes and must not block the UI.
+// Shared by PostgreSQL and MySQL: the two flows are the same shape (pick dump,
+// maybe rebuild, replay), and duplicating the dialog is how the pg and php
+// helpers drifted apart before.
 
 enum { IDC_PGR_FILE = 970, IDC_PGR_REINIT = 971, IDC_PGR_INFO = 972,
        IDC_PGR_GO = 973, IDC_PGR_CANCEL = 974 };
 
-struct PgRestoreState {
-    std::vector<std::wstring> files;   // backup\*.sql, newest first
+struct DbRestoreState {
+    Comp comp = Comp::Postgresql;
+    std::vector<std::wstring> files;   // backup\*.sql of this component, newest first
     std::wstring file;                 // full path; empty means the user backed out
     bool reinit = false;
 };
@@ -1683,7 +1835,7 @@ static std::wstring humanSize(LONGLONG bytes) {
     return wstrfmt(L"%lld KB", (LONGLONG)(bytes / 1024));
 }
 
-static void pgrRefreshInfo(HWND hwnd, PgRestoreState& st) {
+static void dbrRefreshInfo(HWND hwnd, DbRestoreState& st) {
     HWND combo = GetDlgItem(hwnd, IDC_PGR_FILE);
     int idx = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
     HWND info = GetDlgItem(hwnd, IDC_PGR_INFO);
@@ -1701,6 +1853,8 @@ static void pgrRefreshInfo(HWND hwnd, PgRestoreState& st) {
     if (SendMessageW(GetDlgItem(hwnd, IDC_PGR_REINIT), BM_GETCHECK, 0, 0) == BST_CHECKED) {
         txt += L"\r\n\r\n⚠ 将重建数据目录：当前所有数据库与角色都会被删除，";
         txt += L"且原数据目录会被移到一边（不删除），还原失败可自动回滚。";
+        if (st.comp == Comp::Mysql)
+            txt += L"\r\nMySQL 账号（含 root）以备份时的为准，可能与当前密码不同。";
     } else {
         txt += L"\r\n\r\n直接覆盖同名库。dump 里已存在的角色/数据库会跳过，";
         txt += L"还原不会删除备份中不存在的库。";
@@ -1708,10 +1862,10 @@ static void pgrRefreshInfo(HWND hwnd, PgRestoreState& st) {
     SetWindowTextW(info, txt.c_str());
 }
 
-static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    PgRestoreState* st = (PgRestoreState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+static LRESULT CALLBACK DbRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    DbRestoreState* st = (DbRestoreState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
-        // The caller owns PgRestoreState and outlives the dialog, so it arrives
+        // The caller owns DbRestoreState and outlives the dialog, so it arrives
         // through lpCreateParams. WM_DESTROY must not free it.
         case WM_NCCREATE: {
             CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
@@ -1720,8 +1874,11 @@ static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         case WM_CREATE: {
             if (!st) return -1;
-            st->files = pgListBackups();
-            makeCtl(1000, L"STATIC", L"备份文件:", SS_LEFT, 16, 14, 80, 20, hwnd);
+            // Only this component's dumps: the backup folder is shared, and a
+            // mysql dump replayed by mysql is not something a pg restore list
+            // should offer.
+            st->files = st->comp == Comp::Mysql ? myListBackups() : pgListBackups();
+            makeCtl(0, L"STATIC", L"备份文件:", SS_LEFT, 16, 14, 80, 20, hwnd);
             HWND combo = makeCtl(IDC_PGR_FILE, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                                  CBS_DROPDOWNLIST | WS_VSCROLL, 100, 12, 440, 240, hwnd);
             for (auto& f : st->files) {
@@ -1729,7 +1886,7 @@ static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)label.c_str());
             }
             if (st->files.empty()) {
-                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"（backup\\ 下没有 .sql 备份）");
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"（backup\\ 下没有该组件的 .sql 备份）");
                 EnableWindow(combo, FALSE);
                 EnableWindow(GetDlgItem(hwnd, IDC_PGR_GO), FALSE);
             } else {
@@ -1741,7 +1898,7 @@ static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             makeCtl(IDC_PGR_INFO, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 296, 530, 90, hwnd);
             makeCtl(IDC_PGR_GO, L"BUTTON", L"下一步…", BS_PUSHBUTTON, 360, 396, 100, 28, hwnd);
             makeCtl(IDC_PGR_CANCEL, L"BUTTON", L"取消", BS_PUSHBUTTON, 470, 396, 76, 28, hwnd);
-            pgrRefreshInfo(hwnd, *st);
+            dbrRefreshInfo(hwnd, *st);
             return 0;
         }
         case WM_COMMAND: {
@@ -1750,7 +1907,7 @@ static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (id == IDC_PGR_CANCEL) { DestroyWindow(hwnd); return 0; }
             if (id == IDC_PGR_REINIT) {
                 st->reinit = SendMessageW((HWND)lParam, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                pgrRefreshInfo(hwnd, *st);
+                dbrRefreshInfo(hwnd, *st);
                 return 0;
             }
             if (id == IDC_PGR_GO) {
@@ -1776,31 +1933,37 @@ static LRESULT CALLBACK PgRestoreProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void pgOpRestore() {
-    if (iniGet(L"ver.postgresql", L"").empty()) {
-        logAppend(Comp::Postgresql, L"未选择 PostgreSQL 版本，无法还原");
+// Shared by both database components. The version key differs (ver.mysql vs
+// ver.postgresql) and so does the restore implementation, but everything else
+// — the prompts, the dialog, the off-thread run — is identical.
+static void dbRestoreOp(Comp c) {
+    std::wstring verKey = c == Comp::Mysql ? L"ver.mysql" : L"ver.postgresql";
+    if (iniGet(verKey, L"").empty()) {
+        logAppend(c, L"未选择版本，无法还原");
         return;
     }
     static bool reg = false;
     if (!reg) {
         WNDCLASSW wc = {0};
-        wc.lpfnWndProc = PgRestoreProc;
+        wc.lpfnWndProc = DbRestoreProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"LNPPPgRestore";
+        wc.lpszClassName = L"LNPPDbRestore";
         RegisterClassW(&wc);
         reg = true;
     }
     // A restore replaces the whole cluster. Say so before even opening the
     // dialog, and again below if the rebuild option is ticked.
     if (MessageBoxW(g_main,
-            L"「还原数据库」会用 backup\\ 下的备份覆盖当前的 PostgreSQL 数据库。\r\n\r\n"
-            L"被覆盖的数据不会留在数据库里。\r\n继续打开还原对话框？",
+            (L"「还原数据库」会用 backup\\ 下的备份覆盖当前的 " +
+             std::wstring(compDisplay(c)) + L" 数据库。\r\n\r\n"
+             L"被覆盖的数据不会留在数据库里。\r\n继续打开还原对话框？").c_str(),
             L"还原数据库", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
 
-    PgRestoreState st;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPPgRestore", L"还原数据库",
+    DbRestoreState st;
+    st.comp = c;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LNPPDbRestore", L"还原数据库",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
                                0, 0, 562, 462, g_main, nullptr, GetModuleHandleW(nullptr), &st);
     if (!dlg) return;
@@ -1815,7 +1978,7 @@ static void pgOpRestore() {
         std::wstring msg =
             L"即将重建数据目录并还原：\r\n\r\n"
             L"  备份文件: " + st.file + L"\r\n"
-            L"  目标版本: " + iniGet(L"ver.postgresql", L"") + L"\r\n\r\n"
+            L"  目标版本: " + iniGet(verKey, L"") + L"\r\n\r\n"
             L"当前所有数据库与角色都会被删除。此操作不可撤销。\r\n"
             L"（原数据目录会移到 .before-restore-<时间戳> 保留，不删除）\r\n\r\n"
             L"确认继续？";
@@ -1827,11 +1990,11 @@ static void pgOpRestore() {
     std::wstring file = st.file;
     bool reinit = st.reinit;
     std::wstring name = reinit ? L"初始化并还原数据库" : L"还原数据库";
-    runAsync(Comp::Postgresql, name, [file, reinit](std::wstring& err) {
-        return pgRestoreBackup(Comp::Postgresql, file, reinit, err);
+    runAsync(c, name, [c, file, reinit](std::wstring& err) {
+        return c == Comp::Mysql ? myRestoreBackup(c, file, reinit, err)
+                                : pgRestoreBackup(c, file, reinit, err);
     });
 }
-
 
 // load the pg user list in the background, then refresh the user combo
 static void refreshPgUsers() {
@@ -1845,6 +2008,21 @@ static void refreshPgUsers() {
             PostMessageW(g_main, WM_PG_USERS, 0, 0);
         }
         g_pgUsersBusy = false;
+    }).detach();
+}
+
+// load the mysql account list in the background, then refresh the user combo
+static void refreshMyUsers() {
+    if (g_myUsersBusy.exchange(true)) return;
+    std::thread([]() {
+        std::vector<std::wstring> users;
+        std::wstring err;
+        if (myListUsers(users, err)) {
+            std::lock_guard<std::mutex> lk(g_snapMtx);
+            g_myUsers = users;
+            PostMessageW(g_main, WM_MY_USERS, 0, 0);
+        }
+        g_myUsersBusy = false;
     }).detach();
 }
 
@@ -2284,7 +2462,9 @@ static void dlPopulate(DlState& st) {
         ListView_SetItemText(st.list, (int)i, 1, (LPWSTR)it.name.c_str());
         Comp c = it.comp == L"nginx" ? Comp::Nginx :
                  it.comp == L"nodejs" ? Comp::Nodejs :
-                 it.comp == L"postgresql" ? Comp::Postgresql : Comp::Redis;
+                 it.comp == L"postgresql" ? Comp::Postgresql :
+                 it.comp == L"php" ? Comp::Php :
+                 it.comp == L"mysql" ? Comp::Mysql : Comp::Redis;
         std::wstring status = compVersionUsable(c, it.ver) ? L"已安装" : L"未安装";
         ListView_SetItemText(st.list, (int)i, 2, (LPWSTR)status.c_str());
     }
@@ -2435,7 +2615,7 @@ static LRESULT CALLBACK DownloaderProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     ovLogAppend(L"组件下载安装完成: " + st->curName);
                     // Refresh the version combos. This used to borrow WM_OP_DONE,
                     // whose job is to clear a component's busy flag — posting it
-                    // here force-cleared all four components and re-enabled their
+                    // here force-cleared all components and re-enabled their
                     // buttons while a real start/stop was still running. Just ask
                     // the pollers for fresh data instead.
                     refreshOverview();
@@ -2495,7 +2675,7 @@ static void showDownloaderDialog(HWND owner) {
     DestroyWindow(dlg);
 }
 
-// The four component pages are built by initCommonControls() with the *same*
+// The component pages are built by initCommonControls() with the *same*
 // control IDs (IDC_BTN_START / IDC_LOG / ...) under the same parent window, so
 // GetDlgItem(g_main, ...) only ever finds the nginx copy. Resolve a WM_COMMAND
 // sender back to its component instead of trusting the active tab: the tab
@@ -2527,6 +2707,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             TabCtrl_InsertItem(g_tab, compToTab(Comp::Nginx), &ti);
             ti.pszText = (LPWSTR)L"PostgreSQL";
             TabCtrl_InsertItem(g_tab, compToTab(Comp::Postgresql), &ti);
+            ti.pszText = (LPWSTR)L"MySQL";
+            TabCtrl_InsertItem(g_tab, compToTab(Comp::Mysql), &ti);
             ti.pszText = (LPWSTR)L"Redis";
             TabCtrl_InsertItem(g_tab, compToTab(Comp::Redis), &ti);
             ti.pszText = (LPWSTR)L"Node.js";
@@ -2539,6 +2721,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             initNginxPage(hwnd);
             initCommonControls(hwnd, Comp::Postgresql);
             initPgPage(hwnd);
+            initCommonControls(hwnd, Comp::Mysql);
+            initMyPage(hwnd);
             initCommonControls(hwnd, Comp::Redis);
             initRedisPage(hwnd);
             initCommonControls(hwnd, Comp::Nodejs);
@@ -2594,11 +2778,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_OV_COMP_START_BASE + 2: ovToggle(Comp::Redis); break;
                 case IDC_OV_COMP_START_BASE + 3: ovToggle(Comp::Nodejs); break;
                 case IDC_OV_COMP_START_BASE + 4: ovToggle(Comp::Php); break;
+                case IDC_OV_COMP_START_BASE + 5: ovToggle(Comp::Mysql); break;
                 case IDC_OV_COMP_AUTO_BASE + 0: ovAutoComp(Comp::Nginx, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 1: ovAutoComp(Comp::Postgresql, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 2: ovAutoComp(Comp::Redis, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 3: ovAutoComp(Comp::Nodejs, (HWND)lParam); break;
                 case IDC_OV_COMP_AUTO_BASE + 4: ovAutoComp(Comp::Php, (HWND)lParam); break;
+                case IDC_OV_COMP_AUTO_BASE + 5: ovAutoComp(Comp::Mysql, (HWND)lParam); break;
                 case IDC_BTN_START:
                     if (sender != Comp::Count) actStart(sender);
                     break;
@@ -2845,7 +3031,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case IDC_PG_BTN_ADDUSER: pgOpAddUser(); break;
                 case IDC_PG_BTN_DELUSER: pgOpDelUser(); break;
                 case IDC_PG_BTN_BACKUP: pgOpBackup(); break;
-                case IDC_PG_BTN_RESTORE: pgOpRestore(); break;
+                case IDC_PG_BTN_RESTORE: dbRestoreOp(Comp::Postgresql); break;
+                case IDC_MY_BTN_INIT: myOpInit(); break;
+                case IDC_MY_BTN_PWD: myOpPwd(); break;
+                case IDC_MY_BTN_ADDUSER: myOpAddUser(); break;
+                case IDC_MY_BTN_DELUSER: myOpDelUser(); break;
+                case IDC_MY_BTN_BACKUP: myOpBackup(); break;
+                case IDC_MY_BTN_RESTORE: dbRestoreOp(Comp::Mysql); break;
                 case IDC_NODE_BTN_RESTART_ALL:
                     runAsync(Comp::Nodejs, L"重启全部 PM2 应用", [](std::wstring& err) {
                         return nodePm2RestartAll(err);
@@ -2929,6 +3121,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             {
                 std::lock_guard<std::mutex> lk(g_snapMtx);
                 users = g_pgUsers;
+            }
+            wchar_t cur[128];
+            GetWindowTextW(combo, cur, 128);
+            SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+            for (auto& u : users) SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)u.c_str());
+            SetWindowTextW(combo, cur);
+            break;
+        }
+        case WM_MY_USERS: {
+            HWND combo = GetDlgItem(hwnd, IDC_MY_USER);
+            if (!combo) break;
+            std::vector<std::wstring> users;
+            {
+                std::lock_guard<std::mutex> lk(g_snapMtx);
+                users = g_myUsers;
             }
             wchar_t cur[128];
             GetWindowTextW(combo, cur, 128);

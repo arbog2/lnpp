@@ -11,7 +11,8 @@ enum class Comp {
     Redis = 2,
     Nodejs = 3,
     Php = 4,
-    Count = 5
+    Mysql = 5,
+    Count = 6
 };
 
 // What a vhost runs: the node template (static files first, then proxy_pass to
@@ -153,6 +154,52 @@ bool pgRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError)
 bool pgDataInitialized(const std::wstring& ver);
 bool pgListUsers(std::vector<std::wstring>& users, std::wstring& err);
 
+// mysql
+// 便携版 zip（dev.mysql.com / cdn.mysql.com 的 winx64 包）剥掉顶层目录后是
+// bin\mysql\<版本>\bin\mysqld.exe + share\，与 PostgreSQL 同为 bin\ 子目录布局，
+// 所以 compExe() 对两者的处理方式一致。收 MySQL 8.0.x 与 8.4.x LTS：8.4 默认
+// 禁用 mysql_native_password，且删掉了 default_authentication_plugin 变量
+// （写它会让初始化/启动直接 abort），所以 8.4 用单独的 my-8.4.ini.tpl 把插件
+// 打开，新建账号一律用显式的 IDENTIFIED WITH（见 myAuthClause）；9.x 创新版
+// 行为变化大，暂不收。
+//
+// 版本切换**不做数据迁移**：MySQL 跨大版本升级/降级必须 dump→init→restore，
+// 搬系统库（mysql schema）比 pg_dumpall 还容易出事。切版本只是改 ver.mysql、
+// 指向该版本自己的数据目录；要搬数据请手动「备份 → 切版本 → 还原」。
+bool myInit(Comp c, const std::wstring& ver, const std::wstring& password,
+            const std::wstring& port, std::wstring& err);
+bool myDataInitialized(Comp c, const std::wstring& ver);
+// Split a page/combo account ("name@host", or bare "name" meaning
+// "name@localhost") for SQL. Pure text parsing, exposed for unit tests.
+bool mySplitAccount(const std::wstring& text, std::wstring& user, std::wstring& host);
+// Quote a MySQL string literal (' doubles, \ doubles). Pure text building,
+// exposed for unit tests.
+std::wstring myEscapeLiteral(const std::wstring& value);
+// The authentication clause every account this manager creates gets:
+// IDENTIFIED WITH mysql_native_password BY <literal>. Spelling the plugin out
+// keeps 8.0 and 8.4 accounts identical without depending on the server default
+// (8.4 may default to caching_sha2_password even with the native plugin
+// enabled). Pure text building, exposed for unit tests.
+std::wstring myAuthClause(const std::wstring& password);
+bool myChangePassword(Comp c, const std::wstring& user, const std::wstring& password, std::wstring& err);
+bool myCreateUser(Comp c, const std::wstring& user, const std::wstring& password, std::wstring& err);
+bool myDropUser(Comp c, const std::wstring& user, std::wstring& err);
+bool myListUsers(std::vector<std::wstring>& users, std::wstring& err);
+// Dump every database with mysqldump. backupFile empty means "pick one" in backup\.
+bool myBackup(Comp c, std::wstring& backupFile, std::wstring& err);
+// Backups available to restore, newest first; only the mysql-*.sql ones, so the
+// PostgreSQL dumps never show up in MySQL's restore dialog.
+std::vector<std::wstring> myListBackups();
+// True when a mysql replay produced no error other than the "already exists"
+// collisions a mysqldump --all-databases dump always makes (the mysql and sys
+// system schemas exist in every server). firstRealError receives the first
+// unexpected ERROR line.
+bool myRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError);
+// Replay a mysqldump dump. reinit=true rebuilds the data dir first — the old one
+// is moved aside, never deleted, so a failed restore can be rolled back. Either
+// way this is destructive: the databases are overwritten.
+bool myRestoreBackup(Comp c, const std::wstring& backupFile, bool reinit, std::wstring& err);
+
 // nodejs / pm2
 bool nodePm2Installed();
 std::vector<PM2App> nodePm2List();
@@ -253,6 +300,16 @@ int phpApplyExtensions(const std::wstring& ver, const std::vector<std::wstring>&
 
 // ---- Config generation ----
 bool genNginxConfig(const std::wstring& ver);
+// A version renders my.ini from "my.ini.tpl" (8.0.x) or "my-8.4.ini.tpl"
+// (8.4.x). The dotted prefix matters: a bare "8.4" prefix would also match
+// an 8.0-branch "8.40" directory. Pure string rule, exposed for unit tests.
+std::wstring myIniTemplateFor(const std::wstring& ver);
+// Render etc\mysql\my.ini.tpl into data\mysql\<ver>\my.ini. Called on every
+// start, exactly like genRedisConfig: the port lives in the template rendering,
+// and the template ends in an !includedir line so hand-written .cnf files under
+// data\mysql\<ver>\conf.d\ survive the regeneration. The generated file itself
+// is not hand-edited — put local settings in conf.d\ instead.
+bool genMyConfig(const std::wstring& ver);
 // The catch-all server blocks substituted into the {{DENY_UNKNOWN}} placeholder
 // of etc\nginx\nginx.conf.tpl. blockUnknown=true refuses every request whose
 // Host / SNI matches no site (:80 -> 500, :443 -> TLS handshake refusal);
@@ -284,5 +341,16 @@ std::wstring redisPort();
 std::wstring nodejsPort();
 // First port handed out to a php-cgi instance (settings.ini: php.baseport).
 std::wstring phpBasePort();
+
+// ---- Mysql connection settings ----
+// MySQL only manages root@localhost: every client (mysql / mysqladmin /
+// mysqldump) connects as root, and created accounts are 'name'@'localhost'.
+std::wstring myUser();
+// DPAPI-encrypted, same scheme as pg.password.enc (settings.ini:
+// mysql.password.enc). Falls back to "" when none was stored yet — an empty
+// string means "the root password was never set here", which is exactly what
+// --initialize-insecure leaves behind.
+std::wstring myPassword();
+std::wstring mysqlPort();
 
 #endif

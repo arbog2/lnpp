@@ -19,6 +19,7 @@ const wchar_t* compName(Comp c) {
         case Comp::Redis: return L"redis";
         case Comp::Nodejs: return L"nodejs";
         case Comp::Php: return L"php";
+        case Comp::Mysql: return L"mysql";
         default: return L"";
     }
 }
@@ -30,6 +31,7 @@ const wchar_t* compDisplay(Comp c) {
         case Comp::Redis: return L"Redis";
         case Comp::Nodejs: return L"Node.js";
         case Comp::Php: return L"PHP";
+        case Comp::Mysql: return L"MySQL";
         default: return L"";
     }
 }
@@ -63,6 +65,10 @@ std::wstring compConfigDir(Comp c) {
         // The generated php.ini lives next to the instance it belongs to, so
         // the "配置" button opens the ini the running php-cgi was started with.
         case Comp::Php:        return liveVerDir(Comp::Php);
+        // data\mysql\<版本>\ (the generated my.ini plus conf.d\); the real
+        // datadir is one level down under data\ so that --initialize-insecure
+        // still sees an empty directory with the ini sitting next to it.
+        case Comp::Mysql:      return liveVerDir(Comp::Mysql);
         default:               return compDataDir(c);
     }
 }
@@ -74,6 +80,15 @@ std::wstring compBinDirVer(Comp c, const std::wstring& ver) {
 // postgresql section, but the version-switch migration code above it also
 // builds a psql command line and needs them first.
 static bool pgValidIdent(const std::wstring& s);
+// The mysql section lives further down, but the shared lifecycle dispatchers
+// (compStart / compStop) need these helpers before it.
+static std::wstring myQuoteClientArg(const std::wstring& value);
+static bool myCredsFile(std::wstring& path, std::wstring& err,
+                        const std::wstring* pwdOverride = nullptr);
+// Read-only kernel TCP-table probe, defined with the php section. Safe to call
+// from any thread; used here to tell "our server is up" from "a foreign server
+// holds the port". Declared in the same anonymous namespace as its definition.
+namespace { bool tcpPortListening(const std::wstring& port); }
 // phpStart() checks pool ownership before declaring a version already up, and
 // the enumerator itself is defined further down next to phpStop.
 static std::vector<DWORD> ourPhpCgiPids(const std::wstring& ver);
@@ -94,8 +109,8 @@ static const wchar_t* kCompBusyMsg = L"该组件正在执行其他操作，请�
 
 bool compIsBusy(const std::wstring& err) { return err == kCompBusyMsg; }
 
-// One lock per component. autoStartComponents() fires compStart for all four
-// components from four parallel threads, and compStart(Nodejs) additionally
+// One lock per component. autoStartComponents() fires compStart for every
+// component from its own thread, and compStart(Nodejs) additionally
 // starts Redis as a side effect — so the same component really can be driven
 // by two threads at once (two servers fighting over one port / data dir, or
 // two config generators racing). try_lock makes the loser fail fast with a
@@ -218,6 +233,11 @@ bool compVersionUsable(Comp c, const std::wstring& ver) {
             return fileExists(joinPath(compBinDirVer(c, ver), L"node.exe"));
         case Comp::Php:
             return fileExists(joinPath(compBinDirVer(c, ver), L"php-cgi.exe"));
+        case Comp::Mysql:
+            // The official zip ships bin\mysqld.exe (not a flat mysqld.exe in
+            // the version root), so a copied-over tree without bin\ is not an
+            // install at all.
+            return fileExists(joinPath(joinPath(compBinDirVer(c, ver), L"bin"), L"mysqld.exe"));
         default:
             return false;
     }
@@ -249,8 +269,8 @@ ComponentStatus compStatusQuick(Comp c) { return compStatusImpl(c, true); }
 // ============================ Process helpers ============================
 
 std::wstring compExe(Comp c, const std::wstring& ver, const std::wstring& exeName) {
-    // Node/nginx/redis have exe at version root; postgresql has bin/ subdir
-    if (c == Comp::Postgresql)
+    // Node/nginx/redis have exe at version root; postgresql and mysql have bin/
+    if (c == Comp::Postgresql || c == Comp::Mysql)
         return joinPath(joinPath(compBinDirVer(c, ver), L"bin"), exeName);
     return joinPath(compBinDirVer(c, ver), exeName);
 }
@@ -507,6 +527,57 @@ static bool redisRunningVer(const std::wstring& ver) {
            processImageIs(pid, compExe(Comp::Redis, ver, L"redis-server.exe"));
 }
 
+// ---- mysql ----
+// Windows 上 mysqld **不写 pid 文件**（pid-file 在 my.ini 里只是摆设），所以
+// 运行判定和 PG/Redis 的 pid 文件路线不同：与 PHP 的做法一致——扫 Toolhelp 进程
+// 表找镜像路径属于 bin\mysql\<版本>\ 的 mysqld.exe。dirIsUnder 而不是裸的前缀
+// 比较，否则 8.0 会把别处的 mysqld.exe 认成自己的（任务管理器里常见）。
+static std::vector<DWORD> ourMysqldPids(const std::wstring& ver) {
+    std::vector<DWORD> pids;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return pids;
+    std::wstring ours = compBinDirVer(Comp::Mysql, ver);
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+    std::vector<wchar_t> path(1024);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"mysqld.exe") != 0) continue;
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!h) continue;
+            // Grow the buffer until the image name fits: the install tree can
+            // legitimately be deep, and a silent skip here would make Stop
+            // report a foreign process while our own server kept the port.
+            DWORD size = (DWORD)path.size();
+            BOOL ok = QueryFullProcessImageNameW(h, 0, path.data(), &size);
+            if (!ok) {
+                while (path.size() < 32768 && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    path.resize(path.size() * 2);
+                    size = (DWORD)path.size();
+                    ok = QueryFullProcessImageNameW(h, 0, path.data(), &size);
+                }
+            }
+            CloseHandle(h);
+            if (!ok) continue;
+            if (dirIsUnder(dirOf(std::wstring(path.data(), size)), ours))
+                pids.push_back(pe.th32ProcessID);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pids;
+}
+
+// Data dir lives one level below data\mysql\<ver>\ because --initialize-insecure
+// refuses a non-empty directory and my.ini sits next to it (regenerated on
+// every start).
+static std::wstring myDataDir(Comp c, const std::wstring& ver) {
+    return joinPath(compDataVerDir(c, ver), L"data");
+}
+
+static bool myRunningVer(const std::wstring& ver) {
+    return !ourMysqldPids(ver).empty();
+}
+
 // ---- nodejs / pm2 ----
 
 static std::wstring pm2HomeDir() {
@@ -747,6 +818,7 @@ bool compIsRunning(Comp c) {
         case Comp::Nginx:      return nginxRunningVer(st.currentVersion, /*repairPidFile=*/true);
         case Comp::Postgresql: return pgRunningVer(c, st.currentVersion);
         case Comp::Redis:      return redisRunningVer(st.currentVersion);
+        case Comp::Mysql:      return myRunningVer(st.currentVersion);
         case Comp::Nodejs:
             return nodeDaemonRunning();
         // Any php-cgi answering on any port means the component is up; the
@@ -772,6 +844,10 @@ bool compRunningQuick(Comp c) {
             return isPidAlive(pid);
         }
         case Comp::Nodejs:     return nodeDaemonRunning();
+        // ourMysqldPids() only reads the process table (no spawn, no file
+        // write), so the poller can use the same probe the real check uses —
+        // unlike Redis, where the pidfile shortcut exists only for polling.
+        case Comp::Mysql:      return myRunningVer(ver);
         // phpRunning() only tests whether a port is bound — no process spawn,
         // no pid file write — so it is safe to call from the poller too.
         case Comp::Php:        return phpAnyRunning();
@@ -826,6 +902,11 @@ void rotateCompLogs(Comp c, const std::wstring& ver) {
             return;
         case Comp::Redis:
             rotateOneLog(joinPath(logsDir(), L"redis-" + ver + L".log"));
+            return;
+        // mysqld keeps appending to log-error for as long as it runs, and it
+        // holds the file open — same rotation rule as the other servers.
+        case Comp::Mysql:
+            rotateOneLog(joinPath(logsDir(), L"mysql-" + ver + L".log"));
             return;
         default:
             // nodejs: pm2 keeps its own logs under %USERPROFILE%\.pm2\logs.
@@ -959,9 +1040,10 @@ bool compStart(Comp c, std::wstring& err) {
     rotateCompLogs(c, ver);
     // Starting a component is a natural maintenance window: the PostgreSQL
     // version switch leaves a full copy of the old cluster behind every time,
-    // and the backup folder grows by one full dump per migration.
-    if (c == Comp::Postgresql) {
-        pruneStaleDataCopies(Comp::Postgresql);
+    // and the backup folder grows by one full dump per migration. MySQL gets
+    // the same treatment for the .before-restore- copies its restore leaves.
+    if (c == Comp::Postgresql || c == Comp::Mysql) {
+        pruneStaleDataCopies(c);
         pruneOldBackups();
     }
 
@@ -1021,6 +1103,66 @@ bool compStart(Comp c, std::wstring& err) {
             CloseHandle(pi.hProcess);
             if (!pgRunningVer(c, ver)) {
                 err = L"PostgreSQL 启动失败，请查看日志 " + logFile;
+                return false;
+            }
+            return true;
+        }
+        case Comp::Mysql: {
+            // Regenerate my.ini on every start, exactly like Redis: the port
+            // only reaches the server through this render, and the template
+            // ends in !includedir so hand-written .cnf files under conf.d\
+            // survive it. Editing the generated my.ini directly is overwritten.
+            if (!genMyConfig(ver)) { err = L"生成 MySQL 配置失败"; return false; }
+            if (!myDataInitialized(c, ver)) {
+                err = L"数据库尚未初始化，请先点击「初始化数据库」";
+                return false;
+            }
+            std::wstring port = mysqlPort();
+            // Refuse before spawning when the port is already held by something
+            // that is not ours: our mysqld would fail to bind and exit, while
+            // the readiness loop below could mistake (dying own process +
+            // foreign listener) for a healthy start — and the next client call
+            // would then die with a confusing 2013 against the stranger.
+            // TIME_WAIT leftovers are not counted (tcpPortListening only sees
+            // LISTEN), so a just-stopped own server never trips this.
+            if (validPort(port) && !myRunningVer(ver) && tcpPortListening(port)) {
+                err = L"端口 " + port + L" 已被其他程序占用（不是本管理器的 MySQL），" +
+                      L"请先释放该端口，或改 mysql.port 后重试";
+                return false;
+            }
+            std::wstring mysqld;
+            if (!findExe(Comp::Mysql, ver, L"mysqld.exe", mysqld)) {
+                err = L"未找到 mysqld.exe"; return false;
+            }
+            // --defaults-file must be the FIRST argument; the paths inside the
+            // ini are absolute, so the working directory is only a fallback for
+            // mysqld looking up its share\ directory relative to basedir.
+            std::wstring ini = joinPath(compDataVerDir(Comp::Mysql, ver), L"my.ini");
+            ProcInfo pi;
+            if (!startProcessDetached(mysqld, L"--defaults-file=\"" + ini + L"\"",
+                                      compBinDirVer(c, ver), pi)) {
+                err = L"启动 MySQL 失败"; return false;
+            }
+            std::wstring logFile = joinPath(logsDir(), L"mysql-" + ver + L".log");
+            // Two conditions, not one: a foreign mysqld squatting on the port
+            // must not be reported as "started", and our own server must not be
+            // reported ready while it is still crunching through InnoDB
+            // recovery. Startup takes longer than the other servers here.
+            // Break early when our own process is gone (bad my.ini, failed
+            // bind): waiting out the clock only delays the log pointer below.
+            bool up = false;
+            for (int i = 0; i < 200; ++i) {
+                if (!myRunningVer(ver)) break;
+                if (validPort(port) && tcpPortListening(port)) {
+                    up = true;
+                    break;
+                }
+                Sleep(100);
+            }
+            CloseHandle(pi.hProcess);
+            if (!up) {
+                err = L"MySQL 启动后 20 秒内未就绪，请查看日志 " + logFile +
+                      L"（常见原因：端口被其他程序占用，或 my.ini 写了该版本不支持的变量）";
                 return false;
             }
             return true;
@@ -1168,6 +1310,43 @@ bool compStop(Comp c, std::wstring& err) {
                 return false;
             }
             return true;
+        }
+        case Comp::Mysql: {
+            std::wstring port = mysqlPort();
+            if (!validPort(port)) port = L"3306";
+            // Graceful first: mysqladmin shutdown flushes and exits cleanly.
+            // The password rides in a temp --defaults-extra-file, never as a
+            // -p argument (that shows up in every process listing on the box).
+            // A wrong or unset password must not abort the stop — the kill
+            // fallback below still gets the server down, and InnoDB recovers
+            // from an unclean exit on the next start.
+            std::wstring mysqladmin;
+            if (findExe(Comp::Mysql, ver, L"mysqladmin.exe", mysqladmin)) {
+                std::wstring creds, cerr;
+                if (myCredsFile(creds, cerr)) {
+                    runProcessCapture(mysqladmin,
+                        L"--defaults-extra-file=" + myQuoteClientArg(creds) +
+                        L" -h 127.0.0.1 -P " + port + L" -u " + myUser() + L" shutdown",
+                        compBinDirVer(c, ver), 45000);
+                    DeleteFileW(creds.c_str());
+                } else {
+                    logMsg(L"mysql", L"无法准备 mysqladmin 凭据: " + cerr);
+                }
+            }
+            // Fallback / cleanup: every mysqld of this version. Killing mysqld
+            // is not data loss (InnoDB crash recovery on the next start), it is
+            // just less tidy than a shutdown.
+            for (DWORD pid : ourMysqldPids(ver)) killProcessByPid(pid);
+            for (int i = 0; i < 50; ++i) {
+                if (!myRunningVer(ver)) return true;
+                Sleep(100);
+            }
+            // Never return false with an empty err: callers prefix it.
+            if (validPort(mysqlPort()) && tcpPortListening(mysqlPort()))
+                err = L"MySQL 已无法停止，端口 " + mysqlPort() + L" 仍被其他 mysqld 占用";
+            else
+                err = L"MySQL 无法停止";
+            return false;
         }
         case Comp::Redis: {
             // try shutdown via redis-cli
@@ -1436,6 +1615,14 @@ bool compSwitchVersion(Comp c, const std::wstring& ver, std::wstring& err) {
         // restart pm2 with new node version
         std::wstring serr;
         if (!compStart(c, serr)) { err = L"启动失败: " + serr; return false; }
+    } else if (c == Comp::Mysql) {
+        // No data migration, on purpose (see the mysql block in manager.h):
+        // switching versions only moves ver.mysql to the new version, whose
+        // data directory is its own. The old version's data stays where it is
+        // for a manual backup / restore round trip.
+        if (!genMyConfig(ver)) { err = L"生成 MySQL 配置失败"; return false; }
+        std::wstring serr;
+        if (!compStart(c, serr)) { err = L"启动失败: " + serr; return false; }
     }
     return true;
 }
@@ -1482,6 +1669,43 @@ static const wchar_t* DEFAULT_PG_APPEND =
     L"listen_addresses = '127.0.0.1'\r\n"
     L"port = {{PORT}}\r\n"
     L"max_connections = 100\r\n";
+
+// Keep in sync with etc\mysql\my.ini.tpl. Same layout rationale: loopback
+// only, log/pid/data paths resolved at render time, and a conf.d include so
+// hand-written settings survive the regeneration.
+static const wchar_t* DEFAULT_MY_INI =
+    L"[mysqld]\r\n"
+    L"basedir = \"{{BASEDIR}}\"\r\n"
+    L"datadir = \"{{DATADIR}}\"\r\n"
+    L"port = {{PORT}}\r\n"
+    L"bind-address = 127.0.0.1\r\n"
+    L"log-error = \"{{LOGFILE}}\"\r\n"
+    L"pid-file = \"{{PIDFILE}}\"\r\n"
+    L"character-set-server = utf8mb4\r\n"
+    L"collation-server = utf8mb4_general_ci\r\n"
+    L"default_authentication_plugin = mysql_native_password\r\n"
+    L"max_connections = 100\r\n"
+    L"!includedir \"{{CONFDIR}}\"\r\n";
+
+// Fallback when etc\mysql\my-8.4.ini.tpl is missing. Same shape as
+// DEFAULT_MY_INI plus the one line 8.4 cannot start without: the native
+// password plugin is OFF by default there. There is deliberately NO
+// default_authentication_plugin line: 8.4 removed that variable outright and
+// treats it as a fatal unknown variable (this exact line is what aborted both
+// --initialize and startup in the 8.4.11 field report).
+static const wchar_t* DEFAULT_MY84_INI =
+    L"[mysqld]\r\n"
+    L"basedir = \"{{BASEDIR}}\"\r\n"
+    L"datadir = \"{{DATADIR}}\"\r\n"
+    L"port = {{PORT}}\r\n"
+    L"bind-address = 127.0.0.1\r\n"
+    L"log-error = \"{{LOGFILE}}\"\r\n"
+    L"pid-file = \"{{PIDFILE}}\"\r\n"
+    L"character-set-server = utf8mb4\r\n"
+    L"collation-server = utf8mb4_general_ci\r\n"
+    L"mysql_native_password = ON\r\n"
+    L"max_connections = 100\r\n"
+    L"!includedir \"{{CONFDIR}}\"\r\n";
 
 // The catch-all server blocks that live where the {{DENY_UNKNOWN}} placeholder
 // is, i.e. inside http{} and before "include vhosts/*.conf".
@@ -1742,6 +1966,57 @@ bool genPgConfig(const std::wstring& ver, const std::wstring& dataDir) {
     std::wstring existing = readFileText(confPath);
     existing += L"\r\n" + append;
     return writeFileText(confPath, existing);
+}
+
+std::wstring myIniTemplateFor(const std::wstring& ver) {
+    // "8.4." with the dot: a bare "8.4" prefix would also match an 8.0-branch
+    // "8.40" directory. A bare "8.4" (no patch) is treated as the 8.4 branch.
+    if (ver == L"8.4" || ver.rfind(L"8.4.", 0) == 0) return L"my-8.4.ini.tpl";
+    return L"my.ini.tpl";
+}
+
+// Render data\mysql\<ver>\my.ini from the version's template (see
+// myIniTemplateFor). Called on every
+// start, like genRedisConfig: the port only reaches the server through this
+// render, so a settings.ini change takes effect on the next restart. The
+// file it overwrites is NOT the hand-editable surface — the template ends in
+// an !includedir line, and everything under data\mysql\<ver>\conf.d\ is the
+// user's own and survives every regeneration.
+bool genMyConfig(const std::wstring& ver) {
+    std::lock_guard<std::mutex> lk(g_genCfgMtx);
+    std::wstring port = mysqlPort();
+    if (!validPort(port)) {
+        // Writing a broken ini would fail later with a confusing mysqld
+        // message; refusing here names the actual key in the log.
+        logMsg(L"mysql", L"端口号无效，未生成 my.ini: mysql.port = " + port +
+                         L"（应为 1-65535）");
+        return false;
+    }
+    std::wstring dir = compDataVerDir(Comp::Mysql, ver);
+    if (!makeDirs(dir)) return false;
+    std::wstring confDir = joinPath(dir, L"conf.d");
+    // Create the include target: mysqld only logs a warning for a missing
+    // !includedir, and a user's .cnf dropped in later would silently do
+    // nothing until the directory exists on the next start.
+    if (!makeDirs(confDir)) return false;
+    if (!makeDirs(logsDir())) return false;
+    std::wstring tplName = myIniTemplateFor(ver);
+    std::wstring tpl = readFileText(joinPath(compEtcDir(Comp::Mysql), tplName));
+    if (tpl.empty()) tpl = tplName == L"my-8.4.ini.tpl" ? DEFAULT_MY84_INI : DEFAULT_MY_INI;
+
+    std::map<std::wstring, std::wstring> kv;
+    // Forward slashes inside the option file: that is what the official MySQL
+    // installer writes, and mysqld accepts both. The template quotes every
+    // value so a path with a space survives.
+    kv[L"BASEDIR"] = toForward(compBinDirVer(Comp::Mysql, ver));
+    kv[L"DATADIR"] = toForward(joinPath(dir, L"data"));
+    kv[L"PORT"] = port;
+    kv[L"LOGFILE"] = toForward(joinPath(logsDir(), L"mysql-" + ver + L".log"));
+    kv[L"PIDFILE"] = toForward(joinPath(dir, L"mysqld.pid"));
+    kv[L"CONFDIR"] = toForward(confDir);
+
+    std::wstring ini = renderTemplate(tpl, kv);
+    return writeFileText(joinPath(dir, L"my.ini"), ini);
 }
 
 // ============================ Pg connection settings ============================
@@ -2236,12 +2511,21 @@ static bool pgRunSql(Comp c, const std::wstring& ver, const std::wstring& extraA
 
 // ============================ Restore ============================
 
-std::vector<std::wstring> pgListBackups() {
-    std::vector<std::wstring> files = listFiles(backupDir(), L"sql");
+// The backup folder is shared by every database component, so each restore
+// dialog lists only the dumps it can replay. Every dump both tools write is
+// named "<component>-<version>-<stamp>.sql", so a name prefix is the filter.
+// Newest first, by file mtime rather than by name: a name sort would mix
+// versions ("postgresql-18-..." sorts above every "postgresql-17-..."
+// regardless of date).
+static std::vector<std::wstring> listBackupsByPrefix(const wchar_t* const* prefixes,
+                                                     int n) {
+    std::vector<std::wstring> files;
+    for (const auto& f : listFiles(backupDir(), L"sql")) {
+        for (int i = 0; i < n; ++i) {
+            if (f.rfind(prefixes[i], 0) == 0) { files.push_back(f); break; }
+        }
+    }
     std::sort(files.begin(), files.end(), [](const std::wstring& a, const std::wstring& b) {
-        // file mtime, not name: the keep-newest-N pruning already bounds this
-        // list, and a name sort would mix versions ("postgresql-18-..." sorts
-        // above every "postgresql-17-..." regardless of date).
         HANDLE ha = CreateFileW(joinPath(backupDir(), a).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         HANDLE hb = CreateFileW(joinPath(backupDir(), b).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -2256,6 +2540,16 @@ std::vector<std::wstring> pgListBackups() {
         return a > b;
     });
     return files;
+}
+
+std::vector<std::wstring> pgListBackups() {
+    static const wchar_t* kPrefixes[] = { L"postgresql-" };
+    return listBackupsByPrefix(kPrefixes, 1);
+}
+
+std::vector<std::wstring> myListBackups() {
+    static const wchar_t* kPrefixes[] = { L"mysql-" };
+    return listBackupsByPrefix(kPrefixes, 1);
 }
 
 bool pgRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError) {
@@ -2555,6 +2849,593 @@ bool pgBackup(Comp c, std::wstring& backupFile, std::wstring& err) {
     if (!r.ok) {
         err = L"pg_dumpall 失败: " + r.output;
         return false;
+    }
+    return true;
+}
+
+// ============================ mysql ============================
+
+std::wstring myUser() { return iniGet(L"mysql.user", L"root"); }
+
+// Same DPAPI scheme as pgStorePassword, separate keys. There is deliberately
+// no "default" password: an unset value means the root password was never set
+// here, which is exactly what --initialize-insecure leaves behind, and callers
+// must be able to tell that apart from a password.
+static void myStorePassword(const std::wstring& password) {
+    std::wstring enc = dpProtect(password);
+    if (!enc.empty()) {
+        iniSet(L"mysql.password.enc", enc);
+        iniDelete(L"mysql.password");
+    } else {
+        // DPAPI failure is rare but possible; keep working on the plaintext
+        // key rather than losing the password entirely (same trade as PG).
+        iniSet(L"mysql.password", password);
+    }
+}
+
+std::wstring myPassword() {
+    std::wstring enc = iniGet(L"mysql.password.enc", L"");
+    if (!enc.empty()) {
+        std::wstring p = dpUnprotect(enc);
+        if (!p.empty()) return p;
+    }
+    return iniGet(L"mysql.password", L"");
+}
+std::wstring mysqlPort() { return iniGet(L"mysql.port", L"3306"); }
+
+// A MySQL account name the GUI is willing to build SQL and command lines
+// from: at most 32 chars (the server's own limit) and only identifier-safe
+// characters. Quotes / semicolons / whitespace / NUL are rejected here so no
+// caller can inject through the combo box.
+static bool myValidUser(const std::wstring& s) {
+    if (s.empty() || s.size() > 32) return false;
+    for (wchar_t c : s) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') || c == L'_' || c == L'$';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool myValidHost(const std::wstring& s) {
+    if (s.empty() || s.size() > 255) return false;
+    for (wchar_t c : s) {
+        bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                  (c >= L'0' && c <= L'9') || c == L'_' || c == L'-' ||
+                  c == L'.' || c == L'%';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// The user list is shown as "name@host" (that is how mysql.user spells an
+// account), but SQL and the command line want the two halves apart.
+bool mySplitAccount(const std::wstring& text, std::wstring& user,
+                    std::wstring& host) {
+    size_t at = text.rfind(L'@');
+    if (at == std::wstring::npos) {
+        user = text;
+        host = L"localhost";
+    } else {
+        user = text.substr(0, at);
+        host = text.substr(at + 1);
+    }
+    if (host.empty()) host = L"localhost";
+    return myValidUser(user) && myValidHost(host);
+}
+
+// 'name'@'host' for CREATE/ALTER/DROP USER.
+static std::wstring myIdent(const std::wstring& user, const std::wstring& host) {
+    return L"'" + user + L"'@'" + host + L"'";
+}
+
+// MySQL string literal escaping. Single quotes double, backslashes double —
+// the default sql_mode does NOT include NO_BACKSLASH_ESCAPES, so a bare
+// backslash inside a literal is an escape character and would silently eat
+// the next character of the password.
+std::wstring myEscapeLiteral(const std::wstring& s) {
+    std::wstring out = L"'";
+    for (wchar_t c : s) {
+        if (c == L'\'' || c == L'\\') out += c;
+        out += c;
+    }
+    out += L'\'';
+    return out;
+}
+
+std::wstring myAuthClause(const std::wstring& password) {
+    return L"IDENTIFIED WITH mysql_native_password BY " + myEscapeLiteral(password);
+}
+
+// A newline in a password would truncate both the option-file line it lands
+// in and any SQL file it is written to, so the server would end up with a
+// different secret than the manager stored — the same failure mode pgInit
+// guards against with its --pwfile rules.
+static bool myValidPassword(const std::wstring& p, std::wstring& why) {
+    if (p.empty()) { why = L"密码不能为空"; return false; }
+    if (p.find_first_of(L"\r\n") != std::wstring::npos) { why = L"密码不能包含换行符"; return false; }
+    return true;
+}
+
+// Write a temporary --defaults-extra-file holding the credentials. Every
+// MySQL client tool reads [client], so one file serves mysql / mysqladmin /
+// mysqldump. The point of the exercise: -p<password> on a command line is
+// readable by every process-listing tool on the machine, and MYSQL_PWD is
+// deprecated by the vendor. The caller owns the file and deletes it.
+// pwdOverride (when non-null) replaces the stored password — used right after
+// a --initialize-insecure, when root still has the empty password.
+static bool myCredsFile(std::wstring& path, std::wstring& err,
+                        const std::wstring* pwdOverride) {
+    std::wstring user = myUser();
+    if (!myValidUser(user)) {
+        err = L"MySQL 用户名含非法字符（只允许字母、数字、下划线、$）: " + user;
+        return false;
+    }
+    std::wstring pwd = pwdOverride ? *pwdOverride : myPassword();
+    if (pwd.find_first_of(L"\r\n") != std::wstring::npos) {
+        err = L"MySQL 密码含换行符，无法写入凭据文件（请重新设置密码）";
+        return false;
+    }
+    if (!makeTempFile(L"lnm", path)) { err = L"无法创建临时凭据文件"; return false; }
+    // writeFileText emits UTF-8 without a BOM, which is what MySQL option
+    // files are specified to be.
+    std::wstring content = L"[client]\r\nuser = " + user + L"\r\n";
+    if (!pwd.empty()) content += L"password = " + pwd + L"\r\n";
+    if (!writeFileText(path, content)) {
+        err = L"无法写入临时凭据文件: " + path;
+        DeleteFileW(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Quote one mysql client argument so paths containing spaces survive both the
+// Windows command line and the client's own parser.
+static std::wstring myQuoteClientArg(const std::wstring& value) {
+    return L"\"" + replaceAll(value, L"\"", L"\\\"") + L"\"";
+}
+
+// Run one statement batch through mysql.exe. See myCredsFile for the password
+// override. On failure returns false with out.output holding the reason.
+static bool myRunSql(const std::wstring& sql, RunResult& out,
+                     const std::wstring* pwdOverride = nullptr) {
+    out = RunResult();
+    std::wstring ver = iniGet(L"ver.mysql", L"");
+    if (ver.empty()) { out.output = L"未选择 MySQL 版本"; return false; }
+    std::wstring port = mysqlPort();
+    if (!validPort(port)) { out.output = L"端口号无效: " + port; return false; }
+    if (!myValidUser(myUser())) {
+        out.output = L"MySQL 用户名含非法字符: " + myUser();
+        return false;
+    }
+    std::wstring mysql;
+    if (!findExe(Comp::Mysql, ver, L"mysql.exe", mysql)) {
+        out.output = L"未找到 mysql.exe";
+        return false;
+    }
+    std::wstring creds, cerr;
+    if (!myCredsFile(creds, cerr, pwdOverride)) { out.output = cerr; return false; }
+    // The statement travels through a temp file, not the command line: SQL here
+    // routinely contains a password literal, and command lines are visible to
+    // every process listing on the machine.
+    std::wstring sqlFile;
+    if (!makeTempFile(L"lnm", sqlFile)) {
+        DeleteFileW(creds.c_str());
+        out.output = L"无法创建临时 SQL 文件";
+        return false;
+    }
+    if (!writeFileText(sqlFile, sql + L"\r\n")) {
+        DeleteFileW(creds.c_str());
+        DeleteFileW(sqlFile.c_str());
+        out.output = L"无法写入临时 SQL 文件: " + sqlFile;
+        return false;
+    }
+    std::wstring cmd = L"--defaults-extra-file=" + myQuoteClientArg(creds) +
+                       L" -h 127.0.0.1 -P " + port +
+                       L" --default-character-set=utf8mb4 --batch --skip-column-names" +
+                       L" --execute \"source " + myQuoteClientArg(toForward(sqlFile)) + L"\"";
+    RunResult r = runProcessCapture(mysql, cmd, compBinDirVer(Comp::Mysql, ver), 20000);
+    DeleteFileW(creds.c_str());
+    DeleteFileW(sqlFile.c_str());
+    if (!r.ok) {
+        out.output = r.output.empty() ? L"SQL 执行失败" : r.output;
+        return false;
+    }
+    out = r;
+    return true;
+}
+
+bool myDataInitialized(Comp c, const std::wstring& ver) {
+    // --initialize writes the mysql system schema (and a db.opt per schema),
+    // so its presence is the equivalent of PostgreSQL's PG_VERSION marker.
+    return dirExists(joinPath(myDataDir(c, ver), L"mysql"));
+}
+
+// Initialize an empty data dir with --initialize-insecure. Split out of
+// myInit because the restore path needs the same step without the password
+// dance that follows it.
+static bool myInitializeDataDir(Comp c, const std::wstring& ver, std::wstring& err) {
+    if (myDataInitialized(c, ver)) { err = L"数据库已初始化"; return false; }
+    std::wstring dataDir = myDataDir(c, ver);
+    // mysqld initializes into an EMPTY directory only; a half-written dir from
+    // a failed earlier run would otherwise be adopted silently.
+    if (dirExists(dataDir)) {
+        if (!listSubDirs(dataDir).empty() || !listFiles(dataDir, L"*").empty()) {
+            err = L"数据目录非空，拒绝初始化: " + dataDir;
+            return false;
+        }
+    }
+    std::wstring mysqld;
+    if (!findExe(Comp::Mysql, ver, L"mysqld.exe", mysqld)) {
+        err = L"未找到 mysqld.exe";
+        return false;
+    }
+    // my.ini carries datadir / port / log-error into this one-shot run; it is
+    // the very file the later start uses.
+    if (!genMyConfig(ver)) { err = L"生成 my.ini 失败"; return false; }
+    std::wstring ini = joinPath(compDataVerDir(Comp::Mysql, ver), L"my.ini");
+    std::wstring logFile = joinPath(logsDir(), L"mysql-" + ver + L".log");
+    logMsg(L"mysql", L"初始化数据目录 " + dataDir + L"（日志: " + logFile + L"）");
+    RunResult r = runProcessCapture(mysqld,
+        L"--defaults-file=\"" + ini + L"\" --initialize-insecure",
+        compBinDirVer(c, ver), 300000);
+    // Judge by the exit code first, the directory second: a failed --initialize
+    // can still leave a half-written mysql/ system schema behind (exactly what
+    // happened with the 8.4 unknown-variable abort), and a bare "dir exists"
+    // check would then bless a cluster whose next start dies with
+    // "Table 'mysql.plugin' doesn't exist".
+    if (!r.ok || !myDataInitialized(c, ver)) {
+        err = L"初始化失败: " + (!r.output.empty()
+              ? r.output
+              : L"数据目录未生成或不可用，请查看日志 " + logFile);
+        // The directory was verified empty (or absent) before init, so
+        // everything in it came from this failed run — a half-written cluster
+        // that would otherwise block every retry (and poison the next start
+        // with "Table 'mysql.plugin' doesn't exist"). Park it in the Recycle
+        // Bin rather than deleting it, consistent with the restore rollback.
+        if (dirExists(dataDir)) {
+            if (recycleTree(dataDir))
+                logMsg(L"mysql", L"已把失败的数据目录移入回收站: " + dataDir);
+            else
+                logMsg(L"mysql", L"失败的数据目录无法移走，请手工删除后重试: " + dataDir);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool myInit(Comp c, const std::wstring& ver, const std::wstring& password,
+            const std::wstring& port, std::wstring& err) {
+    std::wstring why;
+    if (!myValidPassword(password, why)) { err = why; return false; }
+    std::wstring effPort = port.empty() ? L"3306" : port;
+    if (!validPort(effPort)) { err = L"端口号无效（应为 1-65535）: " + port; return false; }
+    // Everything below reads ver.mysql (myRunSql, compStart's compStatus), so
+    // pin it to the version being initialized instead of relying on whatever
+    // the ini happens to say.
+    iniSet(L"ver.mysql", ver);
+
+    if (!myInitializeDataDir(c, ver, err)) return false;
+
+    // --initialize-insecure leaves root@localhost with an EMPTY password. An
+    // empty-password server on any port is a takeover waiting to happen, so
+    // the password is set before returning: start once with the empty
+    // password, ALTER USER, then verify the new one actually authenticates.
+    iniSet(L"mysql.user", L"root");
+    iniSet(L"mysql.port", effPort);
+    // No myStorePassword yet: myRunSql must still connect with the empty
+    // password this step exists to replace.
+    std::wstring emptyPw;
+    std::wstring serr;
+    if (!compStart(c, serr)) {
+        err = L"初始化后启动失败: " + serr;
+        return false;
+    }
+    RunResult ar;
+    if (!myRunSql(L"ALTER USER 'root'@'localhost' " +
+                  myAuthClause(password) + L";", ar, &emptyPw)) {
+        std::wstring stopErr;
+        compStop(c, stopErr);
+        err = L"设置 root 密码失败: " + ar.output;
+        return false;
+    }
+    // Store only after the server accepted it, then prove the new secret
+    // works before tearing the temporary instance down.
+    myStorePassword(password);
+    RunResult vr;
+    if (!myRunSql(L"SELECT 1;", vr)) {
+        std::wstring stopErr;
+        compStop(c, stopErr);
+        err = L"密码已设置但验证连接失败: " + vr.output;
+        return false;
+    }
+    // Leave it stopped, like PostgreSQL after initdb: the 启动 button (and
+    // 随管理器自动启动) is what brings it up.
+    std::wstring stopErr;
+    if (!compStop(c, stopErr)) {
+        err = L"初始化已完成，但停止临时实例失败: " + stopErr;
+        return false;
+    }
+    logMsg(L"mysql", L"MySQL " + ver + L" 初始化完成（root 密码已设置），点「启动」运行");
+    return true;
+}
+
+bool myChangePassword(Comp c, const std::wstring& user, const std::wstring& password,
+                     std::wstring& err) {
+    (void)c;   // SQL targets the current ini selection; the component never varies.
+    std::wstring u, h, why;
+    if (!mySplitAccount(user, u, h)) {
+        err = L"用户名含非法字符（只允许字母、数字、下划线、$）: " + user;
+        return false;
+    }
+    if (!myValidPassword(password, why)) { err = why; return false; }
+    RunResult r;
+    if (!myRunSql(L"ALTER USER " + myIdent(u, h) + L" " +
+                  myAuthClause(password) + L";", r)) {
+        err = r.output.empty() ? L"修改密码失败" : r.output;
+        return false;
+    }
+    // Keep the stored secret in sync only when the account the manager
+    // actually connects as changed. Another host's root (for example
+    // 'root'@'%') is a different account; adopting its password would break
+    // every later client call made as 'root'@'localhost'.
+    if (lowerStr(u) == L"root" && lowerStr(h) == L"localhost") myStorePassword(password);
+    return true;
+}
+
+bool myCreateUser(Comp c, const std::wstring& user, const std::wstring& password,
+                  std::wstring& err) {
+    (void)c;   // SQL targets the current ini selection; the component never varies.
+    std::wstring u, h, why;
+    if (!mySplitAccount(user, u, h)) {
+        err = L"用户名含非法字符（只允许字母、数字、下划线、$）: " + user;
+        return false;
+    }
+    // New accounts stay local: the manager, template, and README all assume
+    // loopback-only access. Existing remote accounts can still be changed or
+    // dropped above; they are just never created here.
+    if (lowerStr(h) != L"localhost") {
+        err = L"新建账号只支持 localhost，请不要指定其他主机: " + user;
+        return false;
+    }
+    if (!myValidPassword(password, why)) { err = why; return false; }
+    RunResult r;
+    if (!myRunSql(L"CREATE USER " + myIdent(u, h) + L" " +
+                  myAuthClause(password) + L";", r)) {
+        err = r.output.empty() ? L"创建用户失败" : r.output;
+        return false;
+    }
+    return true;
+}
+
+bool myDropUser(Comp c, const std::wstring& user, std::wstring& err) {
+    (void)c;   // SQL targets the current ini selection; the component never varies.
+    std::wstring u, h;
+    if (!mySplitAccount(user, u, h)) {
+        err = L"用户名含非法字符（只允许字母、数字、下划线、$）: " + user;
+        return false;
+    }
+    RunResult r;
+    if (!myRunSql(L"DROP USER IF EXISTS " + myIdent(u, h) + L";", r)) {
+        err = r.output.empty() ? L"删除用户失败" : r.output;
+        return false;
+    }
+    return true;
+}
+
+bool myListUsers(std::vector<std::wstring>& users, std::wstring& err) {
+    users.clear();
+    std::wstring ver = iniGet(L"ver.mysql", L"");
+    if (ver.empty()) { err = L"未选择 MySQL 版本"; return false; }
+    if (!myRunningVer(ver)) { err = L"MySQL 未运行"; return false; }
+    RunResult r;
+    if (!myRunSql(L"SELECT user, host FROM mysql.user ORDER BY user, host;", r)) {
+        err = r.output;
+        return false;
+    }
+    // --batch --skip-column-names gives one "user<TAB>host" per row; system
+    // accounts (mysql.sys / mysql.session, the anonymous '' users) are noise
+    // in a GUI list, the same way pg_roles filters pg\_%.
+    std::wstringstream ss(r.output);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        line = trimStr(line);
+        if (line.empty()) continue;
+        size_t tab = line.find(L'\t');
+        std::wstring u = tab == std::wstring::npos ? line : trimStr(line.substr(0, tab));
+        std::wstring host = tab == std::wstring::npos ? L"" : trimStr(line.substr(tab + 1));
+        if (u == L"mysql.sys" || u == L"mysql.session" || u == L"mysql.infoschema") continue;
+        // The page works in name@host form, even though the client returns the
+        // two columns tab-separated.
+        users.push_back(u + L"@" + host);
+    }
+    return true;
+}
+
+bool myBackup(Comp c, std::wstring& backupFile, std::wstring& err) {
+    std::wstring ver = iniGet(L"ver.mysql", L"");
+    if (ver.empty()) { err = L"未选择 MySQL 版本"; return false; }
+    // must be running to dump
+    if (!myRunningVer(ver)) { err = L"MySQL 未运行，无法备份"; return false; }
+    std::wstring port = mysqlPort();
+    if (!validPort(port)) { err = L"端口号无效: " + port; return false; }
+    if (!myValidUser(myUser())) { err = L"MySQL 用户名含非法字符: " + myUser(); return false; }
+    std::wstring mysqldump;
+    if (!findExe(Comp::Mysql, ver, L"mysqldump.exe", mysqldump)) {
+        err = L"未找到 mysqldump.exe"; return false;
+    }
+    makeDirs(backupDir());
+    if (backupFile.empty())
+        backupFile = joinPath(backupDir(), L"mysql-" + ver + L"-" + nowStamp() + L".sql");
+    std::wstring creds, cerr;
+    if (!myCredsFile(creds, cerr)) { err = cerr; return false; }
+    // --result-file instead of shell redirection: runProcessCapture has no
+    // shell, and stdout capture would buffer a multi-GB dump in memory.
+    // --set-gtid-purged=OFF: the default AUTO bakes this server's GTID set
+    // into the file, which a different server rejects on restore.
+    std::wstring cmd = L"--defaults-extra-file=" + myQuoteClientArg(creds) +
+                       L" -h 127.0.0.1 -P " + port +
+                       L" --default-character-set=utf8mb4 --all-databases --single-transaction --quick --routines --events" +
+                       L" --triggers --add-drop-database --set-gtid-purged=OFF" +
+                       L" --result-file=" + myQuoteClientArg(backupFile);
+    RunResult r = runProcessCapture(mysqldump, cmd, compBinDirVer(c, ver), 600000);
+    DeleteFileW(creds.c_str());
+    if (!r.ok) {
+        err = L"mysqldump 失败: " + r.output;
+        return false;
+    }
+    return true;
+}
+
+bool myRestoreOutputOk(const std::wstring& output, std::wstring& firstRealError) {
+    firstRealError.clear();
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(output);
+    std::wstring line;
+    while (std::getline(ss, line)) lines.push_back(trimStr(line));
+
+    // The mysql client prints failures as "ERROR <code> (<sqlstate>) at line
+    // N: <message>". Judge the expected bootstrap collisions on the numeric
+    // code, which survives a non-English lc_messages: 1007 is "database
+    // exists", 1008 is "cannot drop a nonexistent database". Text matching is
+    // only a fallback for output that somehow omits the code.
+    // A duplicate TABLE is deliberately NOT tolerated: mysqldump emits
+    // DROP TABLE IF EXISTS before every CREATE TABLE, so hitting "already
+    // exists" there means the dump is being merged into a server that still
+    // holds that data — the same rule pgRestoreOutputOk applies.
+    for (const std::wstring& l : lines) {
+        if (l.rfind(L"ERROR", 0) != 0) continue;
+        int code = 0;
+        size_t p = 5;
+        while (p < l.size() && iswspace(l[p])) ++p;
+        size_t q = p;
+        while (q < l.size() && iswdigit(l[q])) ++q;
+        if (q > p) code = _wtoi(l.substr(p, q - p).c_str());
+        std::wstring low = lowerStr(l);
+        bool tolerated = code == 1007 || code == 1008 ||
+            low.find(L"database exists") != std::wstring::npos ||
+            (low.find(L"already exists") != std::wstring::npos &&
+             low.find(L"database") != std::wstring::npos);
+        if (!tolerated && firstRealError.empty()) firstRealError = l;
+    }
+    return firstRealError.empty();
+}
+
+// Replay a dump through mysql.exe --force (continue past the expected
+// collisions, then let myRestoreOutputOk judge the log). pwdOverride mirrors
+// myRunSql: right after a rebuild, root has the empty password.
+static bool myReplayDump(Comp c, const std::wstring& backupFile,
+                         const std::wstring* pwdOverride, RunResult& out) {
+    out = RunResult();
+    std::wstring ver = iniGet(L"ver.mysql", L"");
+    if (ver.empty()) { out.output = L"未选择 MySQL 版本"; return false; }
+    std::wstring port = mysqlPort();
+    if (!validPort(port)) { out.output = L"端口号无效: " + port; return false; }
+    std::wstring mysql;
+    if (!findExe(Comp::Mysql, ver, L"mysql.exe", mysql)) {
+        out.output = L"未找到 mysql.exe";
+        return false;
+    }
+    std::wstring creds, cerr;
+    if (!myCredsFile(creds, cerr, pwdOverride)) { out.output = cerr; return false; }
+    // "source" is the client's own file command, usable inside --execute:
+    // runProcessCapture offers no stdin, so `mysql < file` is not an option.
+    // Forward slashes in the path: the client parses the argument itself.
+    std::wstring cmd = L"--defaults-extra-file=" + myQuoteClientArg(creds) +
+                       L" -h 127.0.0.1 -P " + port +
+                       L" --default-character-set=utf8mb4 --silent --force --execute \"source " +
+                       myQuoteClientArg(toForward(backupFile)) + L"\"";
+    RunResult r = runProcessCapture(mysql, cmd, compBinDirVer(c, ver), 600000);
+    DeleteFileW(creds.c_str());
+    out = r;
+    return true;   // exit code judgement belongs to myRestoreOutputOk
+}
+
+// Put the pre-restore data dir back. The half-restored one is moved aside
+// rather than deleted, so a failed attempt costs disk space, not data.
+static void myRollbackRestore(const std::wstring& ver, const std::wstring& aside,
+                              std::wstring& err) {
+    if (aside.empty()) return;   // nothing was moved aside -> nothing to undo
+    std::wstring dataDir = myDataDir(Comp::Mysql, ver);
+    std::wstring e;
+    if (myRunningVer(ver)) compStop(Comp::Mysql, e);
+    if (dirExists(dataDir)) {
+        std::wstring failed = dataDir + L".failed-" + nowStamp();
+        MoveFileW(dataDir.c_str(), failed.c_str());
+    }
+    if (dirExists(aside) && MoveFileW(aside.c_str(), dataDir.c_str())) {
+        compStart(Comp::Mysql, e);
+        err += L"；已回滚到还原前的数据目录并重新启动";
+    } else {
+        err += L"；回滚失败，原数据目录仍在 " + aside;
+    }
+}
+
+bool myRestoreBackup(Comp c, const std::wstring& backupFile, bool reinit,
+                     std::wstring& err) {
+    std::unique_lock<std::recursive_mutex> lk(g_compOpMtx[(int)c], std::try_to_lock);
+    if (!lk.owns_lock()) { err = kCompBusyMsg; return false; }
+
+    if (backupFile.empty() || !fileExists(backupFile)) { err = L"备份文件不存在"; return false; }
+    std::wstring ver = iniGet(L"ver.mysql", L"");
+    if (ver.empty()) { err = L"未选择 MySQL 版本"; return false; }
+    if (!validPort(mysqlPort())) { err = L"端口号无效: " + mysqlPort(); return false; }
+    if (!myValidUser(myUser())) { err = L"MySQL 用户名含非法字符: " + myUser(); return false; }
+
+    std::wstring aside;                       // previous data dir, preserved
+    std::wstring emptyPw;
+    const std::wstring* replayPw = nullptr;   // password the server will have
+    if (reinit) {
+        // Stop first: MoveFileW on a datadir mysqld still holds fails.
+        if (myRunningVer(ver) && !compStop(c, err)) {
+            err = L"停止 MySQL 失败: " + err;
+            return false;
+        }
+        std::wstring dataDir = myDataDir(c, ver);
+        if (dirExists(dataDir)) {
+            aside = dataDir + L".before-restore-" + nowStamp();
+            if (!MoveFileW(dataDir.c_str(), aside.c_str())) {
+                err = L"无法移走当前数据目录（可能仍被占用）: " + dataDir;
+                return false;
+            }
+            logMsg(L"mysql", L"还原前已移走原数据目录: " + aside);
+        }
+        // Unlike PostgreSQL, no password dance here: an --all-databases dump
+        // carries the mysql system schema, accounts included, so the root
+        // password that comes out of the restore is the one the dump was
+        // taken with. That may or may not match the stored one — the success
+        // note below says so instead of pretending otherwise.
+        if (!myInitializeDataDir(c, ver, err)) {
+            myRollbackRestore(ver, aside, err);
+            return false;
+        }
+        if (!compStart(c, err)) {
+            myRollbackRestore(ver, aside, err);
+            return false;
+        }
+        // The fresh server's root has no password yet — the dump sets it.
+        replayPw = &emptyPw;
+    } else if (!myRunningVer(ver)) {
+        err = L"MySQL 未运行。请先启动，或勾选「还原前初始化」";
+        return false;
+    }
+
+    RunResult r;
+    myReplayDump(c, backupFile, replayPw, r);
+    std::wstring firstReal;
+    if (!r.ok || !myRestoreOutputOk(r.output, firstReal)) {
+        err = L"恢复备份失败: " + (firstReal.empty() ? r.output : firstReal);
+        if (reinit) myRollbackRestore(ver, aside, err);
+        return false;
+    }
+    if (reinit) {
+        // The data copies and the dump this restore consumed are now surplus;
+        // anything dropped goes to the Recycle Bin, so a bad restore is still
+        // undoable.
+        pruneStaleDataCopies(Comp::Mysql);
+        pruneOldBackups();
+        err = L"已重建数据目录并还原。root 密码以备份时的为准；"
+              L"之后连不上请用「初始化数据库」重来";
     }
     return true;
 }

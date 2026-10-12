@@ -7,7 +7,8 @@
 // 没有驱动刷写的定时器，所以用户的 settings.ini 不会被改写；凡改过的键，
 // 都在所在测试块结尾按「有原值则恢复、原本没有才删除」还原。
 // 覆盖 renderTemplate、packages.conf 解析、pkgsNameToCompVer、自然版本排序、
-// pm2 jlist 解析、INI 文本助手、文件写入器，以及 php 端口分配与扩展解析。
+// pm2 jlist 解析、INI 文本助手、文件写入器，以及 php 端口分配与扩展解析、
+// mysql 模板/恢复输出分类。
 // 通过 test.bat（target "unittests"）构建与运行。
 #include "common.h"
 #include "manager.h"
@@ -86,9 +87,11 @@ int wmain() {
         check(L"postgresql", pkgsNameToCompVer(L"postgresql-17.1", c, v) && c == L"postgresql" && v == L"17.1");
         check(L"redis", pkgsNameToCompVer(L"redis-7.2", c, v) && c == L"redis" && v == L"7.2");
         check(L"php", pkgsNameToCompVer(L"php-8.3", c, v) && c == L"php" && v == L"8.3");
+        check(L"mysql", pkgsNameToCompVer(L"mysql-8.0.46", c, v) && c == L"mysql" && v == L"8.0.46");
+        check(L"mysql 8.4", pkgsNameToCompVer(L"mysql-8.4.11", c, v) && c == L"mysql" && v == L"8.4.11");
         // "php" is a real component now, so the negative case needs a name that
-        // is genuinely unknown — mysql was dropped, and must stay rejected.
-        check(L"unknown component rejected", !pkgsNameToCompVer(L"mysql-8.0", c, v));
+        // is genuinely unknown.
+        check(L"unknown component rejected", !pkgsNameToCompVer(L"mariadb-11.4", c, v));
         check(L"not a component at all rejected", !pkgsNameToCompVer(L"tomcat-9", c, v));
         // ".sha256" suffixes are intentionally parsed as a version here — the
         // caller (pkgsParseConf) must intercept them BEFORE this function.
@@ -149,15 +152,15 @@ int wmain() {
             check(L"URL keeps query string", ok, err);
         }
         {
-            // "php" stopped being an unknown component when the PHP component
-            // landed, so this negative case now has to use a name that is
-            // genuinely not a component (mysql was evaluated and dropped).
+            // mysql is a component now, so it must survive the same filter as
+            // nginx; mariadb stays the genuinely-unknown negative case.
             auto secs = pkgsParseConfText(
-                L"# Title\n# https://note.example.org\n---\nmysql-8.0=https://example.org/c.zip\n"
+                L"# Title\n# https://note.example.org\n---\nmariadb-11.4=https://example.org/c.zip\n"
+                L"mysql-8.0.46=https://example.org/mysql.zip\n"
                 L"nginx-1.30.4=https://example.org/a.zip\n---\n", err);
             check(L"unknown component skipped, known kept",
-                  secs.size() == 1 && secs[0].items.size() == 1 &&
-                  secs[0].items[0].comp == L"nginx");
+                  secs.size() == 1 && secs[0].items.size() == 2 &&
+                  secs[0].items[0].comp == L"mysql" && secs[0].items[1].comp == L"nginx");
             check(L"first comment is the title", secs.size() == 1 && secs[0].title == L"Title");
         }
         {
@@ -167,6 +170,40 @@ int wmain() {
             check(L"php entry kept",
                   secs.size() == 1 && secs[0].items.size() == 1 &&
                   secs[0].items[0].comp == L"php" && secs[0].items[0].ver == L"8.3", err);
+        }
+        {
+            // The shipped template must expose at least one MySQL download, and
+            // it must resolve to the mysql component rather than being skipped.
+            // URLs are fixtures, not network calls, so parsing them is side
+            // effect free.
+            std::wstring tplText = readFileText(pkgTemplatePath());
+            check(L"自带下载模板可读", !tplText.empty(), pkgTemplatePath());
+            auto secs = pkgsParseConfText(tplText, err);
+            bool found = false;
+            for (const auto& sec : secs) {
+                for (const auto& item : sec.items) {
+                    if (item.name == L"mysql-8.0.46" &&
+                        item.url == L"https://cdn.mysql.com/Downloads/MySQL-8.0/mysql-8.0.46-winx64.zip") {
+                        found = true;
+                    }
+                }
+            }
+            check(L"自带下载模板含 MySQL 8.0.46 条目", found, pkgTemplatePath());
+        }
+        {
+            // 8.4 LTS 同样必须在模板里，且地址精确到已校验的直链。
+            std::wstring tplText = readFileText(pkgTemplatePath());
+            auto secs = pkgsParseConfText(tplText, err);
+            bool found = false;
+            for (const auto& sec : secs) {
+                for (const auto& item : sec.items) {
+                    if (item.name == L"mysql-8.4.11" &&
+                        item.url == L"https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-8.4.11-winx64.zip") {
+                        found = true;
+                    }
+                }
+            }
+            check(L"自带下载模板含 MySQL 8.4.11 条目", found, pkgTemplatePath());
         }
         {
             // Traversal entry: the parser must not surface it as a package.
@@ -198,7 +235,7 @@ int wmain() {
         check(L"template and working list differ", pkgTemplatePath() != pkgListPath());
         check(L"settings.ini lives under data", settingsIniPath().rfind(dataDir(), 0) == 0);
         // The other half of the split: templates still come from etc\.
-        for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs, Comp::Php }) {
+        for (auto& c : { Comp::Nginx, Comp::Postgresql, Comp::Redis, Comp::Nodejs, Comp::Php, Comp::Mysql }) {
             check(compName(c), compEtcDir(c).rfind(etcDir(), 0) == 0, compEtcDir(c));
             // The "配置" button must land on data\, never on etc\.
             check((std::wstring(L"config dir of ") + compName(c)).c_str(),
@@ -217,6 +254,143 @@ int wmain() {
         check(L"php 模板在 etc\\ 下", phpTpl.rfind(etcDir(), 0) == 0, phpTpl);
         check(L"php 配置目录在 data\\ 下", compConfigDir(Comp::Php).rfind(dataDir(), 0) == 0,
               compConfigDir(Comp::Php));
+        // MySQL's generated my.ini is regenerated on every start, so the
+        // shipped template must contain every placeholder genMyConfig renders;
+        // otherwise a silently unfilled {{...}} would reach mysqld.
+        std::wstring myTplPath = joinPath(etcCompDir(L"mysql"), L"my.ini.tpl");
+        std::wstring myTpl = readFileText(myTplPath);
+        check(L"mysql 模板存在", !myTpl.empty(), myTplPath);
+        check(L"mysql 模板包含全部渲染占位符",
+              myTpl.find(L"{{BASEDIR}}") != std::wstring::npos &&
+              myTpl.find(L"{{DATADIR}}") != std::wstring::npos &&
+              myTpl.find(L"{{PORT}}") != std::wstring::npos &&
+              myTpl.find(L"{{LOGFILE}}") != std::wstring::npos &&
+              myTpl.find(L"{{PIDFILE}}") != std::wstring::npos &&
+              myTpl.find(L"{{CONFDIR}}") != std::wstring::npos, myTplPath);
+        check(L"mysql 默认只监听本机",
+              myTpl.find(L"bind-address = 127.0.0.1") != std::wstring::npos, myTplPath);
+        check(L"mysql 模板保留手工配置入口",
+              myTpl.find(L"!includedir") != std::wstring::npos &&
+              myTpl.find(L"conf.d") != std::wstring::npos, myTplPath);
+        // Render the shipped template through the same substitution path as
+        // genMyConfig. A missing key would otherwise survive as {{...}} until
+        // mysqld rejects the file at startup.
+        std::map<std::wstring, std::wstring> myKv = {
+            {L"BASEDIR", L"D:/x/bin/mysql/8.0.46"}, {L"DATADIR", L"D:/x/data/mysql/8.0.46/data"},
+            {L"PORT", L"3306"}, {L"LOGFILE", L"D:/x/logs/mysql-8.0.46.log"},
+            {L"PIDFILE", L"D:/x/data/mysql/8.0.46/mysqld.pid"},
+            {L"CONFDIR", L"D:/x/data/mysql/8.0.46/conf.d"}};
+        std::wstring myRendered = renderTemplate(myTpl, myKv);
+        check(L"mysql 模板渲染后无残留占位符",
+              myRendered.find(L"{{") == std::wstring::npos, myRendered);
+        check(L"mysql 渲染写入数据目录",
+              myRendered.find(L"D:/x/data/mysql/8.0.46/data") != std::wstring::npos, myRendered);
+        // 8.4 walks a different template (native-password plugin is OFF by
+        // default there), so its file gets the same placeholder/coverage pins.
+        // Template choice is a pure string rule: "8.4." with the dot, because
+        // a bare "8.4" prefix would also match an 8.0-branch "8.40" directory.
+        check(L"8.4.11 用 8.4 模板", myIniTemplateFor(L"8.4.11") == L"my-8.4.ini.tpl");
+        check(L"裸 8.4 用 8.4 模板", myIniTemplateFor(L"8.4") == L"my-8.4.ini.tpl");
+        check(L"8.0.46 用 8.0 模板", myIniTemplateFor(L"8.0.46") == L"my.ini.tpl");
+        check(L"8.40 不是 8.4 分支", myIniTemplateFor(L"8.40") == L"my.ini.tpl");
+        check(L"8.0.11 用 8.0 模板", myIniTemplateFor(L"8.0.11") == L"my.ini.tpl");
+        std::wstring my84TplPath = joinPath(etcCompDir(L"mysql"), L"my-8.4.ini.tpl");
+        std::wstring my84Tpl = readFileText(my84TplPath);
+        check(L"mysql 8.4 模板存在", !my84Tpl.empty(), my84TplPath);
+        check(L"8.4 模板打开 native 密码插件",
+              my84Tpl.find(L"mysql_native_password = ON") != std::wstring::npos, my84TplPath);
+        // 8.4删掉了 default_authentication_plugin 变量：写它会让初始化和启动
+        // 直接 abort（8.4.11 实测），所以 8.4 模板里绝不能出现赋值行。判据带上
+        // " ="，否则模板里解释原因的那行注释也会被误伤。
+        check(L"8.4 模板不写已删除的变量",
+              my84Tpl.find(L"default_authentication_plugin =") == std::wstring::npos, my84TplPath);
+        check(L"8.0 模板保持原状",
+              myTpl.find(L"default_authentication_plugin = mysql_native_password") != std::wstring::npos,
+              myTplPath);
+        check(L"8.4 模板包含全部渲染占位符",
+              my84Tpl.find(L"{{BASEDIR}}") != std::wstring::npos &&
+              my84Tpl.find(L"{{DATADIR}}") != std::wstring::npos &&
+              my84Tpl.find(L"{{PORT}}") != std::wstring::npos &&
+              my84Tpl.find(L"{{LOGFILE}}") != std::wstring::npos &&
+              my84Tpl.find(L"{{PIDFILE}}") != std::wstring::npos &&
+              my84Tpl.find(L"{{CONFDIR}}") != std::wstring::npos, my84TplPath);
+        check(L"8.4 默认只监听本机",
+              my84Tpl.find(L"bind-address = 127.0.0.1") != std::wstring::npos, my84TplPath);
+        check(L"8.4 模板保留手工配置入口",
+              my84Tpl.find(L"!includedir") != std::wstring::npos &&
+              my84Tpl.find(L"conf.d") != std::wstring::npos, my84TplPath);
+        std::map<std::wstring, std::wstring> my84Kv = {
+            {L"BASEDIR", L"D:/x/bin/mysql/8.4.11"}, {L"DATADIR", L"D:/x/data/mysql/8.4.11/data"},
+            {L"PORT", L"3306"}, {L"LOGFILE", L"D:/x/logs/mysql-8.4.11.log"},
+            {L"PIDFILE", L"D:/x/data/mysql/8.4.11/mysqld.pid"},
+            {L"CONFDIR", L"D:/x/data/mysql/8.4.11/conf.d"}};
+        std::wstring my84Rendered = renderTemplate(my84Tpl, my84Kv);
+        check(L"8.4 模板渲染后无残留占位符",
+              my84Rendered.find(L"{{") == std::wstring::npos, my84Rendered);
+        check(L"mysql 配置目录在 data\\ 下", compConfigDir(Comp::Mysql).rfind(dataDir(), 0) == 0,
+              compConfigDir(Comp::Mysql));
+    }
+
+    wprintf(L"\n=== mysql component wiring ===\n");
+    {
+        // Adding a component touches enum mappings, install recognition, and
+        // defaults. These checks pin that contract without starting mysqld,
+        // writing data\, or binding 3306. Settings keys are guarded and
+        // restored in memory.
+        IniKeyGuard gMysqlUser(L"mysql.user");
+        IniKeyGuard gMysqlPort(L"mysql.port");
+        IniKeyGuard gMysqlVer(L"ver.mysql");
+        iniDelete(L"mysql.user");
+        iniDelete(L"mysql.port");
+        iniDelete(L"ver.mysql");
+
+        check(L"mysql enum name", compName(Comp::Mysql) == std::wstring(L"mysql"));
+        check(L"mysql display name", compDisplay(Comp::Mysql) == std::wstring(L"MySQL"));
+        check(L"mysql default user is root", myUser() == L"root");
+        check(L"mysql default port is 3306", mysqlPort() == L"3306");
+        check(L"missing mysql install is unusable",
+              !compVersionUsable(Comp::Mysql, L"no-such-mysql-version"));
+        check(L"missing mysql data is uninitialized",
+              !myDataInitialized(Comp::Mysql, L"no-such-mysql-version"));
+
+        // Account text is the SQL/command injection boundary: the combo is
+        // user-editable, so parsing and literal quoting have to reject or
+        // neutralize hostile input before mysqld ever sees it.
+        std::wstring u, h;
+        check(L"account splits", mySplitAccount(L"root@localhost", u, h) &&
+              u == L"root" && h == L"localhost");
+        check(L"bare account means localhost", mySplitAccount(L"app", u, h) &&
+              u == L"app" && h == L"localhost");
+        check(L"remote host parses", mySplitAccount(L"app@%", u, h) &&
+              u == L"app" && h == L"%");
+        check(L"semicolon account rejected", !mySplitAccount(L"app;DROP", u, h));
+        check(L"quote account rejected", !mySplitAccount(L"app' OR '1", u, h));
+        check(L"second at-sign rejected", !mySplitAccount(L"a@b@c", u, h));
+        check(L"literal escapes quote and backslash",
+              myEscapeLiteral(L"a'b\\c") == L"'a''b\\\\c'",
+              myEscapeLiteral(L"a'b\\c"));
+        // Accounts spell the plugin out instead of relying on the server
+        // default, so 8.0 and 8.4 rows come out identical.
+        check(L"auth clause names the plugin",
+              myAuthClause(L"p@ss") == L"IDENTIFIED WITH mysql_native_password BY 'p@ss'",
+              myAuthClause(L"p@ss"));
+        check(L"auth clause escapes the password",
+              myAuthClause(L"a'b\\c") == L"IDENTIFIED WITH mysql_native_password BY 'a''b\\\\c'",
+              myAuthClause(L"a'b\\c"));
+        check(L"mysql not running without binaries", !compIsRunning(Comp::Mysql));
+        check(L"mysql quick status has no side effects", !compRunningQuick(Comp::Mysql));
+
+        std::wstring backupFile = L"mysql-should-not-be-created.sql";
+        std::wstring err;
+        check(L"mysql backup refuses without a selected version",
+              !myBackup(Comp::Mysql, backupFile, err) &&
+              err == L"未选择 MySQL 版本", err);
+
+        bool allMine = true;
+        for (const auto& name : myListBackups()) {
+            if (name.rfind(L"mysql-", 0) != 0) allMine = false;
+        }
+        check(L"mysql restore list is prefix-filtered", allMine);
     }
 
     wprintf(L"\n=== dirIsUnder（进程归属判定）===\n");
@@ -574,6 +748,35 @@ int wmain() {
         // Warnings are not errors and must not fail a restore.
         check(L"warnings ignored",
               pgRestoreOutputOk(L"WARNING:  no privileges were granted for \"public\"\n", bad));
+    }
+
+    wprintf(L"\n=== myRestoreOutputOk ===\n");
+    {
+        // The mysql replay runs with --force so one expected bootstrap-schema
+        // collision does not abort the whole restore. The tolerated family is
+        // intentionally narrow: a duplicate database is expected, a duplicate
+        // table means merging into live data and must fail loudly.
+        std::wstring bad;
+        check(L"empty output is ok", myRestoreOutputOk(L"", bad));
+        check(L"no errors is ok", myRestoreOutputOk(L"CREATE DATABASE\ndump completed\n", bad));
+        check(L"bootstrap database exists tolerated",
+              myRestoreOutputOk(L"ERROR 1007 (HY000) at line 22: Can't create database 'mysql'; database exists\n",
+                                bad));
+        check(L"numeric code tolerates localized text",
+              myRestoreOutputOk(L"ERROR 1007 (HY000) at line 22: 无法创建数据库 'mysql'；数据库已存在\n",
+                                bad));
+        check(L"drop of missing database tolerated",
+              myRestoreOutputOk(L"ERROR 1008 (HY000) at line 4: Can't drop database 'legacydb'; database doesn't exist\n",
+                                bad));
+        check(L"table already exists rejected",
+              !myRestoreOutputOk(L"ERROR 1050 (HY000) at line 35: Table 't' already exists\n", bad));
+        check(L"unknown database rejected",
+              !myRestoreOutputOk(L"ERROR 1049 (42000): Unknown database 'appdb'\n", bad));
+        check(L"rejected error is reported",
+              !myRestoreOutputOk(L"ERROR 1064 (42000) at line 3: You have an error in your SQL syntax\n", bad) &&
+              bad.find(L"1064") != std::wstring::npos, bad);
+        check(L"warnings ignored",
+              myRestoreOutputOk(L"Warning: Skipping the data of table mysql.general_log\n", bad));
     }
 
     wprintf(L"\n=== compIsBusy ===\n");

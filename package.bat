@@ -80,6 +80,7 @@ if exist "%STAGE%\" (
 )
 mkdir "%STAGE%\etc\nginx\vhosts" 2>nul
 mkdir "%STAGE%\etc\postgresql" 2>nul
+mkdir "%STAGE%\etc\mysql" 2>nul
 mkdir "%STAGE%\etc\redis" 2>nul
 mkdir "%STAGE%\etc\php" 2>nul
 mkdir "%STAGE%\www" 2>nul
@@ -100,6 +101,8 @@ copy /y etc\nginx\vhosts\_template_https.conf "%STAGE%\etc\nginx\vhosts\" >nul |
 copy /y etc\nginx\vhosts\_template_php.conf    "%STAGE%\etc\nginx\vhosts\" >nul || goto :copyfail
 copy /y etc\nginx\vhosts\_template_php_https.conf "%STAGE%\etc\nginx\vhosts\" >nul || goto :copyfail
 copy /y etc\postgresql\postgresql.conf.append "%STAGE%\etc\postgresql\"    >nul || goto :copyfail
+copy /y etc\mysql\my.ini.tpl                 "%STAGE%\etc\mysql\"         >nul || goto :copyfail
+copy /y etc\mysql\my-8.4.ini.tpl             "%STAGE%\etc\mysql\"         >nul || goto :copyfail
 copy /y etc\redis\redis.conf.tpl               "%STAGE%\etc\redis\"         >nul || goto :copyfail
 copy /y etc\php\php.ini.append                 "%STAGE%\etc\php\"           >nul || goto :copyfail
 copy /y etc\packages.conf.tpl                 "%STAGE%\etc\"              >nul || goto :copyfail
